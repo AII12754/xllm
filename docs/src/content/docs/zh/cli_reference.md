@@ -71,11 +71,36 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `kv_cache_dtype` | `string` | `"auto"` | KV Cache 量化数据类型；`auto` 表示与模型 dtype 对齐且不量化，`int8` 表示启用 INT8 量化，仅 MLU 后端支持。 |
 | `indexer_cache_dtype` | `string` | `"auto"` | 带 indexer cache 的模型所使用的 indexer cache 数据类型。支持 `auto` 和 `int8`；`auto` 表示与模型 dtype 对齐且不量化，`int8` 表示启用 INT8 indexer cache 量化。 |
 | `enable_prefix_cache` | `bool` | `true` | 是否在 block manager 中启用 prefix cache；详见 [Prefix Cache](/zh/features/prefix_cache/)。 |
+| `kv_events_config` | `string` | `""` | KV 驻留事件发布配置，为 JSON 对象字符串；空字符串禁用上报。JSON 字段和示例见下文。 |
 | `enable_in_batch_prefix_cache` | `bool` | `false` | 是否将已准入的 prefill 完整 block 缓存进 prefix cache，使同一 batch 内的后续请求可以共享。 |
 | `max_linear_state_cache_slots` | `int64` | `0` | linear-attention state cache 的最大活跃槽位数；`0` 表示根据可用 KV Cache 预算自动推导容量。 |
 | `xxh3_128bits_seed` | `uint32` | `1024` | XXH3 128-bit 哈希的默认 seed。 |
 | `enable_virtual_memory` | `bool` | `false` | 是否为模型权重和 KV Cache 启用基于物理页池的虚拟内存管理。 |
 | `phy_page_granularity_size` | `int64` | `2097152` | 单个物理页的粒度大小，单位 byte，默认 2 MiB；用于连续 KV Cache。 |
+
+### kv_events_config
+
+以下字段位于 `kv_events_config` 的 JSON 对象中：
+
+| 字段 | 类型 | 默认值 | 含义 |
+|:-----|:-----|:-------|:-----|
+| `publisher` | `string` | `"zmq"` | 发布器类型，当前仅支持 `zmq`。 |
+| `endpoint` | `string` | 必填 | vLLM 风格 KV 事件的 ZeroMQ 发布基准地址，例如 `tcp://*:5557`。必须为非空 TCP 地址。 |
+| `replay_endpoint` | `string` | `""` | 快照恢复请求的 ZeroMQ 基准地址，例如 `tcp://*:6557`；空字符串禁用该入口。恢复回复使用当前全量快照和对应的实时流序号。 |
+| `motor_pool_endpoint` | `string` | `""` | Motor 本地 Host 副本确认事件的 ZeroMQ 发布基准地址，例如 `tcp://*:7557`；空字符串禁用该流。 |
+| `topic` | `string` | `""` | 发布的 ZeroMQ topic；消费端的订阅过滤器需要匹配该 topic。 |
+| `hwm` | `int32` | `10000` | ZeroMQ 发送队列高水位，单位为消息数；必须为正数。 |
+| `snapshot_interval_seconds` | `int32` | `60` | 周期性发布全量驻留快照的间隔，单位为秒；必须为正数。 |
+
+每个 DP rank 使用基准 TCP 端口加 `dp_rank`，所有事件、恢复和 Host 确认端口范围须互不重叠，且端口须位于 `1` 到 `65535`。例如 DP=2、`endpoint=tcp://*:5557` 时，两个 rank 分别发布到 `5557` 和 `5558`。
+
+可在原有启动命令中加入以下参数，启用事件发布和快照恢复：
+
+```bash
+--kv_events_config='{"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:6557"}'
+```
+
+当前支持开启 prefix cache 的普通非 PD 分离文本推理、flat KV 布局和本地 Host offload。上报的是可复用前缀 block 的 Device/Host 驻留元数据；Host 副本在拷贝成功确认后发布。发布器在后台线程运行。多资源复合/linear-state 布局、多模态、虚拟内存 KV、PD 分离和外部 KV 存储尚未支持。
 
 ## KVCacheStoreConfig
 

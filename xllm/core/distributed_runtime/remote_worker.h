@@ -142,7 +142,10 @@ class RemoteWorker : public WorkerClient {
   const torch::Device& device() const override;
 
   folly::SemiFuture<std::optional<RawForwardOutput>>
-  get_last_step_result_async();
+  get_last_llm_step_result_async() override;
+
+  folly::SemiFuture<std::optional<RawForwardOutput>>
+  get_last_vlm_step_result_async() override;
 
   int64_t get_active_activation_memory() override;
 

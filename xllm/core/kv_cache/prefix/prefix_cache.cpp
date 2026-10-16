@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <iostream>
 #include <thread>
+#include <utility>
 
 #include "core/framework/multimodal/mm_data.h"
 
@@ -165,6 +166,22 @@ size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
       cached_blocks_.emplace(std::make_pair(token_hash_key, new_node));
 
       num_blocks_++;
+      if (event_journal_ && event_journal_->enabled()) {
+        std::string parent =
+            block_idx == 0
+                ? std::string()
+                : KVCacheEventJournal::encode_hash(
+                      blocks[block_idx - 1].get_immutable_hash_value());
+        const size_t begin = block_idx * block_size_;
+        std::vector<int32_t> tokens(token_ids.begin() + begin,
+                                    token_ids.begin() + begin + block_size_);
+        event_journal_->store(
+            event_scope_,
+            KVCacheEventJournal::encode_hash(token_hash_key.data),
+            std::move(parent),
+            std::move(tokens),
+            static_cast<uint32_t>(block_idx));
+      }
     }
   }
 
@@ -210,6 +227,11 @@ size_t PrefixCache::insert(Slice<Block>& blocks) {
       cached_blocks_.emplace(std::make_pair(token_hash_key, new_node));
 
       num_blocks_++;
+      if (event_journal_ && event_journal_->enabled()) {
+        event_journal_->store_copy(
+            event_scope_,
+            KVCacheEventJournal::encode_hash(token_hash_key.data));
+      }
     }
   }
 
@@ -259,6 +281,10 @@ size_t PrefixCache::evict(size_t n_blocks) {
     XXH3Key token_hash_key(del_node->block.get_immutable_hash_value());
 
     cached_blocks_.erase(token_hash_key);
+    if (event_journal_ && event_journal_->enabled()) {
+      event_journal_->remove(
+          event_scope_, KVCacheEventJournal::encode_hash(token_hash_key.data));
+    }
 
     delete del_node;
     ++evict_count;

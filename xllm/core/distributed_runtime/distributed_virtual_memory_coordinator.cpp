@@ -23,6 +23,7 @@ limitations under the License.
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <utility>
 
 #include "core/distributed_runtime/collective_service.h"
 #include "core/distributed_runtime/worker_memory_rpc_client.h"
@@ -500,10 +501,8 @@ bool DistributedVirtualMemoryCoordinator::get_virtual_kv_cache_offsets(
     return false;
   }
   const auto& client = clients_[worker_rank];
-  auto future = client->get_virtual_kv_cache_offsets_async(
+  layer_offsets = client->get_virtual_kv_cache_offsets(
       model_id, block_ids, block_size_bytes);
-
-  layer_offsets = std::move(future).get();
   if (layer_offsets.empty()) {
     LOG(ERROR) << "get_virtual_kv_cache_offsets failed for dp_rank=" << dp_rank
                << ", model_id=" << model_id;

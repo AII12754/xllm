@@ -24,6 +24,7 @@ limitations under the License.
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -31,8 +32,8 @@ limitations under the License.
 
 #include "common/etcd_client.h"
 #include "common/types.h"
-#include "distributed_runtime/heartbeat_callback_registry.h"
-#include "framework/request/request_output.h"
+#include "core/distributed_runtime/heartbeat_callback_registry.h"
+#include "core/framework/request/request_output.h"
 #include "xservice.pb.h"
 namespace xllm {
 
@@ -67,9 +68,12 @@ class XServiceClient {
   std::vector<std::string> get_all_xservice_addrs();
 
   // response generation tokens to xllm service
+  bool generation(const RequestOutput& output);
   std::vector<bool> generations(const std::vector<RequestOutput>& outputs);
 
  private:
+  std::vector<bool> send_generations(std::span<const RequestOutput> outputs);
+
   bool register_instance_with_retry(const std::string& key,
                                     const std::string& value);
   bool reconcile_registration();

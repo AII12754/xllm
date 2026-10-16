@@ -30,6 +30,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/distributed_runtime/worker_model_codec.h"
 #include "core/framework/batch/forward_input_builder.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
@@ -1779,10 +1780,10 @@ TEST(BatchTest, ReorderedMtpAcceptedRowsCommitToOwningSequences) {
 
   ForwardOutput forward_output;
   forward_output.sample_output.next_tokens = accepted_output.next_tokens;
-  proto::ForwardOutput proto_output;
-  ASSERT_TRUE(forward_output.to_proto(/*stats=*/{}, &proto_output));
+  proto::LLMForwardResponse proto_output;
+  ASSERT_TRUE(encode_llm_output(forward_output, /*stats=*/{}, &proto_output));
   RawForwardOutput raw_output;
-  ASSERT_TRUE(raw_output.from_proto(proto_output));
+  ASSERT_TRUE(decode_llm_output(proto_output, raw_output));
   ASSERT_EQ(raw_output.outputs.size(), 2u);
   EXPECT_EQ(raw_output.outputs[0].tokens.size(), 6u);
   EXPECT_EQ(raw_output.outputs[0].tokens.back().id, 15);
@@ -2249,11 +2250,12 @@ TEST(BatchTest, ForwardOutputProtoRoundTripPreservesJsonObjectErrors) {
   ForwardOutput forward_output;
   forward_output.sample_output.next_tokens = next_tokens;
   forward_output.json_object_errors = errors;
-  proto::ForwardOutput proto_output;
-  ASSERT_TRUE(forward_output.to_proto(speculative_token_stats, &proto_output));
+  proto::LLMForwardResponse proto_output;
+  ASSERT_TRUE(encode_llm_output(
+      forward_output, speculative_token_stats, &proto_output));
 
   RawForwardOutput round_trip;
-  ASSERT_TRUE(round_trip.from_proto(proto_output));
+  ASSERT_TRUE(decode_llm_output(proto_output, round_trip));
 
   ASSERT_EQ(round_trip.outputs.size(), 2u);
   EXPECT_EQ(round_trip.outputs[0].speculative_token_stats.accepted_tokens, 2);
@@ -2279,7 +2281,6 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
   bool is_reader_creator = false;
   ForwardSharedMemoryManager reader_manager(
       shm_name, 1 << 20, is_reader_creator, ForwardType::RAW_OUTPUT);
-  const torch::Tensor undefined;
   const torch::Tensor next_tokens =
       torch::tensor({{30, 31, -1}, {40, 41, 42}}, torch::kInt64);
   const std::vector<SpeculativeTokenStats> speculative_token_stats = {{1, 3},
@@ -2287,25 +2288,14 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
   const std::vector<JsonObjectOutputError> errors = {
       {"req-error#0", "prior token violates json_object grammar"}};
 
-  ASSERT_TRUE(writer_manager.raw_output_write(next_tokens,
-                                              undefined,
-                                              undefined,
-                                              undefined,
-                                              undefined,
-                                              /*mm_embeddings=*/{},
-                                              speculative_token_stats,
-                                              /*dit_images=*/{},
-                                              /*dit_text_output=*/{},
-                                              /*dit_audio=*/{},
-                                              undefined,
-                                              /*prepared_layer_id=*/-1,
-                                              undefined,
-                                              undefined,
-                                              undefined,
-                                              errors));
+  ForwardOutput forward_output;
+  forward_output.sample_output.next_tokens = next_tokens;
+  forward_output.json_object_errors = errors;
+  ASSERT_TRUE(
+      writer_manager.llm_output_write(forward_output, speculative_token_stats));
 
   RawForwardOutput round_trip;
-  reader_manager.raw_output_read(round_trip);
+  ASSERT_TRUE(reader_manager.llm_output_read(round_trip));
 
   ASSERT_EQ(round_trip.outputs.size(), 2u);
   EXPECT_EQ(round_trip.outputs[0].speculative_token_stats.accepted_tokens, 1);

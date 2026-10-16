@@ -9,6 +9,7 @@ cc_test(
   DEPS
     :config
     :batch
+    :worker_model_codec
     :kv_cache_block
     absl::time
     GTest::gtest_main

@@ -22,6 +22,7 @@ limitations under the License.
 #include <cstddef>
 
 #include "common/global_flags.h"
+#include "core/distributed_runtime/worker_model_codec.h"
 #include "core/kv_cache/transfer/kv_transport_codec.h"
 #include "runtime/rec_forward_params.h"
 #include "runtime/vlm_forward_params.h"
@@ -286,10 +287,10 @@ bool CommChannel::pull_kv_blocks(
   return !cntl.Failed() && s.ok();
 }
 
-void CommChannel::execute_model_async(
+void CommChannel::execute_llm_model_async(
     const LlmForwardInput& input,
     folly::Promise<std::optional<RawForwardOutput>>& promise) {
-  execute_model_with_brpc(input, promise);
+  execute_llm_model_with_brpc(input, promise);
 }
 
 bool CommChannel::process_group_test() {
@@ -555,27 +556,45 @@ void CommChannel::prefetch_from_storage(const StoragePrefetchRequest& request,
   }
 }
 
-bool CommChannel::get_last_step_result_async(
+bool CommChannel::get_last_llm_step_result_async(
     folly::Promise<std::optional<RawForwardOutput>>& promise) {
-  proto::Empty req;
-  proto::ForwardOutput pb_output;
-  brpc::Controller cntl;
-  stub_->GetLastStepResult(&cntl, &req, &pb_output, nullptr);
-  if (cntl.Failed()) {
-    LOG(ERROR) << "Get last step model output result failed, "
-               << cntl.ErrorText();
-    return false;
-  }
-
-  // parse tokens
-  RawForwardOutput raw_forward_output;
-  if (!raw_forward_output.from_proto(pb_output)) {
-    LOG(ERROR) << "Failed to decode last step model output";
+  proto::Empty request;
+  proto::LLMForwardResponse response;
+  brpc::Controller controller;
+  stub_->GetLastLLMStepResult(&controller, &request, &response, nullptr);
+  if (controller.Failed()) {
+    LOG(ERROR) << "Get last LLM step result failed: " << controller.ErrorText();
     promise.setValue(std::optional<RawForwardOutput>{});
     return false;
   }
-  promise.setValue(std::move(raw_forward_output));
+  RawForwardOutput output;
+  if (!decode_llm_output(response, output)) {
+    LOG(ERROR) << "Failed to decode last LLM step result";
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return false;
+  }
+  promise.setValue(std::move(output));
+  return true;
+}
 
+bool CommChannel::get_last_vlm_step_result_async(
+    folly::Promise<std::optional<RawForwardOutput>>& promise) {
+  proto::Empty request;
+  proto::VLMForwardResponse response;
+  brpc::Controller controller;
+  stub_->GetLastVLMStepResult(&controller, &request, &response, nullptr);
+  if (controller.Failed()) {
+    LOG(ERROR) << "Get last VLM step result failed: " << controller.ErrorText();
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return false;
+  }
+  RawForwardOutput output;
+  if (!decode_vlm_output(response, output)) {
+    LOG(ERROR) << "Failed to decode last VLM step result";
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return false;
+  }
+  promise.setValue(std::move(output));
   return true;
 }
 
@@ -611,102 +630,146 @@ bool CommChannel::get_active_activation_memory_async(
   return true;
 }
 
-bool CommChannel::execute_model_with_brpc(
+bool CommChannel::execute_llm_model_with_brpc(
     const LlmForwardInput& input,
     folly::Promise<std::optional<RawForwardOutput>>& promise) {
-  proto::ForwardInput pb_forward_input;
-  auto* packed_input = pb_forward_input.mutable_packed_input();
-  if (!input.to_packed_proto(packed_input)) {
-    LOG(ERROR) << "failed to pack LlmForwardInput for remote execution";
-    promise.setValue(std::optional<RawForwardOutput>(std::nullopt));
-    return false;
-  }
-
-  auto done = new ExecuteModelClosure();
-  done->promise = std::move(promise);
-  stub_->ExecuteModel(&done->cntl, &pb_forward_input, &done->pb_output, done);
-  return true;
-}
-
-void CommChannel::execute_model_async(
-    const DiTForwardInput& input,
-    folly::Promise<std::optional<RawForwardOutput>>& promise) {
-  execute_model_with_brpc(input, promise);
-}
-
-bool CommChannel::execute_model_with_brpc(
-    const DiTForwardInput& input,
-    folly::Promise<std::optional<RawForwardOutput>>& promise) {
-  proto::ForwardInput pb_forward_input;
-  if (!input.to_packed_proto(pb_forward_input.mutable_packed_input())) {
+  proto::LLMForwardRequest request;
+  if (!input.to_packed_proto(request.mutable_packed_input())) {
+    LOG(ERROR) << "Failed to pack LlmForwardInput for remote execution";
     promise.setValue(std::optional<RawForwardOutput>{});
     return false;
   }
-  auto done = new ExecuteModelClosure();
+  auto* done = new ExecuteLLMModelClosure();
   done->promise = std::move(promise);
-  stub_->ExecuteModel(&done->cntl, &pb_forward_input, &done->pb_output, done);
+  stub_->ExecuteLLMModel(&done->cntl, &request, &done->pb_output, done);
   return true;
 }
 
-void CommChannel::execute_model_async(
-    const RecForwardInput& input,
-    folly::Promise<std::optional<RawForwardOutput>>& promise) {
-  execute_model_with_brpc(input, promise);
-}
-
-void CommChannel::execute_model_async(
-    const VlmForwardInput& input,
-    folly::Promise<std::optional<RawForwardOutput>>& promise) {
-  execute_model_with_brpc(input, promise);
-}
-
-bool CommChannel::execute_model_with_brpc(
-    const RecForwardInput& input,
-    folly::Promise<std::optional<RawForwardOutput>>& promise) {
-  proto::ForwardInput pb_forward_input;
-  if (!input.to_packed_proto(pb_forward_input.mutable_packed_input())) {
-    promise.setValue(std::optional<RawForwardOutput>{});
-    return false;
-  }
-  auto done = new ExecuteModelClosure();
-  done->promise = std::move(promise);
-  stub_->ExecuteModel(&done->cntl, &pb_forward_input, &done->pb_output, done);
-  return true;
-}
-
-bool CommChannel::execute_model_with_brpc(
-    const VlmForwardInput& input,
-    folly::Promise<std::optional<RawForwardOutput>>& promise) {
-  proto::ForwardInput pb_forward_input;
-  if (!input.to_packed_proto(pb_forward_input.mutable_packed_input())) {
-    promise.setValue(std::optional<RawForwardOutput>{});
-    return false;
-  }
-  auto done = new ExecuteModelClosure();
-  done->promise = std::move(promise);
-  stub_->ExecuteModel(&done->cntl, &pb_forward_input, &done->pb_output, done);
-  return true;
-}
-
-void ExecuteModelClosure::Run() {
-  std::unique_ptr<ExecuteModelClosure> self_guard(this);
-
+void ExecuteLLMModelClosure::Run() {
+  std::unique_ptr<ExecuteLLMModelClosure> self_guard(this);
   if (cntl.Failed()) {
-    LOG(ERROR) << "Execute_model_async failed. Error code : "
-               << cntl.ErrorCode() << ", error message : " << cntl.ErrorText();
+    LOG(ERROR) << "ExecuteLLMModel failed: " << cntl.ErrorText();
     promise.setValue(std::optional<RawForwardOutput>{});
     return;
   }
-
-  RawForwardOutput raw_forward_output;
-  if (!raw_forward_output.from_proto(pb_output)) {
-    LOG(ERROR) << "Failed to decode execute model output";
+  RawForwardOutput output;
+  if (!decode_llm_output(pb_output, output)) {
+    LOG(ERROR) << "Failed to decode LLM model output";
     promise.setValue(std::optional<RawForwardOutput>{});
     return;
   }
-  promise.setValue(std::move(raw_forward_output));
+  promise.setValue(std::move(output));
+}
 
-  return;
+void CommChannel::execute_dit_model_async(
+    const DiTForwardInput& input,
+    folly::Promise<std::optional<RawForwardOutput>>& promise) {
+  execute_dit_model_with_brpc(input, promise);
+}
+
+bool CommChannel::execute_dit_model_with_brpc(
+    const DiTForwardInput& input,
+    folly::Promise<std::optional<RawForwardOutput>>& promise) {
+  proto::DITForwardRequest request;
+  if (!input.to_packed_proto(request.mutable_packed_input())) {
+    LOG(ERROR) << "Failed to pack DiTForwardInput for remote execution";
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return false;
+  }
+  auto* done = new ExecuteDITModelClosure();
+  done->promise = std::move(promise);
+  stub_->ExecuteDITModel(&done->cntl, &request, &done->pb_output, done);
+  return true;
+}
+
+void ExecuteDITModelClosure::Run() {
+  std::unique_ptr<ExecuteDITModelClosure> self_guard(this);
+  if (cntl.Failed()) {
+    LOG(ERROR) << "ExecuteDITModel failed: " << cntl.ErrorText();
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return;
+  }
+  RawForwardOutput output;
+  if (!decode_dit_output(pb_output, output)) {
+    LOG(ERROR) << "Failed to decode DIT model output";
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return;
+  }
+  promise.setValue(std::move(output));
+}
+
+void CommChannel::execute_rec_model_async(
+    const RecForwardInput& input,
+    folly::Promise<std::optional<RawForwardOutput>>& promise) {
+  execute_rec_model_with_brpc(input, promise);
+}
+
+bool CommChannel::execute_rec_model_with_brpc(
+    const RecForwardInput& input,
+    folly::Promise<std::optional<RawForwardOutput>>& promise) {
+  proto::RECForwardRequest request;
+  if (!input.to_packed_proto(request.mutable_packed_input())) {
+    LOG(ERROR) << "Failed to pack RecForwardInput for remote execution";
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return false;
+  }
+  auto* done = new ExecuteRECModelClosure();
+  done->promise = std::move(promise);
+  stub_->ExecuteRECModel(&done->cntl, &request, &done->pb_output, done);
+  return true;
+}
+
+void ExecuteRECModelClosure::Run() {
+  std::unique_ptr<ExecuteRECModelClosure> self_guard(this);
+  if (cntl.Failed()) {
+    LOG(ERROR) << "ExecuteRECModel failed: " << cntl.ErrorText();
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return;
+  }
+  RawForwardOutput output;
+  if (!decode_rec_output(pb_output, output)) {
+    LOG(ERROR) << "Failed to decode REC model output";
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return;
+  }
+  promise.setValue(std::move(output));
+}
+
+void CommChannel::execute_vlm_model_async(
+    const VlmForwardInput& input,
+    folly::Promise<std::optional<RawForwardOutput>>& promise) {
+  execute_vlm_model_with_brpc(input, promise);
+}
+
+bool CommChannel::execute_vlm_model_with_brpc(
+    const VlmForwardInput& input,
+    folly::Promise<std::optional<RawForwardOutput>>& promise) {
+  proto::VLMForwardRequest request;
+  if (!input.to_packed_proto(request.mutable_packed_input())) {
+    LOG(ERROR) << "Failed to pack VlmForwardInput for remote execution";
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return false;
+  }
+  auto* done = new ExecuteVLMModelClosure();
+  done->promise = std::move(promise);
+  stub_->ExecuteVLMModel(&done->cntl, &request, &done->pb_output, done);
+  return true;
+}
+
+void ExecuteVLMModelClosure::Run() {
+  std::unique_ptr<ExecuteVLMModelClosure> self_guard(this);
+  if (cntl.Failed()) {
+    LOG(ERROR) << "ExecuteVLMModel failed: " << cntl.ErrorText();
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return;
+  }
+  RawForwardOutput output;
+  if (!decode_vlm_output(pb_output, output)) {
+    LOG(ERROR) << "Failed to decode VLM model output";
+    promise.setValue(std::optional<RawForwardOutput>{});
+    return;
+  }
+  promise.setValue(std::move(output));
 }
 
 void InitModelClosure::Run() {

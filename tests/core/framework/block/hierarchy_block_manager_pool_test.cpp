@@ -105,6 +105,47 @@ class HierarchyPoolTestPeer final {
 
 namespace {
 
+class DeferredOffloadCoordinator final : public KVCacheTransferCoordinatorBase {
+ public:
+  explicit DeferredOffloadCoordinator(bool empty_results = false)
+      : empty_results_(empty_results) {}
+
+  std::vector<folly::SemiFuture<uint32_t>> transfer_kv_blocks(
+      uint32_t /*dp_rank*/,
+      const std::vector<BlockTransferInfo>& infos) override {
+    if (empty_results_) {
+      return {};
+    }
+    count_ = static_cast<uint32_t>(infos.size());
+    promise_ = std::make_unique<folly::Promise<uint32_t>>();
+    std::vector<folly::SemiFuture<uint32_t>> futures;
+    futures.reserve(1);
+    futures.emplace_back(promise_->getSemiFuture());
+    return futures;
+  }
+  void transfer_kv_blocks(
+      uint32_t /*dp_rank*/,
+      uint64_t /*batch_id*/,
+      const std::vector<BlockTransferInfo>& /*infos*/) override {
+    ADD_FAILURE() << "Offload tests must not dispatch loads.";
+  }
+
+  void prefetch_from_storage(
+      uint32_t /*dp_rank*/,
+      std::shared_ptr<const StoragePrefetchRequest> /*request*/,
+      PrefetchResult::StopPredicate /*stop_requested*/,
+      PrefetchResult::DoneCallback /*done*/) override {
+    ADD_FAILURE() << "Offload tests must not dispatch storage prefetches.";
+  }
+
+  void complete(bool success) { promise_->setValue(success ? count_ : 0); }
+
+ private:
+  bool empty_results_ = false;
+  uint32_t count_ = 0;
+  std::unique_ptr<folly::Promise<uint32_t>> promise_;
+};
+
 class FakePrefetchCoordinator final : public KVCacheTransferCoordinatorBase {
  public:
   explicit FakePrefetchCoordinator(size_t worker_count, int64_t timeout_ms = -1)
@@ -184,6 +225,17 @@ BlockManagerPool::Options make_flat_kv_options() {
       .enable_prefix_cache(true)
       .enable_host_offload(true);
   return opts;
+}
+
+void evict_device_prefix_cache(HierarchyBlockManagerPool& pool) {
+  BlockManager* leaf = HierarchyPoolTestPeer::device_composite(pool)
+                           ->leaf_entries()
+                           .at(BlockType::KV)
+                           .leaf.get();
+  const size_t capacity = leaf->num_total_blocks();
+  std::vector<Block> blocks = leaf->allocate(capacity);
+  ASSERT_EQ(blocks.size(), capacity);
+  leaf->deallocate(blocks);
 }
 
 BlockManagerPool::Options make_typed_cache_options() {
@@ -390,6 +442,62 @@ TEST(HierarchyBlockManagerPoolTest, FlatKvHasSingleHostKvLeaf) {
   ASSERT_TRUE(per_type.count(BlockType::KV) == 1);
   EXPECT_EQ(per_type.at(BlockType::KV).leaf->block_size(), 128);
   EXPECT_EQ(per_type.at(BlockType::KV).leaf->num_total_blocks(), 127u);
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     KvEventsPublishHostOnlyAfterSuccessfulCopy) {
+  for (bool success : {false, true}) {
+    auto journal = std::make_shared<KVCacheEventJournal>();
+    auto coordinator = std::make_shared<DeferredOffloadCoordinator>();
+    BlockManagerPool::Options options = make_flat_kv_options();
+    options.event_journal(journal);
+    HierarchyBlockManagerPool pool(options, coordinator, /*dp_size=*/1);
+    std::vector<int32_t> tokens(512, 17);
+    Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+    ASSERT_TRUE(pool.allocate(&sequence, tokens.size()));
+    sequence.kv_state().set_kv_cache_tokens_num(tokens.size());
+    pool.deallocate(&sequence);
+    auto host_count = [&]() {
+      const nlohmann::json state = journal->read("", 0);
+      return static_cast<size_t>(std::count_if(
+          state["events"].begin(),
+          state["events"].end(),
+          [](const auto& event) { return event["medium"] == "cpu"; }));
+    };
+    EXPECT_EQ(host_count(), 0);
+    EXPECT_EQ(journal->read("", 0)["events"].size(), 4);
+    pool.transfer_blocks();
+    EXPECT_EQ(host_count(), 0);
+    coordinator->complete(success);
+    EXPECT_EQ(host_count(), success ? 4 : 0);
+    EXPECT_FALSE(pool.has_pending_async_block_release());
+    evict_device_prefix_cache(pool);
+    EXPECT_EQ(journal->read("", 0)["events"].size(), success ? 4 : 0);
+  }
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     EmptyCopyResultsDoNotAdvertiseHostResidency) {
+  auto journal = std::make_shared<KVCacheEventJournal>();
+  auto coordinator =
+      std::make_shared<DeferredOffloadCoordinator>(/*empty_results=*/true);
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.event_journal(journal);
+  HierarchyBlockManagerPool pool(options, coordinator, /*dp_size=*/1);
+  std::vector<int32_t> tokens(256, 23);
+  Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+  ASSERT_TRUE(pool.allocate(&sequence, tokens.size()));
+  sequence.kv_state().set_kv_cache_tokens_num(tokens.size());
+  pool.deallocate(&sequence);
+  pool.transfer_blocks();
+  const nlohmann::json state = journal->read("", 0);
+  ASSERT_EQ(state["events"].size(), 2);
+  for (const auto& event : state["events"]) {
+    EXPECT_EQ(event["medium"], "gpu");
+  }
+  EXPECT_FALSE(pool.has_pending_async_block_release());
+  evict_device_prefix_cache(pool);
+  EXPECT_TRUE(journal->read("", 0)["events"].empty());
 }
 
 // A typed SWA/C4/C128 layout creates matching Host leaves with the expected

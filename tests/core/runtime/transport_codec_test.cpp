@@ -22,6 +22,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/distributed_runtime/worker_model_codec.h"
 #include "core/kv_cache/transfer/kv_transport_codec.h"
 #include "core/kv_cache/transfer/prefetch_result.h"
 #include "core/runtime/forward_params.h"
@@ -48,12 +49,6 @@ StoragePrefetchRequest make_prefetch_request() {
   request.unit_end_offsets = {1};
   request.batch_end_unit_offsets = {1};
   return request;
-}
-
-bool encode_output(const ForwardOutput& source,
-                   proto::ForwardOutput* output,
-                   const std::vector<SpeculativeTokenStats>& stats = {}) {
-  return source.to_proto(stats, output);
 }
 
 void expect_original_output(const RawForwardOutput& output) {
@@ -198,28 +193,28 @@ TEST(TransportCodecTest, PrefetchReuseReplacesTransfersAndOffsets) {
 }
 
 TEST(TransportCodecTest, InvalidMultimodalOutputEncodePreservesDestination) {
-  proto::ForwardOutput destination;
+  proto::VLMForwardResponse destination;
   destination.add_outputs()->add_tokens()->set_id(19);
   const std::string original = destination.SerializeAsString();
   ForwardOutput source;
   source.sample_output.next_tokens = torch::tensor({7}, torch::kInt32);
   source.sample_output.mm_embeddings = {{torch::Tensor()}};
-  EXPECT_FALSE(encode_output(source, &destination));
+  EXPECT_FALSE(encode_vlm_output(source, /*stats=*/{}, &destination));
   EXPECT_EQ(destination.SerializeAsString(), original);
 }
 
 TEST(TransportCodecTest, InvalidDiTOutputEncodePreservesDestination) {
-  proto::ForwardOutput destination;
-  destination.add_outputs()->add_tokens()->set_id(19);
+  proto::DITForwardResponse destination;
+  destination.mutable_dit_forward_output()->add_text_output("original");
   const std::string original = destination.SerializeAsString();
   ForwardOutput source;
   source.dit_forward_output.tensors = {torch::Tensor()};
-  EXPECT_FALSE(encode_output(source, &destination));
+  EXPECT_FALSE(encode_dit_output(source, &destination));
   EXPECT_EQ(destination.SerializeAsString(), original);
 }
 
 TEST(TransportCodecTest, InvalidOutputTensorLayoutsPreserveDestination) {
-  proto::ForwardOutput destination;
+  proto::LLMForwardResponse destination;
   destination.add_outputs()->add_tokens()->set_id(19);
   const std::string original = destination.SerializeAsString();
   ForwardOutput valid;
@@ -246,38 +241,37 @@ TEST(TransportCodecTest, InvalidOutputTensorLayoutsPreserveDestination) {
       torch::empty({0}, torch::kInt32);
   invalid_inputs[9].sample_output.embeddings = torch::tensor({{1.0f}, {2.0f}});
   for (const ForwardOutput& invalid : invalid_inputs) {
-    EXPECT_FALSE(encode_output(invalid, &destination));
+    EXPECT_FALSE(encode_llm_output(invalid, /*stats=*/{}, &destination));
     EXPECT_EQ(destination.SerializeAsString(), original);
   }
-  EXPECT_FALSE(encode_output(valid, &destination, {{1, 2}}));
+  EXPECT_FALSE(encode_llm_output(valid, {{1, 2}}, &destination));
   EXPECT_EQ(destination.SerializeAsString(), original);
 }
 
 TEST(TransportCodecTest, InvalidMultimodalOutputDecodePreservesDestination) {
-  proto::ForwardOutput source;
+  proto::VLMForwardResponse source;
   proto::SquenceOutput* sequence = source.add_outputs();
   sequence->add_tokens()->set_id(7);
   sequence->mutable_mm_embeddings()->add_tensors();
   RawForwardOutput destination = original_output();
-  EXPECT_FALSE(destination.from_proto(source));
+  EXPECT_FALSE(decode_vlm_output(source, destination));
   expect_original_output(destination);
 }
 
 TEST(TransportCodecTest, InvalidBeamOutputDecodePreservesDestination) {
-  proto::ForwardOutput source;
+  proto::RECForwardResponse source;
   source.add_src_seq_idxes(0);
   source.add_out_tokens(7);
   RawForwardOutput destination = original_output();
-  EXPECT_FALSE(destination.from_proto(source));
+  EXPECT_FALSE(decode_rec_output(source, destination));
   expect_original_output(destination);
 }
 
 TEST(TransportCodecTest, InvalidDiTOutputDecodePreservesDestination) {
-  proto::ForwardOutput source;
-  source.add_outputs()->add_tokens()->set_id(7);
+  proto::DITForwardResponse source;
   source.mutable_dit_forward_output()->mutable_tensors()->add_tensors();
   RawForwardOutput destination = original_output();
-  EXPECT_FALSE(destination.from_proto(source));
+  EXPECT_FALSE(decode_dit_output(source, destination));
   expect_original_output(destination);
 }
 
@@ -296,13 +290,11 @@ TEST(TransportCodecTest, OutputRoundTripPreservesTokenAndTensorPayloads) {
       torch::tensor({1, 0}, torch::kInt32);
   source.beam_search_output.out_tokens = torch::tensor({8, 7}, torch::kInt32);
   source.beam_search_output.out_logprobs = torch::tensor({-1.0f, -0.5f});
-  source.dit_forward_output.tensors = {torch::tensor({5.0f, 6.0f})};
-  source.dit_forward_output.text_output = {"generated"};
   source.json_object_errors = {{"sequence-0", "invalid JSON"}};
-  proto::ForwardOutput encoded;
-  ASSERT_TRUE(encode_output(source, &encoded, {{1, 2}, {2, 3}}));
+  proto::VLMForwardResponse encoded;
+  ASSERT_TRUE(encode_vlm_output(source, {{1, 2}, {2, 3}}, &encoded));
   RawForwardOutput decoded;
-  ASSERT_TRUE(decoded.from_proto(encoded));
+  ASSERT_TRUE(decode_vlm_output(encoded, decoded));
 
   ASSERT_EQ(decoded.outputs.size(), 2);
   ASSERT_EQ(decoded.outputs[0].tokens.size(), 1);
@@ -321,14 +313,26 @@ TEST(TransportCodecTest, OutputRoundTripPreservesTokenAndTensorPayloads) {
   EXPECT_EQ(decoded.src_seq_idxes, (std::vector<int32_t>{1, 0}));
   EXPECT_EQ(decoded.out_tokens, (std::vector<int32_t>{8, 7}));
   EXPECT_EQ(decoded.out_logprobs, (std::vector<float>{-1.0f, -0.5f}));
+  ASSERT_EQ(decoded.json_object_errors.size(), 1);
+  EXPECT_EQ(decoded.json_object_errors[0].sample_sequence_id, "sequence-0");
+  EXPECT_EQ(decoded.json_object_errors[0].message, "invalid JSON");
+}
+
+TEST(TransportCodecTest, DiTOutputRoundTripPreservesTensorAndTextPayloads) {
+  ForwardOutput source;
+  source.dit_forward_output.tensors = {torch::tensor({5.0f, 6.0f})};
+  source.dit_forward_output.text_output = {"generated"};
+  proto::DITForwardResponse encoded;
+  ASSERT_TRUE(encode_dit_output(source, &encoded));
+  RawForwardOutput decoded;
+  ASSERT_TRUE(decode_dit_output(encoded, decoded));
+
   ASSERT_EQ(decoded.dit_forward_output.tensors.size(), 1);
   EXPECT_TRUE(torch::equal(decoded.dit_forward_output.tensors[0],
                            source.dit_forward_output.tensors[0]));
   EXPECT_EQ(decoded.dit_forward_output.text_output,
             (std::vector<std::string>{"generated"}));
-  ASSERT_EQ(decoded.json_object_errors.size(), 1);
-  EXPECT_EQ(decoded.json_object_errors[0].sample_sequence_id, "sequence-0");
-  EXPECT_EQ(decoded.json_object_errors[0].message, "invalid JSON");
+  EXPECT_TRUE(decoded.outputs.empty());
 }
 
 TEST(TransportCodecTest, SpeculativeOutputStopsAtPaddingAndPreservesPayloads) {
@@ -343,10 +347,10 @@ TEST(TransportCodecTest, SpeculativeOutputStopsAtPaddingAndPreservesPayloads) {
       source.sample_output.logprobs.unsqueeze(/*dim=*/2).contiguous();
   source.sample_output.embeddings =
       torch::tensor({{{1.0f}, {2.0f}, {3.0f}}, {{4.0f}, {5.0f}, {6.0f}}});
-  proto::ForwardOutput encoded;
-  ASSERT_TRUE(encode_output(source, &encoded, {{1, 2}, {2, 2}}));
+  proto::LLMForwardResponse encoded;
+  ASSERT_TRUE(encode_llm_output(source, {{1, 2}, {2, 2}}, &encoded));
   RawForwardOutput decoded;
-  ASSERT_TRUE(decoded.from_proto(encoded));
+  ASSERT_TRUE(decode_llm_output(encoded, decoded));
 
   ASSERT_EQ(decoded.outputs.size(), 2);
   ASSERT_EQ(decoded.outputs[0].tokens.size(), 1);
@@ -368,10 +372,10 @@ TEST(TransportCodecTest, SpeculativeOutputStopsAtPaddingAndPreservesPayloads) {
 TEST(TransportCodecTest, EmbeddingOnlyOutputUsesPlaceholderToken) {
   ForwardOutput source;
   source.sample_output.embeddings = torch::tensor({{1.0f, 2.0f}});
-  proto::ForwardOutput encoded;
-  ASSERT_TRUE(encode_output(source, &encoded));
+  proto::LLMForwardResponse encoded;
+  ASSERT_TRUE(encode_llm_output(source, /*stats=*/{}, &encoded));
   RawForwardOutput decoded;
-  ASSERT_TRUE(decoded.from_proto(encoded));
+  ASSERT_TRUE(decode_llm_output(encoded, decoded));
   ASSERT_EQ(decoded.outputs.size(), 1);
   ASSERT_EQ(decoded.outputs[0].tokens.size(), 1);
   EXPECT_EQ(decoded.outputs[0].tokens[0].id, -1);
@@ -386,17 +390,15 @@ TEST(TransportCodecTest, OutputReuseClearsFieldsAbsentFromTextOnlyResult) {
   first.sample_output.mm_embeddings = {{torch::tensor({1.0f})}};
   first.json_object_errors = {{"sequence-0", "invalid JSON"}};
   first.dit_forward_output.tensors = {torch::tensor({2.0f})};
-  proto::ForwardOutput encoded;
-  ASSERT_TRUE(encode_output(first, &encoded));
-  RawForwardOutput decoded;
-  ASSERT_TRUE(decoded.from_proto(encoded));
+  proto::DITForwardResponse encoded;
+  ASSERT_TRUE(encode_dit_output(first, &encoded));
+  RawForwardOutput decoded = original_output();
+  ASSERT_TRUE(decode_dit_output(encoded, decoded));
 
   ForwardOutput second;
   second.dit_forward_output.text_output = {"text only"};
-  ASSERT_TRUE(encode_output(second, &encoded));
-  ASSERT_TRUE(decoded.from_proto(encoded));
-  EXPECT_EQ(encoded.outputs_size(), 0);
-  EXPECT_EQ(encoded.json_object_errors_size(), 0);
+  ASSERT_TRUE(encode_dit_output(second, &encoded));
+  ASSERT_TRUE(decode_dit_output(encoded, decoded));
   EXPECT_TRUE(decoded.outputs.empty());
   EXPECT_TRUE(decoded.json_object_errors.empty());
   EXPECT_TRUE(decoded.dit_forward_output.tensors.empty());

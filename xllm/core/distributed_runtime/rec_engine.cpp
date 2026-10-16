@@ -27,6 +27,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/model_loader/model_loader.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "framework/model/model_args.h"
@@ -264,6 +265,7 @@ bool RecEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   // initialize block manager
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks())
+      .kv_events_config(KVCacheConfig::get_instance().kv_events_config())
       .host_num_blocks(0)
       .block_size(block_size)
       .enable_prefix_cache(options_.enable_prefix_cache())

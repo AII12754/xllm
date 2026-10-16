@@ -171,7 +171,7 @@ RemoteWorker::step_remote_async(const LlmForwardInput& input) {
   auto future = promise.getSemiFuture();
   threadpool_.schedule(
       [this, input = input.clone(), promise = std::move(promise)]() mutable {
-        channel_->execute_model_async(input, promise);
+        channel_->execute_llm_model_async(input, promise);
       });
   return future;
 }
@@ -188,7 +188,7 @@ RemoteWorker::step_remote_async(const DiTForwardInput& input) {
   auto future = promise.getSemiFuture();
   threadpool_.schedule(
       [this, input = input, promise = std::move(promise)]() mutable {
-        channel_->execute_model_async(input, promise);
+        channel_->execute_dit_model_async(input, promise);
       });
   return future;
 }
@@ -211,7 +211,7 @@ RemoteWorker::step_remote_async(const RecForwardInput& input) {
   auto future = promise.getSemiFuture();
   threadpool_.schedule(
       [this, input = input.clone(), promise = std::move(promise)]() mutable {
-        channel_->execute_model_async(input, promise);
+        channel_->execute_rec_model_async(input, promise);
       });
   return future;
 }
@@ -222,7 +222,7 @@ RemoteWorker::step_remote_async(const VlmForwardInput& input) {
   auto future = promise.getSemiFuture();
   threadpool_.schedule(
       [this, input = input.clone(), promise = std::move(promise)]() mutable {
-        channel_->execute_model_async(input, promise);
+        channel_->execute_vlm_model_async(input, promise);
       });
   return future;
 }
@@ -347,11 +347,21 @@ const torch::Device& RemoteWorker::device() const {
 }
 
 folly::SemiFuture<std::optional<RawForwardOutput>>
-RemoteWorker::get_last_step_result_async() {
+RemoteWorker::get_last_llm_step_result_async() {
   folly::Promise<std::optional<RawForwardOutput>> promise;
   auto future = promise.getSemiFuture();
   threadpool_.schedule([this, promise = std::move(promise)]() mutable {
-    channel_->get_last_step_result_async(promise);
+    channel_->get_last_llm_step_result_async(promise);
+  });
+  return future;
+}
+
+folly::SemiFuture<std::optional<RawForwardOutput>>
+RemoteWorker::get_last_vlm_step_result_async() {
+  folly::Promise<std::optional<RawForwardOutput>> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this, promise = std::move(promise)]() mutable {
+    channel_->get_last_vlm_step_result_async(promise);
   });
   return future;
 }

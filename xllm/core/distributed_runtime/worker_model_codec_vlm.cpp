@@ -13,14 +13,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "common/macros.h"
-#include "common/metrics.h"
+#include <algorithm>
+#include <cstdint>
+#include <utility>
+
+#include "core/common/macros.h"
+#include "core/common/metrics.h"
+#include "core/distributed_runtime/worker_model_codec.h"
 #include "core/framework/config/eplb_config.h"
-#include "runtime/forward_params.h"
-#include "util/tensor_helper.h"
-#include "util/timer.h"
-#include "util/utils.h"
-#include "worker.pb.h"
+#include "core/util/tensor_helper.h"
+#include "core/util/timer.h"
+#include "core/util/utils.h"
 
 namespace xllm {
 namespace {
@@ -85,126 +88,113 @@ bool valid_token_output(const torch::Tensor& next_tokens,
 
 }  // namespace
 
-bool RawForwardOutput::from_proto(const proto::ForwardOutput& pb_output) {
+bool decode_vlm_output(const proto::VLMForwardResponse& response,
+                       RawForwardOutput& output) {
   Timer timer;
   RawForwardOutput decoded_output;
-  size_t seq_nums = pb_output.outputs().size();
-  decoded_output.outputs.reserve(seq_nums);
-  size_t expert_load_data_size = pb_output.expert_load_data().size();
-  decoded_output.expert_load_data.reserve(expert_load_data_size);
-  decoded_output.expert_load_data.assign(pb_output.expert_load_data().begin(),
-                                         pb_output.expert_load_data().end());
-  decoded_output.src_seq_idxes.reserve(pb_output.src_seq_idxes().size());
-  decoded_output.src_seq_idxes.assign(pb_output.src_seq_idxes().begin(),
-                                      pb_output.src_seq_idxes().end());
-  decoded_output.out_tokens.reserve(pb_output.out_tokens().size());
-  decoded_output.out_tokens.assign(pb_output.out_tokens().begin(),
-                                   pb_output.out_tokens().end());
-  decoded_output.out_logprobs.reserve(pb_output.out_logprobs().size());
-  decoded_output.out_logprobs.assign(pb_output.out_logprobs().begin(),
-                                     pb_output.out_logprobs().end());
-  const size_t beam_src_seq_count = decoded_output.src_seq_idxes.size();
-  const size_t beam_token_count = decoded_output.out_tokens.size();
-  const size_t beam_logprob_count = decoded_output.out_logprobs.size();
-  if ((beam_src_seq_count != 0 || beam_token_count != 0 ||
-       beam_logprob_count != 0) &&
-      (beam_src_seq_count != beam_token_count ||
-       beam_src_seq_count != beam_logprob_count)) {
-    LOG(ERROR) << "Mismatched beam output field counts";
+  decoded_output.expert_load_data.assign(response.expert_load_data().begin(),
+                                         response.expert_load_data().end());
+  decoded_output.src_seq_idxes.assign(response.src_seq_idxes().begin(),
+                                      response.src_seq_idxes().end());
+  decoded_output.out_tokens.assign(response.out_tokens().begin(),
+                                   response.out_tokens().end());
+  decoded_output.out_logprobs.assign(response.out_logprobs().begin(),
+                                     response.out_logprobs().end());
+  if (decoded_output.src_seq_idxes.size() != decoded_output.out_tokens.size() ||
+      decoded_output.src_seq_idxes.size() !=
+          decoded_output.out_logprobs.size()) {
+    LOG(ERROR) << "Mismatched vlm beam output field counts";
     return false;
   }
-  decoded_output.json_object_errors.reserve(
-      pb_output.json_object_errors_size());
-  for (const proto::JsonObjectOutputError& pb_error :
-       pb_output.json_object_errors()) {
-    decoded_output.json_object_errors.push_back(
-        {pb_error.sample_sequence_id(), pb_error.message()});
+  decoded_output.json_object_errors.reserve(response.json_object_errors_size());
+  for (const proto::JsonObjectOutputError& error :
+       response.json_object_errors()) {
+    decoded_output.json_object_errors.emplace_back(
+        JsonObjectOutputError{error.sample_sequence_id(), error.message()});
   }
-  decoded_output.prepared_token = pb_output.prepared_token();
-  for (size_t i = 0; i < seq_nums; ++i) {
-    const proto::SquenceOutput& pb_seq_out = pb_output.outputs()[i];
-    RawSampleOutput s;
-    size_t token_nums = pb_seq_out.tokens().size();
-    s.tokens.reserve(token_nums);
-    for (size_t j = 0; j < token_nums; ++j) {
-      RawToken t;
-      const proto::Token& pb_token = pb_seq_out.tokens()[j];
-      t.id = pb_token.id();
-      switch (pb_token.lp_case()) {
-        case proto::Token::kEmpty:
-          break;
-        case proto::Token::kLogprob:
-          t.logprob = pb_token.logprob();
-          break;
-        default:
-          break;
-      }
-      if (pb_token.top_tokens_size() != pb_token.top_logprobs_size()) {
-        LOG(ERROR) << "Mismatched top-k token and logprob counts";
+  decoded_output.prepared_token = response.prepared_token();
+  decoded_output.outputs.reserve(response.outputs_size());
+  for (const proto::SquenceOutput& sequence : response.outputs()) {
+    RawSampleOutput sample;
+    sample.tokens.reserve(sequence.tokens_size());
+    for (const proto::Token& token : sequence.tokens()) {
+      if (token.top_tokens_size() != token.top_logprobs_size()) {
+        LOG(ERROR) << "Mismatched vlm top-k token and logprob counts";
         return false;
       }
-      t.top_tokens.assign(pb_token.top_tokens().begin(),
-                          pb_token.top_tokens().end());
-      t.top_logprobs.assign(pb_token.top_logprobs().begin(),
-                            pb_token.top_logprobs().end());
-      t.embeddings.assign(pb_token.embeddings().vals().begin(),
-                          pb_token.embeddings().vals().end());
-      s.tokens.emplace_back(std::move(t));
+      RawToken decoded_token;
+      decoded_token.id = token.id();
+      if (token.lp_case() == proto::Token::kLogprob) {
+        decoded_token.logprob = token.logprob();
+      }
+      decoded_token.top_tokens.assign(token.top_tokens().begin(),
+                                      token.top_tokens().end());
+      decoded_token.top_logprobs.assign(token.top_logprobs().begin(),
+                                        token.top_logprobs().end());
+      decoded_token.embeddings.assign(token.embeddings().vals().begin(),
+                                      token.embeddings().vals().end());
+      sample.tokens.emplace_back(std::move(decoded_token));
     }
-    s.mm_embeddings.reserve(pb_seq_out.mm_embeddings().tensors_size());
-    for (const auto& pb_tensor : pb_seq_out.mm_embeddings().tensors()) {
-      torch::Tensor tensor = util::proto_to_torch(pb_tensor);
+    sample.mm_embeddings.reserve(sequence.mm_embeddings().tensors_size());
+    for (const proto::Tensor& encoded_tensor :
+         sequence.mm_embeddings().tensors()) {
+      torch::Tensor tensor = util::proto_to_torch(encoded_tensor);
       if (!tensor.defined()) {
-        LOG(ERROR) << "Failed to deserialize multimodal embedding tensor";
+        LOG(ERROR) << "Failed to deserialize vlm multimodal embedding tensor";
         return false;
       }
-      s.mm_embeddings.emplace_back(std::move(tensor));
+      sample.mm_embeddings.emplace_back(std::move(tensor));
     }
-    s.speculative_token_stats.accepted_tokens =
-        pb_seq_out.speculative_token_stats().accepted_tokens();
-    s.speculative_token_stats.proposed_tokens =
-        pb_seq_out.speculative_token_stats().proposed_tokens();
-    decoded_output.outputs.emplace_back(std::move(s));
+    sample.speculative_token_stats.accepted_tokens =
+        sequence.speculative_token_stats().accepted_tokens();
+    sample.speculative_token_stats.proposed_tokens =
+        sequence.speculative_token_stats().proposed_tokens();
+    decoded_output.outputs.emplace_back(std::move(sample));
   }
-  if (!decoded_output.dit_forward_output.from_proto(
-          pb_output.dit_forward_output())) {
-    return false;
-  }
-  *this = std::move(decoded_output);
+  output = std::move(decoded_output);
   COUNTER_ADD(proto_latency_seconds_proto2o, timer.elapsed_seconds());
   return true;
 }
 
-bool ForwardOutput::to_proto(
+bool encode_vlm_output(
+    const ForwardOutput& output,
     const std::vector<SpeculativeTokenStats>& speculative_token_stats,
-    proto::ForwardOutput* output) const {
-  const auto& next_tokens = sample_output.next_tokens;
-  const auto& logprobs = sample_output.logprobs;
-  const auto& top_tokens = sample_output.top_tokens;
-  const auto& top_logprobs = sample_output.top_logprobs;
-  const auto& embeddings = sample_output.embeddings;
-  const auto& mm_embeddings = sample_output.mm_embeddings;
-  const auto& src_seq_idxes = beam_search_output.src_seq_idxes;
-  const auto& out_tokens = beam_search_output.out_tokens;
-  const auto& out_logprobs = beam_search_output.out_logprobs;
-  if (output == nullptr) {
+    proto::VLMForwardResponse* response) {
+  const auto& next_tokens = output.sample_output.next_tokens;
+  const auto& logprobs = output.sample_output.logprobs;
+  const auto& top_tokens = output.sample_output.top_tokens;
+  const auto& top_logprobs = output.sample_output.top_logprobs;
+  const auto& embeddings = output.sample_output.embeddings;
+  const auto& mm_embeddings = output.sample_output.mm_embeddings;
+  const auto& src_seq_idxes = output.beam_search_output.src_seq_idxes;
+  const auto& out_tokens = output.beam_search_output.out_tokens;
+  const auto& out_logprobs = output.beam_search_output.out_logprobs;
+  if (response == nullptr) {
     return false;
   }
-  proto::ForwardOutput encoded_output;
-  proto::ForwardOutput* pb_forward_output = &encoded_output;
+  proto::VLMForwardResponse encoded_output;
+  proto::VLMForwardResponse* pb_forward_output = &encoded_output;
   Timer timer;
   if (!valid_token_output(
           next_tokens, logprobs, top_tokens, top_logprobs, embeddings) ||
-      !valid_host_tensor(expert_load_data, torch::kInt64) ||
+      !valid_host_tensor(output.expert_load_data, torch::kInt64) ||
       !valid_host_tensor(src_seq_idxes, torch::kInt32) ||
       !valid_host_tensor(out_tokens, torch::kInt32) ||
       !valid_host_tensor(out_logprobs, torch::kFloat32)) {
     LOG(ERROR) << "Invalid forward output tensor layout.";
     return false;
   }
-  // LLM decode fills next_tokens; DiT text diffusion (e.g. Cola-DLM) may leave
-  // it undefined and only populate dit_text_output. Guard before
-  // .size()/.dim().
+  const int64_t beam_src_seq_count =
+      src_seq_idxes.defined() ? src_seq_idxes.numel() : 0;
+  const int64_t beam_token_count =
+      out_tokens.defined() ? out_tokens.numel() : 0;
+  const int64_t beam_logprob_count =
+      out_logprobs.defined() ? out_logprobs.numel() : 0;
+  if (beam_src_seq_count != beam_token_count ||
+      beam_src_seq_count != beam_logprob_count) {
+    LOG(ERROR) << "Mismatched vlm beam output field counts";
+    return false;
+  }
   int32_t num_seqs =
       next_tokens.defined() ? static_cast<int32_t>(next_tokens.size(0)) : 0;
   if (embeddings.defined() && embeddings.numel() > 0) {
@@ -228,7 +218,8 @@ bool ForwardOutput::to_proto(
     LOG(ERROR) << "Embedding rows do not match token rows.";
     return false;
   }
-  if (next_tokens.defined() && next_tokens.numel() > 0 &&
+  if (next_tokens.defined() &&
+      (next_tokens.dim() == 2 || next_tokens.numel() > 0) &&
       next_tokens.size(0) < static_cast<int64_t>(num_seqs)) {
     LOG(ERROR) << "Token rows do not match forward output rows.";
     return false;
@@ -270,7 +261,7 @@ bool ForwardOutput::to_proto(
       int32_t num_tokens = static_cast<int32_t>(next_tokens.size(1));
       pb_seq_out->mutable_tokens()->Reserve(num_tokens);
       for (int32_t i = 0; i < num_tokens; ++i) {
-        const Token token = sample_output.token_at(output_idx, i);
+        const Token token = output.sample_output.token_at(output_idx, i);
         if (token.id == -1) {
           break;
         }
@@ -282,23 +273,25 @@ bool ForwardOutput::to_proto(
       pb_seq_out->mutable_tokens()->Reserve(1);
       Token token(-1);
 
-      // Handle case where next_tokens might be empty but embeddings have data
+      // Embedding-only results use a placeholder token.
       if (next_tokens.defined() && next_tokens.numel() > 0) {
-        token = sample_output.token_at(output_idx);
+        token = output.sample_output.token_at(output_idx);
       }
 
       const auto token_embeddings =
           embeddings.defined() ? embeddings[output_idx] : embeddings;
       append_token(token, token_embeddings, pb_seq_out);
-      if (output_idx < static_cast<int32_t>(mm_embeddings.size())) {
-        for (const auto& tensor : mm_embeddings[output_idx]) {
-          if ((!tensor.defined() || !tensor.device().is_cpu() ||
-               !tensor.is_contiguous() ||
-               !util::torch_to_proto(
-                   tensor,
-                   pb_seq_out->mutable_mm_embeddings()->add_tensors()))) {
-            return false;
-          }
+    }
+    if (output_idx < static_cast<int32_t>(mm_embeddings.size())) {
+      const auto& tensors = mm_embeddings[output_idx];
+      pb_seq_out->mutable_mm_embeddings()->mutable_tensors()->Reserve(
+          static_cast<int32_t>(tensors.size()));
+      for (const torch::Tensor& tensor : tensors) {
+        if (!tensor.defined() || !tensor.device().is_cpu() ||
+            !tensor.is_contiguous() ||
+            !util::torch_to_proto(
+                tensor, pb_seq_out->mutable_mm_embeddings()->add_tensors())) {
+          return false;
         }
       }
     }
@@ -313,11 +306,11 @@ bool ForwardOutput::to_proto(
   }
 
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    pb_forward_output->set_prepared_token(prepared_token);
+    pb_forward_output->set_prepared_token(output.prepared_token);
 
-    if (expert_load_data.defined()) {
+    if (output.expert_load_data.defined()) {
       Slice<int64_t> expert_load_data_flattened_slice =
-          tensor_slice<int64_t>(expert_load_data.view({-1}));
+          tensor_slice<int64_t>(output.expert_load_data.view({-1}));
       ADD_VECTOR_TO_PROTO(pb_forward_output->mutable_expert_load_data(),
                           expert_load_data_flattened_slice);
     }
@@ -338,20 +331,13 @@ bool ForwardOutput::to_proto(
     ADD_VECTOR_TO_PROTO(pb_forward_output->mutable_out_logprobs(),
                         out_logprobs_slice);
   }
-  if ((!dit_forward_output.tensors.empty() ||
-       !dit_forward_output.audio_tensors.empty() ||
-       !dit_forward_output.text_output.empty()) &&
-      !dit_forward_output.to_proto(
-          pb_forward_output->mutable_dit_forward_output())) {
-    return false;
-  }
-  for (const JsonObjectOutputError& error : json_object_errors) {
+  for (const JsonObjectOutputError& error : output.json_object_errors) {
     proto::JsonObjectOutputError* pb_error =
         pb_forward_output->add_json_object_errors();
     pb_error->set_sample_sequence_id(error.sample_sequence_id);
     pb_error->set_message(error.message);
   }
-  output->Swap(pb_forward_output);
+  response->Swap(pb_forward_output);
   COUNTER_ADD(proto_latency_seconds_o2proto, timer.elapsed_seconds());
   return true;
 }

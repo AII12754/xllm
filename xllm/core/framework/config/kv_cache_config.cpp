@@ -52,6 +52,10 @@ DEFINE_bool(enable_prefix_cache,
             true,
             "Whether to enable the prefix cache for the block manager.");
 
+DEFINE_string(kv_events_config,
+              "",
+              "ZMQ KV event publisher JSON; disabled when empty.");
+
 DEFINE_bool(enable_in_batch_prefix_cache,
             false,
             "Whether to cache admitted prefill full blocks into the prefix "
@@ -84,6 +88,7 @@ void KVCacheConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(kv_cache_dtype);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(indexer_cache_dtype);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_prefix_cache);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(kv_events_config);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_in_batch_prefix_cache);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_linear_state_cache_slots);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(xxh3_128bits_seed);
@@ -98,6 +103,7 @@ void KVCacheConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(kv_cache_dtype);
   XLLM_CONFIG_ASSIGN_FROM_JSON(indexer_cache_dtype);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_prefix_cache);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(kv_events_config);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_in_batch_prefix_cache);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_linear_state_cache_slots);
   XLLM_CONFIG_ASSIGN_FROM_JSON(xxh3_128bits_seed);
@@ -120,6 +126,8 @@ void KVCacheConfig::append_config_json(
       config_json, default_config, indexer_cache_dtype);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_prefix_cache);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, kv_events_config);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_in_batch_prefix_cache);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
@@ -146,6 +154,24 @@ void KVCacheConfig::initialize() {
 }
 
 void KVCacheConfig::validate() const {
+  if (!kv_events_config_.empty()) {
+    const nlohmann::json config =
+        nlohmann::json::parse(kv_events_config_, nullptr, false);
+    CHECK(config.is_object()) << "kv_events_config must be a JSON object";
+    CHECK(config.contains("endpoint") && config["endpoint"].is_string())
+        << "kv_events_config requires endpoint";
+    for (const std::string& key :
+         {"publisher", "replay_endpoint", "topic", "motor_pool_endpoint"}) {
+      CHECK(!config.contains(key) || config[key].is_string())
+          << key << " must be a string";
+    }
+    for (const std::string& key : {"hwm", "snapshot_interval_seconds"}) {
+      CHECK(!config.contains(key) ||
+            (config[key].is_number_integer() && config[key] > 0 &&
+             config[key] <= INT32_MAX))
+          << key << " must be a positive int32";
+    }
+  }
   if (indexer_cache_dtype_ != "auto" && indexer_cache_dtype_ != "int8") {
     LOG(FATAL) << "Invalid indexer_cache_dtype=\"" << indexer_cache_dtype_
                << "\". Supported values are exactly \"auto\" and \"int8\".";

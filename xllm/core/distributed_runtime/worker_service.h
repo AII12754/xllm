@@ -117,15 +117,35 @@ class WorkerService : public proto::DistributeWorker {
                  proto::Status* resp,
                  ::google::protobuf::Closure* done) override;
 
-  void ExecuteModel(::google::protobuf::RpcController* controller,
-                    const proto::ForwardInput* pb_fwd_input,
-                    proto::ForwardOutput* pb_forward_output,
-                    ::google::protobuf::Closure* done) override;
+  void ExecuteLLMModel(::google::protobuf::RpcController* controller,
+                       const proto::LLMForwardRequest* request,
+                       proto::LLMForwardResponse* response,
+                       ::google::protobuf::Closure* done) override;
 
-  void GetLastStepResult(::google::protobuf::RpcController* controller,
-                         const proto::Empty* req,
-                         proto::ForwardOutput* pb_forward_output,
-                         ::google::protobuf::Closure* done) override;
+  void ExecuteVLMModel(::google::protobuf::RpcController* controller,
+                       const proto::VLMForwardRequest* request,
+                       proto::VLMForwardResponse* response,
+                       ::google::protobuf::Closure* done) override;
+
+  void ExecuteRECModel(::google::protobuf::RpcController* controller,
+                       const proto::RECForwardRequest* request,
+                       proto::RECForwardResponse* response,
+                       ::google::protobuf::Closure* done) override;
+
+  void ExecuteDITModel(::google::protobuf::RpcController* controller,
+                       const proto::DITForwardRequest* request,
+                       proto::DITForwardResponse* response,
+                       ::google::protobuf::Closure* done) override;
+
+  void GetLastLLMStepResult(::google::protobuf::RpcController* controller,
+                            const proto::Empty* request,
+                            proto::LLMForwardResponse* response,
+                            ::google::protobuf::Closure* done) override;
+
+  void GetLastVLMStepResult(::google::protobuf::RpcController* controller,
+                            const proto::Empty* request,
+                            proto::VLMForwardResponse* response,
+                            ::google::protobuf::Closure* done) override;
 
   void GetActiveActivationMemory(::google::protobuf::RpcController* controller,
                                  const proto::Empty* req,
@@ -153,14 +173,35 @@ class WorkerService : public proto::DistributeWorker {
                    ::google::protobuf::Closure* done) override;
 
  private:
-  void step(const DiTForwardInput& input, DiTForwardOutput& output);
+  void step_llm_model(
+      LlmForwardInput& input,
+      ForwardOutput& cpu_output,
+      std::vector<SpeculativeTokenStats>& speculative_token_stats);
+  void step_vlm_model(
+      VlmForwardInput& input,
+      ForwardOutput& cpu_output,
+      std::vector<SpeculativeTokenStats>& speculative_token_stats);
+  void step_rec_model(
+      RecForwardInput& input,
+      ForwardOutput& cpu_output,
+      std::vector<SpeculativeTokenStats>& speculative_token_stats);
+  void step_dit_model(const DiTForwardInput& input, ForwardOutput& cpu_output);
 
-  template <typename Input>
-  void step(Input& fwd_input,
-            ForwardOutput& cpu_output,
-            std::vector<SpeculativeTokenStats>& speculative_token_stats);
-  std::vector<SpeculativeTokenStats> record_speculative_metrics_from_output(
-      const ForwardOutput& forward_output);
+  void collect_llm_output(const ForwardOutput& output,
+                          ForwardOutput& cpu_output,
+                          bool cpu_ready_result);
+  void collect_vlm_output(const ForwardOutput& output,
+                          ForwardOutput& cpu_output);
+
+  void poll_llm_shm(
+      std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager);
+  void poll_vlm_shm(
+      std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager);
+  void poll_rec_shm(
+      std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager);
+  void poll_dit_shm(
+      std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager);
+
   DISALLOW_COPY_AND_ASSIGN(WorkerService);
 
  private:

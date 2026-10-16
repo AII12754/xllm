@@ -28,6 +28,7 @@ cc_library(
     linear_state_prefix_cache.cpp
     prefix_cache_factory.cpp
   DEPS
+    :kv_cache_events
     :block_hasher
     :config
     :kv_cache_block_types

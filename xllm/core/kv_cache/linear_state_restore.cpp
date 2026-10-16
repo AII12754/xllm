@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "framework/kv_cache/linear_state_restore.h"
+#include "core/kv_cache/linear_state_restore.h"
 
 #include <glog/logging.h>
 

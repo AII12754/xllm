@@ -1,0 +1,215 @@
+---
+// Copyright 2026 The xLLM Authors. Licensed under the Apache License, Version 2.0.
+import { Code } from '@astrojs/starlight/components';
+import { getQuickStart } from '../data/quickStart';
+
+interface Props {
+	locale: 'en' | 'zh';
+}
+
+const { locale } = Astro.props;
+const { text, groups, combinations } = getQuickStart(locale);
+---
+
+<xllm-quick-start data-ready={text.ready} data-unavailable={text.unavailable}>
+	<slot />
+	<div class="quick-start not-content" data-quick-start-content hidden>
+		<form aria-label={text.preferences}>
+			{groups.map((group) => (
+				<fieldset>
+					<legend>{group.label}</legend>
+					<div class="quick-start-options" data-group={group.name}>
+						{group.options.map((option) => (
+							<label>
+								<input type="radio" name={group.name} value={option.id} checked={option.id === group.selected} />
+								<span>{option.label}</span>
+							</label>
+						))}
+					</div>
+				</fieldset>
+			))}
+		</form>
+		<div class="quick-start-summary" role="status" aria-live="polite" aria-atomic="true"></div>
+		{combinations.map(({ platform, build, image, command, notice, key }) => (
+			<div data-installation={key} hidden>
+				{image ? (
+					<>
+						<Code code={command} lang="bash" title={text.commandTitle} locale={locale === 'zh' ? 'zh-CN' : 'en'} />
+						<p class="quick-start-next">
+							{build.id === 'release' ? (
+								<>{text.releaseBefore}<a href={`/${locale}/getting_started/launch_xllm/`}>{text.releaseLink}</a>{text.releaseAfter}</>
+							) : (
+								<>{text.devBefore}<a href={text.buildAnchor}>{text.devLink}</a>{text.devAfter}</>
+							)}
+						</p>
+					</>
+				) : (
+					<p class="quick-start-unavailable">{notice}</p>
+				)}
+				<p class="quick-start-guide"><a href={`/${locale}/hardware/${platform.guide}/`}>{platform.label} {text.guide} →</a></p>
+			</div>
+		))}
+	</div>
+</xllm-quick-start>
+
+<script>
+	class QuickStart extends HTMLElement {
+		connectedCallback() {
+			if (this.dataset.initialized) {
+				return;
+			}
+			const target = this.querySelector('[data-quick-start]');
+			const content = this.querySelector<HTMLElement>('[data-quick-start-content]');
+			if (!target || !content) {
+				return;
+			}
+			this.dataset.initialized = 'true';
+			target.replaceChildren(content);
+			content.hidden = false;
+			const form = target.querySelector('form')!;
+			const summary = target.querySelector('.quick-start-summary')!;
+			const panels = target.querySelectorAll<HTMLElement>('[data-installation]');
+			const update = () => {
+				const selection = new FormData(form);
+				const key = ['hardware', 'cpu', 'build'].map((name) => selection.get(name)).join('-');
+				for (const panel of panels) {
+					panel.hidden = panel.dataset.installation !== key;
+				}
+				const labels = Array.from(form.querySelectorAll<HTMLInputElement>('input:checked'))
+					.map((input) => input.nextElementSibling!.textContent);
+				const active = target.querySelector<HTMLElement>('[data-installation]:not([hidden])')!;
+				summary.textContent = `${labels.join(' / ')} — ${active.querySelector('pre') ? this.dataset.ready : this.dataset.unavailable}`;
+			};
+			form.addEventListener('submit', (event) => event.preventDefault());
+			form.addEventListener('change', update);
+			update();
+		}
+	}
+	if (!customElements.get('xllm-quick-start')) {
+		customElements.define('xllm-quick-start', QuickStart);
+	}
+</script>
+
+<style is:global>
+	xllm-quick-start {
+		display: block;
+	}
+	.quick-start {
+		container: quick-start / inline-size;
+		margin-block: 1.5rem;
+		padding: 1.5rem;
+		border: 1px solid var(--sl-color-gray-5);
+		border-radius: .8rem;
+		background: var(--sl-color-bg);
+	}
+	.quick-start [hidden] {
+		display: none !important;
+	}
+	.quick-start form {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 1.25rem;
+	}
+	.quick-start fieldset:first-child {
+		grid-column: 1 / -1;
+	}
+	.quick-start fieldset {
+		min-width: 0;
+		margin: 0;
+		padding: 0;
+		border: 0;
+	}
+	.quick-start legend {
+		margin-bottom: .65rem;
+		padding: 0;
+		color: var(--sl-color-white);
+		font-size: .9rem;
+		font-weight: 600;
+	}
+	.quick-start-options {
+		display: flex;
+		flex-wrap: wrap;
+		gap: .5rem;
+	}
+	.quick-start-options label {
+		position: relative;
+		cursor: pointer;
+	}
+	.quick-start-options[data-group='hardware'] label {
+		flex: 1 1 calc(25% - .5rem);
+	}
+	.quick-start-options[data-group='hardware'] span {
+		text-align: center;
+		white-space: nowrap;
+	}
+	.quick-start-options input {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		opacity: 0;
+	}
+	.quick-start-options span {
+		display: block;
+		padding: .5rem .85rem;
+		border: 1px solid var(--sl-color-gray-5);
+		border-radius: .4rem;
+		color: var(--sl-color-gray-2);
+		font-size: .875rem;
+		line-height: 1.5;
+	}
+	.quick-start-options label:hover span {
+		border-color: var(--sl-color-gray-3);
+	}
+	.quick-start-options input:checked + span {
+		border-color: var(--sl-color-text-accent);
+		background: var(--sl-color-accent-low);
+		color: var(--sl-color-white);
+		font-weight: 600;
+	}
+	.quick-start-options input:focus-visible + span {
+		outline: 2px solid var(--sl-color-text-accent);
+		outline-offset: 3px;
+	}
+	.quick-start-summary {
+		margin-block: 1.5rem 1rem;
+		padding-top: 1.25rem;
+		border-top: 1px solid var(--sl-color-gray-5);
+		color: var(--sl-color-gray-2);
+		font-size: .85rem;
+	}
+	.quick-start a {
+		color: var(--sl-color-text-accent);
+		text-underline-offset: .2em;
+	}
+	.quick-start-next,
+	.quick-start-unavailable,
+	.quick-start-guide {
+		margin: 1rem 0 0;
+		font-size: .9rem;
+		line-height: 1.7;
+	}
+	.quick-start-unavailable {
+		padding: 1rem;
+		border: 1px dashed var(--sl-color-gray-4);
+		border-radius: .4rem;
+		background: var(--sl-color-gray-6);
+	}
+	@container quick-start (max-width: 38rem) {
+		.quick-start-options[data-group='hardware'] label {
+			flex-basis: calc(50% - .5rem);
+		}
+	}
+	@container quick-start (max-width: 24rem) {
+		.quick-start form {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+	@media (max-width: 40rem) {
+		.quick-start {
+			padding: 1rem;
+		}
+		.quick-start-options span {
+			padding-inline: .65rem;
+		}
+	}
+</style>

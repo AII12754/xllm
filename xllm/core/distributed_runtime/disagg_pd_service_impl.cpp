@@ -17,10 +17,14 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <utility>
+#include <vector>
 
-#include "common/global_flags.h"
 #include "common/types.h"
+#include "core/distributed_runtime/disagg_pd_kv_response.h"
+#include "core/distributed_runtime/disagg_pd_request_converter.h"
 #include "core/distributed_runtime/distributed_virtual_memory_coordinator.h"
 #include "core/distributed_runtime/engine.h"
 #include "core/framework/block/block_manager_pool.h"
@@ -37,7 +41,8 @@ DisaggPDServiceImpl::DisaggPDServiceImpl(DisaggPDScheduler* scheduler,
                                          int32_t kv_cache_block_tokens)
     : scheduler_(scheduler),
       engine_(engine),
-      kv_cache_block_tokens_(kv_cache_block_tokens) {
+      kv_cache_block_tokens_(kv_cache_block_tokens),
+      block_manager_(engine->block_manager_pool()) {
   xservice_client_ = XServiceClient::get_instance();
   if (!xservice_client_->initialize_done()) {
     LOG(FATAL) << "XServiceClient not init.";
@@ -79,85 +84,20 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
   }
 
   std::string prompt = req.prompt();
-  std::vector<int> prompt_tokens(req.prompt_tokens().begin(),
-                                 req.prompt_tokens().end());
+  std::vector<int32_t> prompt_tokens(req.prompt_tokens().begin(),
+                                     req.prompt_tokens().end());
 
-  RequestSamplingParam sampling_param;
-  sampling_param.frequency_penalty = req.frequency_penalty();
-  sampling_param.presence_penalty = req.presence_penalty();
-  sampling_param.repetition_penalty = req.repetition_penalty();
-  sampling_param.temperature = req.temperature();
-  sampling_param.top_p = req.top_p();
-  sampling_param.min_p = req.min_p();
-  if (req.has_seed()) {
-    sampling_param.seed = req.seed();
-  }
-  sampling_param.min_tokens = req.min_tokens();
-  sampling_param.vocab_size = req.vocab_size();
-  for (const auto& [token, bias] : req.logit_bias()) {
-    sampling_param.logit_bias.emplace(token, bias);
-  }
-  if (req.allowed_token_ids_size() > 0) {
-    sampling_param.allowed_token_ids = std::vector<int32_t>(
-        req.allowed_token_ids().begin(), req.allowed_token_ids().end());
-  }
-  sampling_param.all_stop_token_ids.assign(req.all_stop_token_ids().begin(),
-                                           req.all_stop_token_ids().end());
-  sampling_param.bad_words_token_ids.reserve(req.bad_words_token_ids_size());
-  for (const auto& word : req.bad_words_token_ids()) {
-    sampling_param.bad_words_token_ids.emplace_back(word.seq_tokens().begin(),
-                                                    word.seq_tokens().end());
-  }
-  sampling_param.top_k = req.top_k();
-  sampling_param.logprobs = req.logprobs();
-  sampling_param.top_logprobs = req.top_logprobs();
-  sampling_param.is_embeddings = req.is_embeddings();
-  sampling_param.json_object = req.json_object();
+  RequestSamplingParam sampling_param = make_disagg_sampling_param(req);
   const bool json_object = sampling_param.json_object;
-
-  SchedulerParam scheduler_param;
-  scheduler_param.offline = req.offline();
-  scheduler_param.priority = static_cast<xllm::RequestPriority>(req.priority());
-  if (!req.offline()) {
-    scheduler_param.ttft_slo_ms = req.ttft_slo_ms();
-    scheduler_param.tpot_slo_ms = req.tpot_slo_ms();
-    scheduler_param.ttlt_slo_ms = req.ttlt_slo_ms();
-    scheduler_param.tpot_priority_weight = req.tpot_priority_weight();
-    scheduler_param.ttft_priority_weight = req.ttft_priority_weight();
-    scheduler_param.ttlt_priority_weight = req.ttlt_priority_weight();
-    scheduler_param.priority_weight = req.priority_weight();
-  }
-
-  std::unordered_set<int32_t> stop_tokens;
-  for (auto& stop_token_id : req.stop_token_ids()) {
-    stop_tokens.insert(stop_token_id);
-  }
-  std::vector<std::vector<int32_t>> stop_sequences;
-  std::vector<std::string> stop_strings;
-  stop_sequences.reserve(req.stop_sequences_size());
-  stop_strings.reserve(req.stop_sequences_size());
-  for (auto& stop_sequence : req.stop_sequences()) {
-    auto stop_seq_tokens = std::vector<int32_t>(
-        stop_sequence.seq_tokens().begin(), stop_sequence.seq_tokens().end());
-    stop_sequences.push_back(std::move(stop_seq_tokens));
-    stop_strings.emplace_back(stop_sequence.stop_string());
-  }
-  StoppingChecker stopping_checker(req.max_tokens(),
-                                   req.max_context_len(),
-                                   req.eos_token_id(),
-                                   req.ignore_eos(),
-                                   std::move(stop_tokens),
-                                   std::move(stop_sequences),
-                                   std::move(stop_strings),
-                                   req.min_tokens());
+  SchedulerParam scheduler_param = make_disagg_scheduler_param(req);
+  StoppingChecker stopping_checker = make_disagg_stopping_checker(req);
 
   auto output_callback = [this](const RequestOutput& output) -> bool {
     // response to xllm service to avoid the redirect cost.
-    if (xservice_client_ == nullptr) return false;
-    auto return_status = xservice_client_->generations({output});
-    CHECK_EQ(return_status.size(), 1)
-        << "return size of generations is not equal to 1";
-    return return_status[0];
+    if (xservice_client_ == nullptr) {
+      return false;
+    }
+    return xservice_client_->generation(output);
   };
 
   auto batch_output_callback =
@@ -220,11 +160,63 @@ void DisaggPDServiceImpl::release_reservation(
                            : proto::ReleaseReservationResponse::NOT_WAITING);
 }
 
+void DisaggPDServiceImpl::append_virtual_kv_cache_offsets(
+    int32_t dp_rank,
+    const std::string& request_id,
+    const std::vector<int32_t>& block_ids,
+    proto::DisaggResponse* response) {
+  if (block_manager_ == nullptr ||
+      !block_manager_->options().enable_virtual_memory() || block_ids.empty()) {
+    return;
+  }
+
+  std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>
+      layer_offsets;
+  const auto& block_options = block_manager_->options();
+  CHECK_GT(kv_cache_block_tokens_, 0);
+  // KV split enlarges the manager's logical block length; offsets use
+  // the physical cache block length configured by the engine.
+  const uint64_t block_size_bytes =
+      static_cast<uint64_t>(block_options.slot_size()) *
+      static_cast<uint64_t>(kv_cache_block_tokens_) / 2;
+  const bool offsets_available =
+      DistributedVirtualMemoryCoordinator::get_instance()
+          .get_virtual_kv_cache_offsets(dp_rank,
+                                        block_options.model_id(),
+                                        block_ids,
+                                        block_size_bytes,
+                                        layer_offsets);
+  if (!offsets_available) {
+    LOG(WARNING) << "Failed to get VirtualMemory offsets for request "
+                 << request_id;
+    return;
+  }
+
+  auto* layers = response->mutable_virtual_kv_cache_layer_global_offsets();
+  layers->Reserve(layers->size() + static_cast<int32_t>(layer_offsets.size()));
+  for (const auto& [k_offsets, v_offsets] : layer_offsets) {
+    auto* layer = layers->Add();
+    layer->mutable_k_offsets()->Reserve(static_cast<int32_t>(k_offsets.size()));
+    layer->mutable_v_offsets()->Reserve(static_cast<int32_t>(v_offsets.size()));
+    for (uint64_t offset : k_offsets) {
+      layer->add_k_offsets(offset);
+    }
+    for (uint64_t offset : v_offsets) {
+      layer->add_v_offsets(offset);
+    }
+  }
+  VLOG(5) << "VirtualMemory offsets added for request " << request_id
+          << ", num_blocks=" << block_ids.size()
+          << ", num_layers=" << layer_offsets.size();
+}
+
 void DisaggPDServiceImpl::decode_recv_new_requests(
     const proto::DisaggRequests* request,
     proto::DisaggResponses* response) {
-  for (auto& req : request->reqs()) {
-    auto resp = response->add_resps();
+  response->mutable_resps()->Reserve(response->resps_size() +
+                                     request->reqs_size());
+  for (const auto& req : request->reqs()) {
+    auto* resp = response->add_resps();
     resp->set_req_id(req.req_id());
 
     auto new_request = generate_request(req);
@@ -233,9 +225,7 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
       continue;
     }
 
-    auto& sequences = new_request->sequences();
-    Sequence* sequence = sequences[0].get();
-
+    Sequence* sequence = new_request->sequences()[0].get();
     if (!scheduler_->try_allocate(sequence)) {
       if (scheduler_->exceeds_decode_capacity(sequence)) {
         LOG(ERROR) << "Decode cannot fit request prompt at any load, "
@@ -246,125 +236,31 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
         // Current cache pressure can be relieved, so Prefill may retry.
         resp->set_status_code(404);
       }
-    } else {
-      // push the request to scheduler request buffer
-      bool success =
-          scheduler_->decode_schedule(new_request, request->prefill_name());
-      if (!success) {
-        LOG(ERROR) << "Failed to schedule new decode instance request: "
-                   << req.req_id();
-        // request and blocks are released in scheduler
-        resp->set_status_code(500);
-        continue;
-      }
-
-      auto dp_rank = sequence->dp_rank();
-      resp->set_dp_rank(dp_rank);
-
-      std::vector<int32_t> block_ids;
-      if (sequence->kv_state().has_multi_block_export()) {
-        const auto export_view = sequence->kv_state().multi_block_export_view();
-        for (const auto& [block_type, blocks_ptr] : export_view) {
-          proto::KVTransferGroup* group = resp->add_groups();
-          group->set_group_id(cache_group_id(block_type));
-          // D-side shared count for this group. P advances its per-group
-          // transfer cursor to this value so it starts pushing at the first
-          // block D actually needs. SWA / LINEAR under DECODE role return
-          // 0 (prefix cache off), which is a no-op advance and reproduces
-          // the pre-existing "push everything" behavior. C4 / C128 may
-          // return >0 and let P skip the leading shared blocks.
-          group->set_remote_shared_num(static_cast<uint32_t>(
-              sequence->kv_state().shared_blocks_num(block_type)));
-          group->mutable_ids()->Reserve(blocks_ptr->size());
-          for (const auto& block : *blocks_ptr) {
-            // Invalid placeholders are legitimate for SWA: the sliding
-            // window release loop leaves moved-from Blocks in place so
-            // positional indexing stays stable, and both P and D produce
-            // the same invalid pattern for the slid-out window. Ship them
-            // as max-uint64 sentinels; ForwardInputBuilder skips
-            // positions where the local block id is negative, so the
-            // remote id at those positions is never dereferenced. The
-            // CHECK below only refuses invalid blocks under types where
-            // slide-out cannot produce them (C4 / C128), preserving the
-            // guard for genuine allocation bugs.
-            const int64_t block_id = block.is_valid() ? block.id() : -1;
-            if (!block.is_valid()) {
-              CHECK(block_type == BlockType::SWA)
-                  << "Decode allocated an invalid grouped KV block under a "
-                  << "non-SWA leaf, group_id=" << cache_group_id(block_type);
-            }
-            group->mutable_ids()->Add(static_cast<uint64_t>(block_id));
-          }
-        }
-      } else {
-        const size_t shared_num =
-            sequence->kv_state().shared_blocks_num(BlockType::KV);
-        const auto blocks = sequence->kv_state().blocks(BlockType::KV);
-
-        // Collect block IDs
-        block_ids.reserve(blocks.size() - shared_num);
-        proto::KVTransferGroup* group = resp->add_groups();
-        group->set_group_id(cache_group_id(BlockType::KV));
-        group->set_remote_shared_num(static_cast<uint32_t>(shared_num));
-        group->mutable_ids()->Reserve(blocks.size() - shared_num);
-        for (size_t i = shared_num; i < blocks.size(); i++) {
-          int32_t block_id = blocks[i].id();
-          group->mutable_ids()->Add(block_id);
-          block_ids.push_back(block_id);
-        }
-      }
-      if (has_linear_attention_layers(engine_->model_args())) {
-        const int32_t linear_state_id = sequence->get_linear_state_slot_id();
-        CHECK_GE(linear_state_id, 0)
-            << "Decode did not allocate a linear-state slot.";
-        proto::KVTransferGroup* group = resp->add_groups();
-        group->set_group_id(cache_group_id(BlockType::LINEAR));
-        group->add_ids(static_cast<uint64_t>(linear_state_id));
-      }
-      // Only virtual-memory KV managers have pool-relative memory offsets.
-      auto* block_manager = engine_->block_manager_pool();
-      if (block_manager != nullptr &&
-          block_manager->options().enable_virtual_memory() &&
-          !block_ids.empty()) {
-        std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>
-            layer_offsets;
-        const auto& block_options = block_manager->options();
-        CHECK_GT(kv_cache_block_tokens_, 0);
-        // KV split enlarges the manager's logical block length; offsets use
-        // the physical cache block length configured by the engine.
-        const uint64_t block_size_bytes =
-            static_cast<uint64_t>(block_options.slot_size()) *
-            static_cast<uint64_t>(kv_cache_block_tokens_) / 2;
-        const bool offsets_available =
-            DistributedVirtualMemoryCoordinator::get_instance()
-                .get_virtual_kv_cache_offsets(dp_rank,
-                                              block_options.model_id(),
-                                              block_ids,
-                                              block_size_bytes,
-                                              layer_offsets);
-        if (offsets_available) {
-          // Fill proto with per-layer offsets
-          for (const auto& [k_offsets, v_offsets] : layer_offsets) {
-            auto* layer_proto =
-                resp->add_virtual_kv_cache_layer_global_offsets();
-            for (const auto& k_off : k_offsets) {
-              layer_proto->add_k_offsets(k_off);
-            }
-            for (const auto& v_off : v_offsets) {
-              layer_proto->add_v_offsets(v_off);
-            }
-          }
-          VLOG(5) << "VirtualMemory offsets added for request " << req.req_id()
-                  << ", num_blocks=" << block_ids.size()
-                  << ", num_layers=" << layer_offsets.size();
-        } else {
-          LOG(WARNING) << "Failed to get VirtualMemory offsets for request "
-                       << req.req_id();
-        }
-      }
-
-      resp->set_status_code(200);
+      continue;
     }
+
+    // Push the request to the scheduler request buffer.
+    if (!scheduler_->decode_schedule(new_request, request->prefill_name())) {
+      LOG(ERROR) << "Failed to schedule new decode instance request: "
+                 << req.req_id();
+      // Request and blocks are released in scheduler.
+      resp->set_status_code(500);
+      continue;
+    }
+
+    resp->set_dp_rank(sequence->dp_rank());
+    std::vector<int32_t> virtual_memory_block_ids;
+    append_disagg_kv_transfer_groups(
+        sequence->kv_state(),
+        has_linear_attention_layers(engine_->model_args()),
+        resp,
+        block_manager_ != nullptr &&
+                block_manager_->options().enable_virtual_memory()
+            ? &virtual_memory_block_ids
+            : nullptr);
+    append_virtual_kv_cache_offsets(
+        sequence->dp_rank(), req.req_id(), virtual_memory_block_ids, resp);
+    resp->set_status_code(200);
   }
 }
 

@@ -212,7 +212,12 @@ folly::SemiFuture<bool> WorkerClient::stop_profile_async() {
 const torch::Device& WorkerClient::device() const { return worker_->device(); }
 
 folly::SemiFuture<std::optional<RawForwardOutput>>
-WorkerClient::get_last_step_result_async() {
+WorkerClient::get_last_llm_step_result_async() {
+  return folly::makeSemiFuture(std::optional<RawForwardOutput>(std::nullopt));
+}
+
+folly::SemiFuture<std::optional<RawForwardOutput>>
+WorkerClient::get_last_vlm_step_result_async() {
   return folly::makeSemiFuture(std::optional<RawForwardOutput>(std::nullopt));
 }
 

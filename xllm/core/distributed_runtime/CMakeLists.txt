@@ -7,6 +7,26 @@ if(USE_NPU OR USE_CUDA OR USE_MUSA OR USE_MLU OR USE_DCU)
 endif()
 
 cc_library(
+  NAME
+    worker_model_codec
+  HDRS
+    worker_model_codec.h
+  SRCS
+    worker_model_codec_llm.cpp
+    worker_model_codec_vlm.cpp
+    worker_model_codec_rec.cpp
+    worker_model_codec_dit.cpp
+  DEPS
+    :common
+    :config
+    :sampler
+    :util
+    glog::glog
+    proto::xllm_proto
+    torch
+)
+
+cc_library(
   NAME 
     distributed_runtime
   HDRS
@@ -24,6 +44,8 @@ cc_library(
     rec_master.h
     disagg_pd_service.h
     disagg_pd_service_impl.h
+    disagg_pd_kv_response.h
+    disagg_pd_request_converter.h
     distributed_worker_manager.h
     remote_worker.h
     worker_server.h
@@ -49,6 +71,8 @@ cc_library(
     rec_master.cpp
     disagg_pd_service.cpp
     disagg_pd_service_impl.cpp
+    disagg_pd_kv_response.cpp
+    disagg_pd_request_converter.cpp
     distributed_worker_manager.cpp
     kv_cache_transfer_coordinator.cpp
     remote_worker.cpp
@@ -60,6 +84,7 @@ cc_library(
     model_residency_coordinator.cpp
   DEPS
     :api_service
+    :worker_model_codec
     :models
     :parallel_config_validation
     :runtime
@@ -86,6 +111,7 @@ cc_library(
   SRCS
     worker_service.cpp
   DEPS
+    :worker_model_codec
     :request
     :speculative
     :common

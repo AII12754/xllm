@@ -71,11 +71,36 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | `kv_cache_dtype` | `string` | `"auto"` | KV Cache dtype for quantization. `auto` aligns with model dtype and disables quantization. `int8` enables INT8 quantization and is only supported on the MLU backend. |
 | `indexer_cache_dtype` | `string` | `"auto"` | Indexer cache dtype for models with an indexer cache. Supported values are `auto` and `int8`. `auto` aligns with model dtype and disables indexer cache quantization. `int8` enables INT8 indexer cache quantization. |
 | `enable_prefix_cache` | `bool` | `true` | Whether to enable prefix cache in the block manager. See [Prefix Cache](/en/features/prefix_cache/). |
+| `kv_events_config` | `string` | `""` | KV residency event publisher configuration as a JSON object string. An empty string disables reporting. See the fields and example below. |
 | `enable_in_batch_prefix_cache` | `bool` | `false` | Whether to cache admitted prefill full blocks into the prefix cache so that later requests in the same batch can share them. |
 | `max_linear_state_cache_slots` | `int64` | `0` | Maximum number of active linear-attention state cache slots. `0` derives an automatic capacity from the available KV Cache budget. |
 | `xxh3_128bits_seed` | `uint32` | `1024` | Default XXH3 128-bit hash seed. |
 | `enable_virtual_memory` | `bool` | `false` | Enable virtual memory for model weights and KV Cache with the physical page pool. |
 | `phy_page_granularity_size` | `int64` | `2097152` | Granularity size of one physical page in bytes, default 2 MiB, for continuous KV Cache. |
+
+### kv_events_config
+
+The following fields belong to the JSON object in `kv_events_config`:
+
+| Field | Type | Default | Description |
+|:------|:-----|:--------|:------------|
+| `publisher` | `string` | `"zmq"` | Publisher type. Currently only `zmq` is supported. |
+| `endpoint` | `string` | Required | Base ZeroMQ publish address for vLLM-style KV events, for example `tcp://*:5557`. Must be a nonempty TCP address. |
+| `replay_endpoint` | `string` | `""` | Base ZeroMQ address for snapshot recovery requests, for example `tcp://*:6557`. An empty string disables this endpoint. Recovery replies contain the current full snapshot and its matching live stream sequence. |
+| `motor_pool_endpoint` | `string` | `""` | Base ZeroMQ publish address for Motor local Host copy confirmation events, for example `tcp://*:7557`. An empty string disables this stream. |
+| `topic` | `string` | `""` | Published ZeroMQ topic. Consumer subscription filters must match this topic. |
+| `hwm` | `int32` | `10000` | ZeroMQ send queue high-water mark in messages. Must be positive. |
+| `snapshot_interval_seconds` | `int32` | `60` | Interval between periodic full residency snapshots, in seconds. Must be positive. |
+
+Each DP rank uses the base TCP port plus `dp_rank`. The event, replay and Host confirmation port ranges must not overlap, and every port must be between `1` and `65535`. For example, with DP=2 and `endpoint=tcp://*:5557`, the two ranks publish on `5557` and `5558`.
+
+Add the following flag to an existing launch command to enable event publication and snapshot recovery:
+
+```bash
+--kv_events_config='{"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:6557"}'
+```
+
+Current support covers ordinary non-PD text inference with prefix caching enabled, flat KV layouts and local Host offload. Events describe the Device/Host residency of reusable prefix blocks; Host copies are advertised after successful copy acknowledgements. The publisher runs on a background thread. Multi-resource composite/linear-state layouts, multimodal inference, virtual-memory KV, PD separation and external KV stores are not yet supported.
 
 ## KVCacheStoreConfig
 

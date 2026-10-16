@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <chrono>
 #include <thread>
+#include <utility>
 
 #include "core/framework/config/service_config.h"
 
@@ -209,56 +210,40 @@ folly::SemiFuture<bool> WorkerMemoryRpcClient::free_weight_pages_async(
   return future;
 }
 
-folly::SemiFuture<
-    std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>>
-WorkerMemoryRpcClient::get_virtual_kv_cache_offsets_async(
+std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>
+WorkerMemoryRpcClient::get_virtual_kv_cache_offsets(
     const std::string& model_id,
     const std::vector<int32_t>& block_ids,
     uint64_t block_size_bytes) {
-  using ResultType =
-      std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>;
-  folly::Promise<ResultType> promise;
-  auto future = promise.getSemiFuture();
+  proto::GetVirtualKVCacheOffsetsRequest req;
+  req.set_model_id(model_id);
+  req.mutable_block_ids()->Reserve(static_cast<int32_t>(block_ids.size()));
+  for (int32_t block_id : block_ids) {
+    req.add_block_ids(block_id);
+  }
+  req.set_block_size_bytes(block_size_bytes);
 
-  threadpool_.schedule([this,
-                        model_id,
-                        block_ids = block_ids,
-                        block_size_bytes,
-                        promise = std::move(promise)]() mutable {
-    proto::GetVirtualKVCacheOffsetsRequest req;
-    req.set_model_id(model_id);
-    for (int32_t block_id : block_ids) {
-      req.add_block_ids(block_id);
-    }
-    req.set_block_size_bytes(block_size_bytes);
+  proto::GetVirtualKVCacheOffsetsResponse resp;
+  brpc::Controller cntl;
+  stub_->GetVirtualKVCacheOffsets(&cntl, &req, &resp, brpc::DoNothing());
+  brpc::Join(cntl.call_id());
+  if (cntl.Failed()) {
+    LOG(ERROR) << "GetVirtualKVCacheOffsets failed: " << cntl.ErrorText();
+    return {};
+  }
 
-    proto::GetVirtualKVCacheOffsetsResponse resp;
-    brpc::Controller cntl;
-    stub_->GetVirtualKVCacheOffsets(&cntl, &req, &resp, nullptr);
-
-    if (cntl.Failed()) {
-      LOG(ERROR) << "GetVirtualKVCacheOffsets failed: " << cntl.ErrorText();
-      promise.setValue(ResultType{});
-      return;
-    }
-
-    // Convert proto response to vector of pairs
-    ResultType layer_offsets;
-    layer_offsets.reserve(resp.layer_offsets_size());
-
-    for (int32_t i = 0; i < resp.layer_offsets_size(); ++i) {
-      const auto& layer_proto = resp.layer_offsets(i);
-      std::vector<uint64_t> k_offsets(layer_proto.k_offsets().begin(),
-                                      layer_proto.k_offsets().end());
-      std::vector<uint64_t> v_offsets(layer_proto.v_offsets().begin(),
-                                      layer_proto.v_offsets().end());
-      layer_offsets.emplace_back(std::move(k_offsets), std::move(v_offsets));
-    }
-
-    promise.setValue(std::move(layer_offsets));
-  });
-
-  return future;
+  std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>
+      layer_offsets;
+  layer_offsets.reserve(resp.layer_offsets_size());
+  for (int32_t i = 0; i < resp.layer_offsets_size(); ++i) {
+    const auto& layer_proto = resp.layer_offsets(i);
+    std::vector<uint64_t> k_offsets(layer_proto.k_offsets().begin(),
+                                    layer_proto.k_offsets().end());
+    std::vector<uint64_t> v_offsets(layer_proto.v_offsets().begin(),
+                                    layer_proto.v_offsets().end());
+    layer_offsets.emplace_back(std::move(k_offsets), std::move(v_offsets));
+  }
+  return layer_offsets;
 }
 
 }  // namespace xllm

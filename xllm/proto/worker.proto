@@ -360,15 +360,26 @@ message PackedForwardInput {
   // reject unversioned payloads and unsupported versions before materializing
   // tensors.
   bytes payload = 1;
+  // Optional token-domain overlap hint, checked against sample_idxes during
+  // worker preparation. Missing values retain the legacy lazy-unpack path.
+  optional int32 sample_count = 2;
 }
 
-message ForwardInput {
-  PackedForwardInput packed_input = 100;
+message LLMForwardRequest {
+  PackedForwardInput packed_input = 1;
 }
 
- message BatchedForwardInputs {
-   repeated ForwardInput micro_inputs = 1;
- }
+message VLMForwardRequest {
+  PackedForwardInput packed_input = 1;
+}
+
+message RECForwardRequest {
+  PackedForwardInput packed_input = 1;
+}
+
+message DITForwardRequest {
+  PackedForwardInput packed_input = 1;
+}
 
 message Embeddings {
   repeated float vals = 1;
@@ -401,15 +412,38 @@ message JsonObjectOutputError {
   string message = 2;
 }
 
-message ForwardOutput {
+message LLMForwardResponse {
   repeated SquenceOutput outputs = 2;
   repeated int64 expert_load_data = 3;
   int64 prepared_token = 4;
   repeated int32 src_seq_idxes = 5;
   repeated int32 out_tokens = 6;
   repeated float out_logprobs = 7;
-  DiTForwardOutput dit_forward_output = 8;
   repeated JsonObjectOutputError json_object_errors = 9;
+}
+
+message VLMForwardResponse {
+  repeated SquenceOutput outputs = 2;
+  repeated int64 expert_load_data = 3;
+  int64 prepared_token = 4;
+  repeated int32 src_seq_idxes = 5;
+  repeated int32 out_tokens = 6;
+  repeated float out_logprobs = 7;
+  repeated JsonObjectOutputError json_object_errors = 9;
+}
+
+message RECForwardResponse {
+  repeated SquenceOutput outputs = 2;
+  repeated int64 expert_load_data = 3;
+  int64 prepared_token = 4;
+  repeated int32 src_seq_idxes = 5;
+  repeated int32 out_tokens = 6;
+  repeated float out_logprobs = 7;
+  repeated JsonObjectOutputError json_object_errors = 9;
+}
+
+message DITForwardResponse {
+  DiTForwardOutput dit_forward_output = 1;
 }
 
 // master create Collective service
@@ -434,8 +468,12 @@ service DistributeWorker {
   rpc UnlinkCluster(ClusterInfo) returns (Status) {}
   rpc LinkP2P(P2PLinkWorkerRequest) returns (Status) {}
   rpc UnlinkP2P(P2PLinkWorkerRequest) returns (Status) {}
-  rpc ExecuteModel (ForwardInput) returns (ForwardOutput);
-  rpc GetLastStepResult (Empty) returns (ForwardOutput);
+  rpc ExecuteLLMModel (LLMForwardRequest) returns (LLMForwardResponse);
+  rpc ExecuteVLMModel (VLMForwardRequest) returns (VLMForwardResponse);
+  rpc ExecuteRECModel (RECForwardRequest) returns (RECForwardResponse);
+  rpc ExecuteDITModel (DITForwardRequest) returns (DITForwardResponse);
+  rpc GetLastLLMStepResult (Empty) returns (LLMForwardResponse);
+  rpc GetLastVLMStepResult (Empty) returns (VLMForwardResponse);
   rpc GetActiveActivationMemory (Empty) returns (ActivationMemory);
   rpc TransferBlocks(BlockTransferInfos) returns (TransferStatus) {}
   rpc PrefetchFromStorage(PrefetchRequest) returns (Status) {}

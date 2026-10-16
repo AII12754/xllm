@@ -71,6 +71,80 @@ bool check_instance_name(const std::string& name) {
   return true;
 }
 
+void fill_generation_request(const RequestOutput& output,
+                             proto::DisaggStreamGeneration* request) {
+  request->set_req_id(output.request_id);
+  request->set_service_req_id(output.service_request_id);
+  if (output.status.has_value()) {
+    auto gen_status = request->mutable_gen_status();
+    gen_status->set_status_code(
+        static_cast<int32_t>(output.status.value().code()));
+    gen_status->set_status_msg(output.status.value().message());
+  }
+  request->set_finished(output.finished);
+  request->set_finished_on_prefill_instance(
+      output.finished_on_prefill_instance);
+  if (output.usage.has_value()) {
+    proto::OutputUsage* proto_usage = request->mutable_usage();
+    proto_usage->set_num_prompt_tokens(output.usage.value().num_prompt_tokens);
+    proto_usage->set_num_generated_tokens(
+        output.usage.value().num_generated_tokens);
+    proto_usage->set_num_total_tokens(output.usage.value().num_total_tokens);
+    proto_usage->set_num_cached_tokens(output.usage.value().num_cached_tokens);
+  }
+  request->mutable_outputs()->Reserve(
+      static_cast<int32_t>(output.outputs.size()));
+  for (const auto& seq_output : output.outputs) {
+    auto* proto_seq_out = request->mutable_outputs()->Add();
+    proto_seq_out->set_index(seq_output.index);
+    proto_seq_out->set_text(seq_output.text);
+    if (seq_output.finish_reason.has_value()) {
+      proto_seq_out->set_finish_reason(seq_output.finish_reason.value());
+    } else {
+      proto_seq_out->set_finish_reason("");
+    }
+    if (const auto* token = std::get_if<int32_t>(&seq_output.stop_reason)) {
+      proto_seq_out->mutable_stop_reason()->set_token_id(*token);
+    } else if (const auto* text =
+                   std::get_if<std::string>(&seq_output.stop_reason)) {
+      proto_seq_out->mutable_stop_reason()->set_stop_string(*text);
+    }
+    proto_seq_out->mutable_token_ids()->Reserve(
+        static_cast<int32_t>(seq_output.token_ids.size()));
+    for (const auto& value : seq_output.token_ids) {
+      *proto_seq_out->mutable_token_ids()->Add() = value;
+    }
+    if (!seq_output.logprobs.has_value()) {
+      continue;
+    }
+    const auto& logprobs = seq_output.logprobs.value();
+    proto_seq_out->mutable_logprobs()->Reserve(
+        static_cast<int32_t>(logprobs.size()));
+    for (const auto& logprob : logprobs) {
+      auto* proto_logprob = proto_seq_out->mutable_logprobs()->Add();
+      proto::LogProbData* log_prob_data =
+          proto_logprob->mutable_log_prob_data();
+      log_prob_data->set_token(logprob.token);
+      log_prob_data->set_token_id(logprob.token_id);
+      log_prob_data->set_logprob(logprob.logprob);
+      log_prob_data->set_finished_token(logprob.finished_token);
+      if (!logprob.top_logprobs.has_value()) {
+        continue;
+      }
+      const auto& top_logprobs = logprob.top_logprobs.value();
+      proto_logprob->mutable_top_logprobs()->Reserve(
+          static_cast<int32_t>(top_logprobs.size()));
+      for (const auto& top_logprob : top_logprobs) {
+        auto* top_log_prob_data = proto_logprob->mutable_top_logprobs()->Add();
+        top_log_prob_data->set_token(top_logprob.token);
+        top_log_prob_data->set_token_id(top_logprob.token_id);
+        top_log_prob_data->set_logprob(top_logprob.logprob);
+        top_log_prob_data->set_finished_token(top_logprob.finished_token);
+      }
+    }
+  }
+}
+
 }  // namespace
 
 bool XServiceClient::init(const std::string& etcd_addr,
@@ -407,36 +481,80 @@ std::vector<std::string> XServiceClient::get_all_xservice_addrs() {
   return addrs;
 }
 
+bool XServiceClient::generation(const RequestOutput& output) {
+  std::string master_addr;
+  if (output.target_xservice_addr.empty()) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    master_addr = master_xservice_addr_;
+  }
+  const std::string& target_service = output.target_xservice_addr.empty()
+                                          ? master_addr
+                                          : output.target_xservice_addr;
+  if (target_service.empty()) {
+    LOG(ERROR) << "No target xservice address available for request_id: "
+               << output.request_id;
+    return false;
+  }
+  if (!connect_to_xservice(target_service)) {
+    LOG(ERROR) << "Failed to connect target xservice: " << target_service;
+    return false;
+  }
+
+  proto::DisaggStreamGenerations request;
+  fill_generation_request(output, request.mutable_gens()->Add());
+  proto::StatusSet response;
+  brpc::Controller cntl;
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto* service_stub = find_stub_locked(target_service);
+    if (service_stub == nullptr) {
+      LOG(ERROR) << "No stub available for xservice: " << target_service;
+      return false;
+    }
+    service_stub->Generations(&cntl, &request, &response, brpc::DoNothing());
+  }
+  brpc::Join(cntl.call_id());
+  if (cntl.Failed()) {
+    LOG(ERROR) << "Fail to response tokens to xservice server "
+               << target_service << ", error text: " << cntl.ErrorText();
+    return false;
+  }
+  CHECK_EQ(response.all_status_size(), 1)
+      << "The size of status set is not equal to the size of outputs";
+  return response.all_status(0).ok();
+}
+
 std::vector<bool> XServiceClient::generations(
     const std::vector<RequestOutput>& outputs) {
+  return send_generations(outputs);
+}
+
+std::vector<bool> XServiceClient::send_generations(
+    std::span<const RequestOutput> outputs) {
   std::vector<bool> results(outputs.size(), false);
+  if (outputs.empty()) {
+    return results;
+  }
   std::string master_addr;
   {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     master_addr = master_xservice_addr_;
   }
 
-  // group requests by target xllm_service
-  std::unordered_map<std::string, std::vector<size_t>> service_outputs_map;
-  std::unordered_map<std::string, proto::DisaggStreamGenerations>
-      service_requests_map;
-
-  auto mark_service_failed = [&](const std::string& service_addr) {
-    auto index_it = service_outputs_map.find(service_addr);
-    if (index_it == service_outputs_map.end()) {
-      return;
-    }
-    for (size_t idx : index_it->second) {
-      results[idx] = false;
-    }
+  struct ServiceBatch {
+    std::vector<size_t> output_indices;
+    proto::DisaggStreamGenerations gens;
   };
+
+  // Group requests by target xllm_service. Keeping the indices and protobuf
+  // request together avoids a second address-keyed map and a later lookup.
+  std::unordered_map<std::string, ServiceBatch> service_batches;
 
   for (size_t i = 0; i < outputs.size(); ++i) {
     const auto& output = outputs[i];
-    std::string target_service = master_addr;
-    if (!output.target_xservice_addr.empty()) {
-      target_service = output.target_xservice_addr;
-    }
+    const std::string& target_service = output.target_xservice_addr.empty()
+                                            ? master_addr
+                                            : output.target_xservice_addr;
 
     if (target_service.empty()) {
       LOG(ERROR) << "No target xservice address available for request_id: "
@@ -444,85 +562,11 @@ std::vector<bool> XServiceClient::generations(
       continue;
     }
 
-    service_outputs_map[target_service].push_back(i);
+    auto& batch = service_batches[target_service];
+    batch.output_indices.push_back(i);
 
-    // construct the request to corresponding service
-    auto& gens = service_requests_map[target_service];
-    proto::DisaggStreamGeneration* req = gens.mutable_gens()->Add();
-    req->set_req_id(output.request_id);
-    req->set_service_req_id(output.service_request_id);
-    if (output.status.has_value()) {
-      auto gen_status = req->mutable_gen_status();
-      gen_status->set_status_code(
-          static_cast<int32_t>(output.status.value().code()));
-      gen_status->set_status_msg(output.status.value().message());
-    }
-    req->set_finished(output.finished);
-    req->set_finished_on_prefill_instance(output.finished_on_prefill_instance);
-    if (output.usage.has_value()) {
-      proto::OutputUsage* proto_usage = req->mutable_usage();
-      proto_usage->set_num_prompt_tokens(
-          output.usage.value().num_prompt_tokens);
-      proto_usage->set_num_generated_tokens(
-          output.usage.value().num_generated_tokens);
-      proto_usage->set_num_total_tokens(output.usage.value().num_total_tokens);
-      proto_usage->set_num_cached_tokens(
-          output.usage.value().num_cached_tokens);
-    }
-    req->mutable_outputs()->Reserve(output.outputs.size());
-    for (auto& seq_output : output.outputs) {
-      auto proto_seq_out = req->mutable_outputs()->Add();
-      proto_seq_out->set_index(seq_output.index);
-      proto_seq_out->set_text(seq_output.text);
-      if (seq_output.finish_reason.has_value()) {
-        proto_seq_out->set_finish_reason(seq_output.finish_reason.value());
-      } else {
-        proto_seq_out->set_finish_reason("");
-      }
-      if (const auto* token = std::get_if<int32_t>(&seq_output.stop_reason)) {
-        proto_seq_out->mutable_stop_reason()->set_token_id(*token);
-      } else if (const auto* text =
-                     std::get_if<std::string>(&seq_output.stop_reason)) {
-        proto_seq_out->mutable_stop_reason()->set_stop_string(*text);
-      }
-      proto_seq_out->mutable_token_ids()->Reserve(seq_output.token_ids.size());
-      for (const auto& value : seq_output.token_ids) {
-        *proto_seq_out->mutable_token_ids()->Add() = value;
-      }
-      if (seq_output.logprobs.has_value()) {
-        size_t logprobs_size = seq_output.logprobs.value().size();
-        proto_seq_out->mutable_logprobs()->Reserve(logprobs_size);
-        for (size_t j = 0; j < logprobs_size; ++j) {
-          auto logprob = proto_seq_out->mutable_logprobs()->Add();
-          proto::LogProbData* log_prob_data = logprob->mutable_log_prob_data();
-          log_prob_data->set_token(seq_output.logprobs.value()[j].token);
-          log_prob_data->set_token_id(seq_output.logprobs.value()[j].token_id);
-          log_prob_data->set_logprob(seq_output.logprobs.value()[j].logprob);
-          log_prob_data->set_finished_token(
-              seq_output.logprobs.value()[j].finished_token);
-          if (seq_output.logprobs.value()[j].top_logprobs.has_value()) {
-            size_t top_logprobs_size =
-                seq_output.logprobs.value()[j].top_logprobs.value().size();
-            for (size_t k = 0; k < top_logprobs_size; ++k) {
-              proto::LogProbData* top_log_prob_data =
-                  logprob->mutable_top_logprobs()->Add();
-              top_log_prob_data->set_token(
-                  seq_output.logprobs.value()[j].top_logprobs.value()[k].token);
-              top_log_prob_data->set_token_id(seq_output.logprobs.value()[j]
-                                                  .top_logprobs.value()[k]
-                                                  .token_id);
-              top_log_prob_data->set_logprob(seq_output.logprobs.value()[j]
-                                                 .top_logprobs.value()[k]
-                                                 .logprob);
-              top_log_prob_data->set_finished_token(
-                  seq_output.logprobs.value()[j]
-                      .top_logprobs.value()[k]
-                      .finished_token);
-            }
-          }
-        }
-      }
-    }
+    // Construct the request to corresponding service.
+    fill_generation_request(output, batch.gens.mutable_gens()->Add());
   }
 
   // Use brpc semi-synchronous RPC pattern (DoNothing + Join) instead of
@@ -530,40 +574,37 @@ std::vector<bool> XServiceClient::generations(
   // thread via butex_wait, avoiding the deadlock that occurs when
   // folly::SemiFuture::wait() blocks all brpc workers with a pthread futex.
   struct AsyncCallContext {
-    std::string service_addr;
+    const std::string* service_addr = nullptr;
+    const ServiceBatch* batch = nullptr;
     brpc::Controller cntl;
     proto::StatusSet resp;
-    proto::DisaggStreamGenerations gens;
     bool issued = false;
   };
 
-  const size_t num_services = service_requests_map.size();
+  const size_t num_services = service_batches.size();
   std::vector<AsyncCallContext> contexts(num_services);
-  std::vector<std::string> service_order;
-  service_order.reserve(num_services);
 
   // Fire all RPCs asynchronously
   size_t idx = 0;
-  for (const auto& pair : service_requests_map) {
+  for (auto& pair : service_batches) {
     auto& ctx = contexts[idx++];
-    ctx.service_addr = pair.first;
-    ctx.gens = pair.second;
-    service_order.push_back(ctx.service_addr);
+    ctx.service_addr = &pair.first;
+    ctx.batch = &pair.second;
 
-    if (!connect_to_xservice(ctx.service_addr)) {
-      LOG(ERROR) << "Failed to connect target xservice: " << ctx.service_addr;
+    if (!connect_to_xservice(*ctx.service_addr)) {
+      LOG(ERROR) << "Failed to connect target xservice: " << *ctx.service_addr;
       continue;
     }
 
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    auto* service_stub = find_stub_locked(ctx.service_addr);
+    auto* service_stub = find_stub_locked(*ctx.service_addr);
     if (service_stub == nullptr) {
-      LOG(ERROR) << "No stub available for xservice: " << ctx.service_addr;
+      LOG(ERROR) << "No stub available for xservice: " << *ctx.service_addr;
       continue;
     }
     ctx.issued = true;
     service_stub->Generations(
-        &ctx.cntl, &ctx.gens, &ctx.resp, brpc::DoNothing());
+        &ctx.cntl, &pair.second.gens, &ctx.resp, brpc::DoNothing());
   }
 
   // Wait for all RPCs — bthread-aware, yields brpc worker properly
@@ -574,20 +615,17 @@ std::vector<bool> XServiceClient::generations(
   }
 
   // Process results
-  for (size_t i = 0; i < contexts.size(); ++i) {
-    const std::string& service_addr = service_order[i];
-    auto& ctx = contexts[i];
-    auto index_it = service_outputs_map.find(service_addr);
-    CHECK(index_it != service_outputs_map.end())
-        << "No output index found for service: " << service_addr;
-    const auto& indices = index_it->second;
+  for (auto& ctx : contexts) {
+    CHECK(ctx.service_addr != nullptr);
+    CHECK(ctx.batch != nullptr);
+    const std::string& service_addr = *ctx.service_addr;
+    const auto& indices = ctx.batch->output_indices;
 
     if (!ctx.issued || ctx.cntl.Failed()) {
       if (ctx.cntl.Failed()) {
         LOG(ERROR) << "Fail to response tokens to xservice server "
                    << service_addr << ", error text: " << ctx.cntl.ErrorText();
       }
-      mark_service_failed(service_addr);
       continue;
     }
 

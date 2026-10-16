@@ -1,6 +1,7 @@
 include(cc_library)
 
 add_subdirectory(block)
+add_subdirectory(events)
 add_subdirectory(prefix)
 add_subdirectory(transfer)
 
@@ -101,6 +102,7 @@ cc_library(
   HDRS
     layout/cache_layout_builder.h
     layout/cache_layout_types.h
+    linear_state_types.h
     storage/deepseek_v4_kv_cache_impl.h
     storage/indexed_kv_cache_impl.h
     storage/kpool_kv_cache_impl.h
@@ -138,4 +140,19 @@ cc_library(
     $<$<BOOL:${USE_MLU}>:cndrv>
     $<$<BOOL:${USE_NPU}>:ascendcl>
     $<$<BOOL:${USE_NPU}>:torch_npu>
+)
+
+# Keep worker-side state preparation separate from the base cache storage.
+cc_library(
+  NAME
+    linear_state_restore
+  HDRS
+    linear_state_restore.h
+  SRCS
+    linear_state_restore.cpp
+  DEPS
+    :common
+    :kv_cache
+    glog::glog
+    torch
 )

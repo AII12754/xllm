@@ -59,6 +59,10 @@ BlockManagerImpl::BlockManagerImpl(const Options& options)
         .block_type(options.block_type());
     prefix_cache_ = create_prefix_cache(prefix_cache_options);
     CHECK(prefix_cache_) << "Failed to create prefix cache!";
+    if (options.event_journal()) {
+      prefix_cache_->set_event_sink(options.event_journal(),
+                                    options.event_scope());
+    }
   }
 
   size_t total_blocks = options_.num_blocks();

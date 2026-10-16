@@ -84,6 +84,7 @@ cc_binary(
   DEPS
     :config
     :batch
+    :worker_model_codec
     torch
     benchmark::benchmark
     $<$<BOOL:${USE_NPU}>:npu_startup>

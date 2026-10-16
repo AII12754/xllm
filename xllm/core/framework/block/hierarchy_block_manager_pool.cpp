@@ -535,6 +535,11 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
           .enable_disagg_pd(options_.enable_disagg_pd())
           .enable_kvcache_store(options_.enable_kvcache_store())
           .enable_host_offload(options_.enable_host_offload());
+      if (host_options.event_journal()) {
+        KVCacheEventScope scope = host_options.event_scope();
+        scope.medium = "cpu";
+        host_options.event_scope(scope);
+      }
 
       std::unique_ptr<BlockManager> leaf;
       if (type == BlockType::SWA) {
@@ -1263,7 +1268,10 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
                       device_block_mgr_ptr = block_managers_[i].get(),
                       host_leaves = std::move(host_leaves_snapshot)](
                          std::vector<folly::Try<uint32_t>>&& results) mutable {
-            bool copy_ok = true;
+            bool copy_ok = !results.empty();
+            if (results.empty()) {
+              LOG(ERROR) << "Offload copy returned no worker acknowledgements";
+            }
             for (auto&& result : results) {
               if (result.hasException()) {
                 LOG(ERROR) << "Offload RPC failed: "
@@ -1278,15 +1286,16 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
               }
             }
 
-            // Always release the reserved ids so the block pools do not leak.
-            device_block_mgr_ptr->deallocate(device_blocks);
-            device_blocks.clear();
-
             // Successful copies become visible in the Host prefix cache.
             // Failures publish nothing, but both paths release every reserved
             // Host id through the same type-aware ownership path.
             finalize_host_blocks(
                 copy_ok, std::move(host_blocks), block_types_vec, host_leaves);
+
+            // Keep the source aliases until Host publication has retained its
+            // content metadata. Otherwise an eviction can race store_copy.
+            device_block_mgr_ptr->deallocate(device_blocks);
+            device_blocks.clear();
 
             return 0;
           })

@@ -71,11 +71,11 @@ class WorkerMemoryRpcClient final {
   // Get virtual-memory KV block byte offsets in the shared physical-page pool
   // mapping for PD disaggregation. Returns an empty vector on error.
   // Result: layer_offsets[layer_id] = {k_offsets, v_offsets}.
-  folly::SemiFuture<
-      std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>>
-  get_virtual_kv_cache_offsets_async(const std::string& model_id,
-                                     const std::vector<int32_t>& block_ids,
-                                     uint64_t block_size_bytes);
+  // Waits through brpc::Join so callers running in bthreads yield the worker.
+  std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>
+  get_virtual_kv_cache_offsets(const std::string& model_id,
+                               const std::vector<int32_t>& block_ids,
+                               uint64_t block_size_bytes);
 
  private:
   DISALLOW_COPY_AND_ASSIGN(WorkerMemoryRpcClient);

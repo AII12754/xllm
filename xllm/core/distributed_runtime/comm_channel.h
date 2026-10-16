@@ -81,19 +81,19 @@ class CommChannel {
                               const std::string& src_addr,
                               const std::vector<KVTransferMapping>& mappings);
 
-  virtual void execute_model_async(
+  virtual void execute_llm_model_async(
       const LlmForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise);
 
-  virtual void execute_model_async(
+  virtual void execute_dit_model_async(
       const DiTForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise);
 
-  virtual void execute_model_async(
+  virtual void execute_rec_model_async(
       const RecForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise);
 
-  virtual void execute_model_async(
+  virtual void execute_vlm_model_async(
       const VlmForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise);
 
@@ -114,7 +114,10 @@ class CommChannel {
                                      std::shared_ptr<PrefetchResult> result,
                                      size_t worker_index);
 
-  virtual bool get_last_step_result_async(
+  virtual bool get_last_llm_step_result_async(
+      folly::Promise<std::optional<RawForwardOutput>>& promise);
+
+  virtual bool get_last_vlm_step_result_async(
       folly::Promise<std::optional<RawForwardOutput>>& promise);
 
   virtual bool get_active_activation_memory(int64_t& memory);
@@ -134,19 +137,19 @@ class CommChannel {
   virtual bool stop_profile();
 
  protected:
-  bool execute_model_with_brpc(
+  bool execute_llm_model_with_brpc(
       const LlmForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise);
 
-  bool execute_model_with_brpc(
+  bool execute_dit_model_with_brpc(
       const DiTForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise);
 
-  bool execute_model_with_brpc(
+  bool execute_rec_model_with_brpc(
       const RecForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise);
 
-  bool execute_model_with_brpc(
+  bool execute_vlm_model_with_brpc(
       const VlmForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise);
 
@@ -165,11 +168,38 @@ class InitModelClosure : public google::protobuf::Closure {
   folly::Promise<bool> promise;
 };
 
-class ExecuteModelClosure : public google::protobuf::Closure {
+class ExecuteLLMModelClosure final : public google::protobuf::Closure {
  public:
-  void Run();
+  void Run() override;
 
-  proto::ForwardOutput pb_output;
+  proto::LLMForwardResponse pb_output;
+  brpc::Controller cntl;
+  folly::Promise<std::optional<RawForwardOutput>> promise;
+};
+
+class ExecuteVLMModelClosure final : public google::protobuf::Closure {
+ public:
+  void Run() override;
+
+  proto::VLMForwardResponse pb_output;
+  brpc::Controller cntl;
+  folly::Promise<std::optional<RawForwardOutput>> promise;
+};
+
+class ExecuteRECModelClosure final : public google::protobuf::Closure {
+ public:
+  void Run() override;
+
+  proto::RECForwardResponse pb_output;
+  brpc::Controller cntl;
+  folly::Promise<std::optional<RawForwardOutput>> promise;
+};
+
+class ExecuteDITModelClosure final : public google::protobuf::Closure {
+ public:
+  void Run() override;
+
+  proto::DITForwardResponse pb_output;
   brpc::Controller cntl;
   folly::Promise<std::optional<RawForwardOutput>> promise;
 };

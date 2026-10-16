@@ -113,6 +113,17 @@ class ForwardSharedMemoryManager : public SharedMemoryManager {
   bool input_write(const DiTForwardInput& input);
   bool input_read(DiTForwardInput& input);
 
+  // Check transport support and capacity without copying tensor payloads.
+  // Every rank in a DP group must select the same transport before execution.
+  static bool can_write_input(const DiTForwardInput& input,
+                              size_t segment_size);
+  static bool can_write_input(const RecForwardInput& input,
+                              size_t segment_size);
+  static bool can_write_input(const VlmForwardInput& input,
+                              size_t segment_size);
+  static bool can_write_input(const LlmForwardInput& input,
+                              size_t segment_size);
+
   bool input_write(const RecForwardInput& input);
   bool input_read(RecForwardInput& input,
                   const torch::Device& device,
@@ -130,24 +141,23 @@ class ForwardSharedMemoryManager : public SharedMemoryManager {
                   const torch::Device& device,
                   InputDeviceMaterializationPolicy policy =
                       InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ);
-  bool raw_output_write(
-      const torch::Tensor& next_tokens,
-      const torch::Tensor& logprobs,
-      const torch::Tensor& top_tokens,
-      const torch::Tensor& top_logprobs,
-      const torch::Tensor& embeddings,
-      const std::vector<std::vector<torch::Tensor>>& mm_embeddings,
-      const std::vector<SpeculativeTokenStats>& speculative_token_stats,
-      const std::vector<torch::Tensor>& dit_images,
-      const std::vector<std::string>& dit_text_output,
-      const std::vector<torch::Tensor>& dit_audio,
-      const torch::Tensor& expert_load_data,
-      int64_t prepared_token,
-      const torch::Tensor& src_seq_idxes,
-      const torch::Tensor& out_tokens,
-      const torch::Tensor& out_logprobs,
-      const std::vector<JsonObjectOutputError>& json_object_errors);
-  void raw_output_read(RawForwardOutput& outputs);
+
+  bool llm_output_write(
+      const ForwardOutput& output,
+      const std::vector<SpeculativeTokenStats>& speculative_token_stats);
+  bool vlm_output_write(
+      const ForwardOutput& output,
+      const std::vector<SpeculativeTokenStats>& speculative_token_stats);
+  bool rec_output_write(
+      const ForwardOutput& output,
+      const std::vector<SpeculativeTokenStats>& speculative_token_stats);
+  bool dit_output_write(const DiTForwardOutput& output);
+
+  // Read into owned storage and replace the destination only on success.
+  bool llm_output_read(RawForwardOutput& output);
+  bool vlm_output_read(RawForwardOutput& output);
+  bool rec_output_read(RawForwardOutput& output);
+  bool dit_output_read(RawForwardOutput& output);
 
   // Permanently cancel input reads on this local manager without publishing
   // a synthetic request or changing the shared segment for other readers.

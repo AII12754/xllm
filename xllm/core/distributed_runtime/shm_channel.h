@@ -14,7 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
-#include "comm_channel.h"
+#include "core/distributed_runtime/comm_channel.h"
 #include "runtime/forward_shared_memory_manager.h"
 #include "runtime/options.h"
 
@@ -28,32 +28,25 @@ class ShmChannel : public CommChannel {
                       const runtime::Options& options);
   ~ShmChannel() = default;
 
-  void execute_model_async(
+  void execute_llm_model_async(
       const LlmForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise) override;
 
-  void execute_model_async(
+  void execute_dit_model_async(
       const DiTForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise) override;
 
-  void execute_model_async(
+  void execute_rec_model_async(
       const RecForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise) override;
 
-  void execute_model_async(
+  void execute_vlm_model_async(
       const VlmForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise) override;
 
  private:
-  template <typename Input>
-  void execute_model_async_impl(
-      const Input& input,
-      folly::Promise<std::optional<RawForwardOutput>>& promise);
-
-  bool execute_model_with_shm(const LlmForwardInput& input,
-                              RawForwardOutput& raw_output);
-
   bool enable_shm_ = false;
+  size_t input_shm_size_ = 0;
   std::unique_ptr<ForwardSharedMemoryManager> input_shm_manager_ = nullptr;
   std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager_ = nullptr;
 };

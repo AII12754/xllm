@@ -300,6 +300,9 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   // initialize block manager
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks())
+      .kv_events_config(options_.is_draft_engine()
+                            ? std::string()
+                            : KVCacheConfig::get_instance().kv_events_config())
       .host_num_blocks(0)  // no host cache for vlm engine currently.
       .block_size(block_size)
       .enable_linear_state(enable_state_cache)
@@ -432,7 +435,7 @@ void VLMEngine::update_last_step_result(BatchGroup& last_batch) {
   for (int32_t worker_rank = 0; worker_rank < worker_clients_num_;
        worker_rank += stride) {
     futures.emplace_back(
-        worker_clients_[worker_rank]->get_last_step_result_async());
+        worker_clients_[worker_rank]->get_last_vlm_step_result_async());
   }
   // wait for the all future to complete
   auto last_step_results = folly::collectAll(futures).get();

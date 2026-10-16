@@ -470,6 +470,60 @@ TEST(BatchPackedInputTest, PackedCopyKeepsStagingAliveAfterSourceRelease) {
 }
 
 #if defined(USE_NPU)
+namespace {
+
+template <typename Input>
+void expect_preparation_reuses_only_pinned_payload() {
+  ScopedContiguousInputBuffer contiguous_input_buffer(/*enabled=*/true);
+  const torch::Device device(torch::kPrivateUse1, 0);
+  Input source;
+  source.token_ids = torch::tensor({11, 23}, torch::kInt32);
+  source.positions = torch::tensor({0, 1}, torch::kInt32);
+  source.input_params.multi_block_tables = {
+      torch::tensor({{3, 7}}, torch::kInt32)};
+  proto::PackedForwardInput packed_input;
+  ASSERT_TRUE(source.to_packed_proto(&packed_input));
+  Input lazy_input;
+  ASSERT_TRUE(lazy_input.from_packed_proto(packed_input));
+  ASSERT_TRUE(lazy_input.runtime.input_host_buffer.is_pinned());
+  const void* pinned_data = lazy_input.runtime.input_host_buffer.data_ptr();
+  Input prepared = lazy_input.to(device, torch::kFloat32);
+  EXPECT_EQ(prepared.runtime.input_host_buffer.data_ptr(), pinned_data);
+  lazy_input = Input();
+  EXPECT_TRUE(torch::equal(prepared.token_ids.cpu(), source.token_ids));
+  EXPECT_TRUE(torch::equal(prepared.positions_host, source.positions));
+
+  Input unpinned_input;
+  ASSERT_TRUE(unpinned_input.from_packed_proto(packed_input));
+  torch::Tensor unpinned_buffer =
+      torch::empty(unpinned_input.runtime.input_host_buffer.sizes(),
+                   torch::TensorOptions().dtype(torch::kUInt8));
+  unpinned_buffer.copy_(unpinned_input.runtime.input_host_buffer);
+  ASSERT_FALSE(unpinned_buffer.is_pinned());
+  unpinned_input.runtime.input_host_buffer = std::move(unpinned_buffer);
+  const void* unpinned_data =
+      unpinned_input.runtime.input_host_buffer.data_ptr();
+  Input staged = unpinned_input.to(device, torch::kFloat32);
+  EXPECT_NE(staged.runtime.input_host_buffer.data_ptr(), unpinned_data);
+  EXPECT_TRUE(staged.runtime.input_host_buffer.is_pinned());
+  unpinned_input = Input();
+  EXPECT_TRUE(torch::equal(staged.token_ids.cpu(), source.token_ids));
+  EXPECT_TRUE(torch::equal(staged.positions_host, source.positions));
+  ASSERT_EQ(staged.input_params.multi_block_tables.size(), 1u);
+  EXPECT_TRUE(torch::equal(staged.input_params.multi_block_tables[0],
+                           source.input_params.multi_block_tables[0]));
+}
+
+}  // namespace
+
+TEST(BatchPackedInputTest, LlmPreparationReusesOnlyPinnedPayload) {
+  expect_preparation_reuses_only_pinned_payload<LlmForwardInput>();
+}
+
+TEST(BatchPackedInputTest, VlmPreparationReusesOnlyPinnedPayload) {
+  expect_preparation_reuses_only_pinned_payload<VlmForwardInput>();
+}
+
 TEST(BatchPackedInputTest, MaterializedShmReadRebindsTaggedTensorArena) {
   ScopedContiguousInputBuffer contiguous_input_buffer(/*enabled=*/true);
   const torch::Device device(torch::kPrivateUse1, 0);
@@ -676,6 +730,158 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearStateCacheOps) {
       unpacked_input.input_params.linear_state_cache_ops[0], restore_op);
   expect_linear_state_cache_op_eq(
       unpacked_input.input_params.linear_state_cache_ops[1], direct_read_op);
+}
+
+namespace {
+
+template <typename Input>
+void expect_repeated_unpack_replaces_multi_block_tables() {
+  ScopedContiguousInputBuffer contiguous_input_buffer(/*enabled=*/false);
+  Input source;
+  source.input_params.multi_block_tables = {
+      torch::tensor({{3, 7}}, torch::kInt32),
+      torch::tensor({{11, 13}}, torch::kInt32)};
+  proto::PackedForwardInput packed_input;
+  ASSERT_TRUE(source.to_packed_proto(&packed_input));
+  Input lazy_input;
+  ASSERT_TRUE(lazy_input.from_packed_proto(packed_input));
+  Input first_input;
+  ASSERT_TRUE(detail::unpack_from_input_host_buffer(
+      lazy_input,
+      torch::Device(torch::kCPU),
+      torch::kFloat32,
+      first_input,
+      /*materialize_device_buffer=*/false));
+  ASSERT_EQ(first_input.input_params.multi_block_tables.size(), 2u);
+  Input second_input;
+  ASSERT_TRUE(detail::unpack_from_input_host_buffer(
+      first_input,
+      torch::Device(torch::kCPU),
+      torch::kFloat32,
+      second_input,
+      /*materialize_device_buffer=*/false));
+  ASSERT_EQ(second_input.input_params.multi_block_tables.size(), 2u);
+  for (size_t index = 0; index < 2; ++index) {
+    EXPECT_TRUE(
+        torch::equal(second_input.input_params.multi_block_tables[index],
+                     source.input_params.multi_block_tables[index]));
+    EXPECT_NE(second_input.input_params.multi_block_tables[index].data_ptr(),
+              first_input.input_params.multi_block_tables[index].data_ptr());
+  }
+  first_input.input_params.multi_block_tables[0].fill_(99);
+  EXPECT_TRUE(torch::equal(second_input.input_params.multi_block_tables[0],
+                           source.input_params.multi_block_tables[0]));
+}
+
+}  // namespace
+
+TEST(BatchPackedInputTest, RepeatedLlmUnpackReplacesMultiBlockTables) {
+  expect_repeated_unpack_replaces_multi_block_tables<LlmForwardInput>();
+}
+
+TEST(BatchPackedInputTest, RepeatedVlmUnpackReplacesMultiBlockTables) {
+  expect_repeated_unpack_replaces_multi_block_tables<VlmForwardInput>();
+}
+
+namespace {
+
+template <typename Input>
+void expect_packed_sample_count_hint() {
+  ScopedContiguousInputBuffer contiguous_input_buffer(/*enabled=*/false);
+  Input source;
+  source.sampling_params.selected_token_idxes =
+      torch::tensor({0, 1}, torch::kInt32);
+  source.sampling_params.sample_idxes = torch::tensor({0, 1}, torch::kInt32);
+  proto::PackedForwardInput packed;
+  ASSERT_TRUE(source.to_packed_proto(&packed));
+  ASSERT_TRUE(packed.has_sample_count());
+  EXPECT_EQ(packed.sample_count(), 2);
+  Input lazy;
+  ASSERT_TRUE(lazy.from_packed_proto(packed));
+  EXPECT_EQ(lazy.input_host_sample_count, 2);
+  EXPECT_EQ(lazy.clone().input_host_sample_count, 2);
+  EXPECT_FALSE(lazy.sampling_params.sample_idxes.defined());
+  EXPECT_FALSE(lazy.sampling_params.selected_token_idxes.defined());
+
+  const void* retained_data = lazy.runtime.input_host_buffer.data_ptr();
+  packed.set_sample_count(-1);
+  EXPECT_FALSE(lazy.from_packed_proto(packed));
+  EXPECT_EQ(lazy.runtime.input_host_buffer.data_ptr(), retained_data);
+  packed.set_sample_count(std::numeric_limits<int32_t>::max());
+  EXPECT_FALSE(lazy.from_packed_proto(packed));
+  packed.set_sample_count(static_cast<int32_t>(
+      read_packed_uint64(packed.payload(), /*offset=*/32) / sizeof(int32_t) +
+      1));
+  EXPECT_FALSE(lazy.from_packed_proto(packed));
+
+  const std::string retained_proto = packed.SerializeAsString();
+  source.sampling_params.sample_idxes =
+      source.sampling_params.sample_idxes.reshape({1, 2});
+  EXPECT_FALSE(source.to_packed_proto(&packed));
+  EXPECT_EQ(packed.SerializeAsString(), retained_proto);
+
+  packed.clear_sample_count();
+  ASSERT_TRUE(lazy.from_packed_proto(packed));
+  EXPECT_EQ(lazy.input_host_sample_count, kUnknownPackedSampleCount);
+  Input unpacked;
+  ASSERT_TRUE(detail::unpack_from_input_host_buffer(
+      lazy,
+      torch::Device(torch::kCPU),
+      torch::kFloat32,
+      unpacked,
+      /*materialize_device_buffer=*/false));
+  EXPECT_EQ(unpacked.input_host_sample_count, 2);
+
+  Input empty;
+  ASSERT_TRUE(empty.to_packed_proto(&packed));
+  ASSERT_TRUE(lazy.from_packed_proto(packed));
+  EXPECT_EQ(lazy.input_host_sample_count, 0);
+  DiTForwardInput dit;
+  ASSERT_TRUE(dit.to_packed_proto(&packed));
+  EXPECT_FALSE(packed.has_sample_count());
+}
+
+template <typename Input>
+void expect_packed_sample_count_mismatch_rejected() {
+  ScopedContiguousInputBuffer contiguous_input_buffer(/*enabled=*/false);
+  Input source;
+  source.sampling_params.selected_token_idxes =
+      torch::tensor({0, 1}, torch::kInt32);
+  source.sampling_params.sample_idxes = torch::tensor({0, 1}, torch::kInt32);
+  proto::PackedForwardInput packed;
+  ASSERT_TRUE(source.to_packed_proto(&packed));
+  packed.set_sample_count(1);
+  Input lazy;
+  ASSERT_TRUE(lazy.from_packed_proto(packed));
+  EXPECT_DEATH(
+      {
+        Input unpacked;
+        detail::unpack_from_input_host_buffer(
+            lazy,
+            torch::Device(torch::kCPU),
+            torch::kFloat32,
+            unpacked,
+            /*materialize_device_buffer=*/false);
+      },
+      "Packed sample count does not match sample_idxes");
+}
+
+}  // namespace
+
+TEST(BatchPackedInputTest, LlmPackedSampleCountAvoidsMaterialization) {
+  expect_packed_sample_count_hint<LlmForwardInput>();
+}
+
+TEST(BatchPackedInputTest, VlmPackedSampleCountAvoidsMaterialization) {
+  expect_packed_sample_count_hint<VlmForwardInput>();
+}
+
+TEST(BatchPackedInputDeathTest, LlmPackedSampleCountMustMatchPayload) {
+  expect_packed_sample_count_mismatch_rejected<LlmForwardInput>();
+}
+
+TEST(BatchPackedInputDeathTest, VlmPackedSampleCountMustMatchPayload) {
+  expect_packed_sample_count_mismatch_rejected<VlmForwardInput>();
 }
 
 TEST(BatchPackedInputTest, PackedProtoLazyUnpackRestoresSampleIdxes) {

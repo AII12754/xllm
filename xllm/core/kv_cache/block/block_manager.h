@@ -33,6 +33,7 @@ limitations under the License.
 #include "common/types.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/kv_cache/block/block.h"
+#include "core/kv_cache/events/kv_cache_event_journal.h"
 #include "core/kv_cache/prefix/block_hasher.h"
 #include "util/timer.h"
 
@@ -82,6 +83,8 @@ class BlockManager {
     PROPERTY(int64_t, num_layers) = 0;
     PROPERTY(int64_t, slot_size) = 0;
     PROPERTY(std::string, model_id);
+    PROPERTY(std::shared_ptr<KVCacheEventJournal>, event_journal);
+    PROPERTY(KVCacheEventScope, event_scope);
     // Linear-state (Qwen3.5 GDN) resource leaf. When enable_linear_state is
     // set, build_composite_leaves appends a LINEAR leaf on top of the KV
     // family. linear_state_num_slots is the total physical slot count [0, N)

@@ -30,6 +30,7 @@ limitations under the License.
 #include "common/types.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/kv_cache/block/block.h"
+#include "core/kv_cache/events/kv_cache_event_journal.h"
 #include "core/kv_cache/prefix/block_hasher.h"
 #include "util/hash_util.h"
 #include "util/slice.h"
@@ -62,9 +63,23 @@ class PrefixCache {
       : block_size_(block_size), hasher_type_(hasher_type), num_blocks_(0) {}
 
   virtual ~PrefixCache() {
+    if (event_journal_) {
+      for (const auto& [hash, node] : cached_blocks_) {
+        event_journal_->remove(event_scope_,
+                               KVCacheEventJournal::encode_hash(hash.data));
+      }
+    }
     exited_.store(true);
     sleep(2);
   };
+
+  void set_event_sink(std::shared_ptr<KVCacheEventJournal> journal,
+                      KVCacheEventScope scope) {
+    CHECK_EQ(num_blocks_, 0);
+    CHECK(hasher_type_ == BlockHasherType::TEXT);
+    event_journal_ = std::move(journal);
+    event_scope_ = std::move(scope);
+  }
 
   // Solid-prefix probe: walks the chain per block position, stops on the
   // first miss. Reach in tokens is `returned.size() * block_size_`.
@@ -120,6 +135,8 @@ class PrefixCache {
                                     const size_t cached_blocks = 0);
 
  protected:
+  std::shared_ptr<KVCacheEventJournal> event_journal_;
+  KVCacheEventScope event_scope_;
   struct Node {
     Block block;
     int64_t last_access_time = 0;

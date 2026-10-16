@@ -19,12 +19,12 @@ limitations under the License.
 // LlmForwardInput (ForwardInputBuilder), serialises that for the remote worker
 // (packed proto), the worker unpacks it before the H2D copy, and after the
 // model + sampler have run the worker serialises the sampled tokens back
-// (proto::ForwardOutput), which the engine turns into a RawForwardOutput and
-// feeds to Batch::process_sample_output. Everything here is host-side CPU work
-// and is timed with CPU tensors; the model forward, sampler and device copies
-// are the only steps of the pipeline that are not covered. NPU builds still
-// require a device for the backend's pinned host-memory allocator. Use the
-// separate batch_factory_benchmark target to measure batch creation without
+// (proto::LLMForwardResponse), which the engine turns into a RawForwardOutput
+// and feeds to Batch::process_sample_output. Everything here is host-side CPU
+// work and is timed with CPU tensors; the model forward, sampler and device
+// copies are the only steps of the pipeline that are not covered. NPU builds
+// still require a device for the backend's pinned host-memory allocator. Use
+// the separate batch_factory_benchmark target to measure batch creation without
 // Python or device initialization.
 //
 //   * BM_BlockManagerPool_AllocateRelease - prefix match + block allocation
@@ -69,6 +69,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/common/types.h"
+#include "core/distributed_runtime/worker_model_codec.h"
 #include "core/framework/batch/batch.h"
 #include "core/framework/block/block_manager_pool.h"
 #include "core/framework/model/model_args.h"
@@ -363,7 +364,8 @@ void BM_ForwardInput_FromPackedProto(benchmark::State& state) {
   const torch::Device cpu(torch::kCPU);
 
   for (auto _ : state) {
-    // WorkerService::ExecuteModel: proto -> lazily unpacked LlmForwardInput ...
+    // WorkerService::ExecuteLLMModel: proto -> lazily unpacked LlmForwardInput
+    // ...
     LlmForwardInput lazy_input;
     CHECK(lazy_input.from_packed_proto(packed_input));
     // ... which the worker materialises into individual host tensors before
@@ -383,7 +385,7 @@ void BM_ForwardInput_FromPackedProto(benchmark::State& state) {
 }
 
 // --------------------------------------------------------------------------
-// Worker side: sampled tokens -> proto::ForwardOutput
+// Worker side: sampled tokens -> proto::LLMForwardResponse
 // --------------------------------------------------------------------------
 
 // range(0): batch size, range(1): logprobs (0/1).
@@ -398,11 +400,11 @@ void BM_ForwardOutput_ToProto(benchmark::State& state) {
   ForwardOutput forward_output;
   forward_output.sample_output.next_tokens = next_tokens;
   forward_output.sample_output.logprobs = token_logprobs;
-  proto::ForwardOutput pb_output;
+  proto::LLMForwardResponse pb_output;
 
   for (auto _ : state) {
     pb_output.Clear();
-    CHECK(forward_output.to_proto(/*stats=*/{}, &pb_output));
+    CHECK(encode_llm_output(forward_output, /*stats=*/{}, &pb_output));
     do_not_optimize(pb_output.outputs_size());
   }
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) *
@@ -410,7 +412,7 @@ void BM_ForwardOutput_ToProto(benchmark::State& state) {
 }
 
 // --------------------------------------------------------------------------
-// Engine side: proto::ForwardOutput -> RawForwardOutput -> Sequence
+// Engine side: proto::LLMForwardResponse -> RawForwardOutput -> Sequence
 // --------------------------------------------------------------------------
 
 void BM_ForwardOutput_FromProto(benchmark::State& state) {
@@ -424,12 +426,12 @@ void BM_ForwardOutput_FromProto(benchmark::State& state) {
   ForwardOutput forward_output;
   forward_output.sample_output.next_tokens = next_tokens;
   forward_output.sample_output.logprobs = token_logprobs;
-  proto::ForwardOutput pb_output;
-  CHECK(forward_output.to_proto(/*stats=*/{}, &pb_output));
+  proto::LLMForwardResponse pb_output;
+  CHECK(encode_llm_output(forward_output, /*stats=*/{}, &pb_output));
 
   for (auto _ : state) {
     RawForwardOutput raw_output;
-    CHECK(raw_output.from_proto(pb_output));
+    CHECK(decode_llm_output(pb_output, raw_output));
     do_not_optimize(raw_output.outputs.data());
   }
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) *

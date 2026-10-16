@@ -27,7 +27,6 @@ limitations under the License.
 
 #include "core/framework/batch/batch.h"
 #include "core/framework/config/execution_config.h"
-#include "core/framework/kv_cache/linear_state_restore.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_loader/model_loader.h"
@@ -38,6 +37,7 @@ limitations under the License.
 #include "core/kernels/ops_api.h"
 #include "core/kv_cache/block/block.h"
 #include "core/kv_cache/block/block_manager_impl.h"
+#include "core/kv_cache/linear_state_restore.h"
 #include "core/kv_cache/storage/kv_cache.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"

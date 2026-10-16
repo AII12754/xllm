@@ -353,6 +353,9 @@ bool LLMEngine::allocate_kv_cache(
       ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks())
+      .kv_events_config(options_.is_draft_engine()
+                            ? std::string()
+                            : kv_cache_config.kv_events_config())
       .hasher_type(mtp_hasher_type(BlockHasherType::TEXT,
                                    options_.num_speculative_tokens(),
                                    options_.speculative_algorithm()))
@@ -614,7 +617,7 @@ void LLMEngine::update_last_step_result(BatchGroup& last_batch) {
   for (auto worker_rank = 0; worker_rank < worker_clients_num_;
        worker_rank += stride) {
     futures.emplace_back(
-        worker_clients_[worker_rank]->get_last_step_result_async());
+        worker_clients_[worker_rank]->get_last_llm_step_result_async());
   }
   // wait for the all future to complete
   auto last_step_results = folly::collectAll(futures).get();

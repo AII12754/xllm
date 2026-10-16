@@ -18,8 +18,8 @@ limitations under the License.
 #include <cstdint>
 #include <vector>
 
+#include "core/kv_cache/linear_state_types.h"
 #include "core/kv_cache/storage/kv_cache.h"
-#include "framework/model/model_input_types.h"
 
 namespace xllm {
 

@@ -153,7 +153,10 @@ class WorkerClient {
   virtual const torch::Device& device() const;
 
   virtual folly::SemiFuture<std::optional<RawForwardOutput>>
-  get_last_step_result_async();
+  get_last_llm_step_result_async();
+
+  virtual folly::SemiFuture<std::optional<RawForwardOutput>>
+  get_last_vlm_step_result_async();
 
   virtual folly::SemiFuture<std::optional<ForwardOutput>>
   get_last_step_result_single_process_async();

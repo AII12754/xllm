@@ -12,7 +12,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include "worker_service.h"
+#include "core/distributed_runtime/worker_service.h"
 
 #include <brpc/closure_guard.h>
 #include <brpc/controller.h>
@@ -21,29 +21,25 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
-#include <boost/algorithm/string.hpp>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <type_traits>
+#include <tuple>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "common/device_monitor.h"
-#include "common/global_flags.h"
 #include "common/metrics.h"
 #include "common/types.h"
-#include "core/distributed_runtime/comm_channel.h"
-#include "core/framework/config/eplb_config.h"
+#include "core/distributed_runtime/worker_model_codec.h"
 #include "core/framework/speculative/metrics.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/transfer/kv_transport_codec.h"
-#include "framework/model/model_input_params.h"
-#include "framework/request/sequence.h"
-#include "framework/sampling/sampling_params.h"
+#include "core/kv_cache/transfer/prefetch_result.h"
+#include "core/util/tensor_helper.h"
+#include "runtime/dit_forward_params.h"
 #include "runtime/forward_params.h"
 #include "runtime/rec_forward_params.h"
 #include "runtime/vlm_forward_params.h"
@@ -52,27 +48,42 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-template <typename Input>
-int32_t get_num_decode_seqs_for_schedule_overlap(const Input& input) {
+std::vector<SpeculativeTokenStats> record_llm_speculative_metrics(
+    const ForwardOutput& output,
+    const torch::Tensor& cpu_next_tokens,
+    bool speculative_decode) {
+  if (output.is_graph_warmup || !speculative_decode) {
+    return {};
+  }
+  if (output.spec_verify_layouts.empty()) {
+    CHECK(!cpu_next_tokens.defined() || cpu_next_tokens.dim() != 2)
+        << "speculative verify output is missing row metadata";
+    return {};
+  }
+  // Reuse the completed output copy instead of issuing another D2H for metrics.
+  SpecMetrics metrics =
+      make_spec_metrics(cpu_next_tokens, output.spec_verify_layouts);
+  record_spec_metrics(metrics);
+  return std::move(metrics.sequence_stats);
+}
+
+int32_t get_llm_decode_sequence_count(const LlmForwardInput& input) {
   if (input.sampling_params.sample_idxes.defined()) {
     return static_cast<int32_t>(input.sampling_params.sample_idxes.size(0));
   }
-
   if (input.input_host_sample_count != kUnknownPackedSampleCount) {
     return input.input_host_sample_count;
   }
-
   if (!input.runtime.input_host_buffer_has_layout) {
     return 0;
   }
-
-  Input unpacked_input;
-  const bool unpacked =
-      detail::unpack_from_input_host_buffer(input,
-                                            torch::Device(torch::kCPU),
-                                            torch::kFloat32,
-                                            unpacked_input,
-                                            false);
+  LlmForwardInput unpacked_input;
+  const bool unpacked = detail::unpack_from_input_host_buffer(
+      input,
+      torch::Device(torch::kCPU),
+      torch::kFloat32,
+      unpacked_input,
+      /*materialize_device_buffer=*/false);
   if (!unpacked || !unpacked_input.sampling_params.sample_idxes.defined()) {
     return 0;
   }
@@ -80,7 +91,7 @@ int32_t get_num_decode_seqs_for_schedule_overlap(const Input& input) {
       unpacked_input.sampling_params.sample_idxes.size(0));
 }
 
-torch::Tensor clone_cpu_tensor_view(const torch::Tensor& tensor) {
+torch::Tensor clone_llm_cpu_view(const torch::Tensor& tensor) {
   if (!tensor.defined()) {
     return tensor;
   }
@@ -88,29 +99,110 @@ torch::Tensor clone_cpu_tensor_view(const torch::Tensor& tensor) {
   return tensor.contiguous().clone();
 }
 
-template <typename Input>
-void stabilize_schedule_overlap_host_views(Input& input) {
-  input.token_ids_host = clone_cpu_tensor_view(input.token_ids_host);
-  input.positions_host = clone_cpu_tensor_view(input.positions_host);
+void stabilize_llm_host_views(LlmForwardInput& input) {
+  input.token_ids_host = clone_llm_cpu_view(input.token_ids_host);
+  input.positions_host = clone_llm_cpu_view(input.positions_host);
   input.input_params.attention.host.block_tables =
-      clone_cpu_tensor_view(input.input_params.attention.host.block_tables);
+      clone_llm_cpu_view(input.input_params.attention.host.block_tables);
 }
 
-bool has_cpu_serialization_inputs(const ForwardOutput& output) {
+bool has_cpu_llm_output(const ForwardOutput& output) {
   const auto on_cpu = [](const torch::Tensor& tensor) {
     return !tensor.defined() || tensor.device().is_cpu();
   };
   const auto& sample = output.sample_output;
   const auto& beam = output.beam_search_output;
-  return on_cpu(output.next_tokens_host.defined() ? output.next_tokens_host
-                                                  : sample.next_tokens) &&
-         on_cpu(output.expert_load_data) && on_cpu(sample.embeddings) &&
-         on_cpu(sample.logprobs) && on_cpu(sample.top_tokens) &&
-         on_cpu(sample.top_logprobs) && on_cpu(beam.src_seq_idxes) &&
-         on_cpu(beam.out_tokens) && on_cpu(beam.out_logprobs) &&
-         std::all_of(output.dit_forward_output.tensors.begin(),
-                     output.dit_forward_output.tensors.end(),
-                     on_cpu);
+  const bool cpu_tensors =
+      on_cpu(output.next_tokens_host.defined() ? output.next_tokens_host
+                                               : sample.next_tokens) &&
+      on_cpu(output.expert_load_data) && on_cpu(sample.embeddings) &&
+      on_cpu(sample.logprobs) && on_cpu(sample.top_tokens) &&
+      on_cpu(sample.top_logprobs) && on_cpu(beam.src_seq_idxes) &&
+      on_cpu(beam.out_tokens) && on_cpu(beam.out_logprobs);
+  return cpu_tensors &&
+         std::all_of(sample.mm_embeddings.begin(),
+                     sample.mm_embeddings.end(),
+                     [&](const auto& sequence) {
+                       return std::all_of(
+                           sequence.begin(), sequence.end(), on_cpu);
+                     });
+}
+
+std::vector<SpeculativeTokenStats> record_vlm_speculative_metrics(
+    const ForwardOutput& output,
+    const torch::Tensor& cpu_next_tokens,
+    bool speculative_decode) {
+  if (output.is_graph_warmup || !speculative_decode) {
+    return {};
+  }
+  if (output.spec_verify_layouts.empty()) {
+    CHECK(!cpu_next_tokens.defined() || cpu_next_tokens.dim() != 2)
+        << "speculative verify output is missing row metadata";
+    return {};
+  }
+  // Reuse the completed output copy instead of issuing another D2H for metrics.
+  SpecMetrics metrics =
+      make_spec_metrics(cpu_next_tokens, output.spec_verify_layouts);
+  record_spec_metrics(metrics);
+  return std::move(metrics.sequence_stats);
+}
+
+int32_t get_vlm_decode_sequence_count(const VlmForwardInput& input) {
+  if (input.sampling_params.sample_idxes.defined()) {
+    return static_cast<int32_t>(input.sampling_params.sample_idxes.size(0));
+  }
+  if (input.input_host_sample_count != kUnknownPackedSampleCount) {
+    return input.input_host_sample_count;
+  }
+  if (!input.runtime.input_host_buffer_has_layout) {
+    return 0;
+  }
+  VlmForwardInput unpacked_input;
+  const bool unpacked = detail::unpack_from_input_host_buffer(
+      input,
+      torch::Device(torch::kCPU),
+      torch::kFloat32,
+      unpacked_input,
+      /*materialize_device_buffer=*/false);
+  if (!unpacked || !unpacked_input.sampling_params.sample_idxes.defined()) {
+    return 0;
+  }
+  return static_cast<int32_t>(
+      unpacked_input.sampling_params.sample_idxes.size(0));
+}
+
+torch::Tensor clone_vlm_cpu_view(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return tensor;
+  }
+  CHECK(tensor.device().is_cpu()) << "expected a CPU tensor view";
+  return tensor.contiguous().clone();
+}
+
+void stabilize_vlm_host_views(VlmForwardInput& input) {
+  input.token_ids_host = clone_vlm_cpu_view(input.token_ids_host);
+  input.positions_host = clone_vlm_cpu_view(input.positions_host);
+  input.input_params.attention.host.block_tables =
+      clone_vlm_cpu_view(input.input_params.attention.host.block_tables);
+}
+
+std::vector<SpeculativeTokenStats> record_rec_speculative_metrics(
+    const ForwardOutput& output,
+    const torch::Tensor& cpu_next_tokens,
+    bool speculative_decode) {
+  if (output.is_graph_warmup || !speculative_decode) {
+    return {};
+  }
+  if (output.spec_verify_layouts.empty()) {
+    CHECK(!cpu_next_tokens.defined() || cpu_next_tokens.dim() != 2)
+        << "speculative verify output is missing row metadata";
+    return {};
+  }
+  // Reuse the completed output copy instead of issuing another D2H for metrics.
+  SpecMetrics metrics =
+      make_spec_metrics(cpu_next_tokens, output.spec_verify_layouts);
+  record_spec_metrics(metrics);
+  return std::move(metrics.sequence_stats);
 }
 
 class WorkerPrefetchSession final
@@ -337,228 +429,9 @@ WorkerService::~WorkerService() {
   }
 }
 
-std::vector<SpeculativeTokenStats>
-WorkerService::record_speculative_metrics_from_output(
-    const ForwardOutput& forward_output) {
-  if (forward_output.is_graph_warmup || !options_.enable_speculative_decode()) {
-    return {};
-  }
-  const torch::Tensor& next_tokens = forward_output.sample_output.next_tokens;
-  // A verify result is marked solely by a non-empty row layout; ordinary
-  // decode emits 1-D tokens.
-  if (forward_output.spec_verify_layouts.empty()) {
-    CHECK(!next_tokens.defined() || next_tokens.dim() != 2)
-        << "speculative verify output is missing row metadata";
-    return {};
-  }
-  // Schedule-overlap MTP hands back a device next_tokens (the device copy is
-  // consumed by the next step's input update) plus a host snapshot; prefer
-  // the snapshot so metrics never issue a second D2H of the same matrix.
-  const torch::Tensor& metric_tokens = forward_output.next_tokens_host.defined()
-                                           ? forward_output.next_tokens_host
-                                           : next_tokens;
-  SpecMetrics metrics =
-      make_spec_metrics(metric_tokens, forward_output.spec_verify_layouts);
-  record_spec_metrics(metrics);
-  return std::move(metrics.sequence_stats);
-}
-
 void WorkerService::set_worker(std::unique_ptr<Worker> worker) {
   worker_ = std::move(worker);
   initialized_ = true;
-}
-
-void WorkerService::step(const DiTForwardInput& input,
-                         DiTForwardOutput& output) {
-  auto result = std::move(worker_->step_async(input)).get();
-  if (!result.has_value()) {
-    return;
-  }
-  const DiTForwardOutput& forward_output = result->dit_forward_output;
-  c10::StreamGuard stream_guard = stream_->set_stream_guard();
-  output.tensors.reserve(forward_output.tensors.size());
-  for (const torch::Tensor& tensor : forward_output.tensors) {
-    output.tensors.emplace_back(
-        safe_to(tensor, torch::kCPU, /*non_blocking=*/true));
-  }
-  output.audio_tensors.reserve(forward_output.audio_tensors.size());
-  for (const torch::Tensor& tensor : forward_output.audio_tensors) {
-    output.audio_tensors.emplace_back(
-        safe_to(tensor, torch::kCPU, /*non_blocking=*/true));
-  }
-  output.text_output = forward_output.text_output;
-  stream_->synchronize();
-}
-
-template <typename Input>
-void WorkerService::step(
-    Input& fwd_input,
-    ForwardOutput& cpu_output,
-    std::vector<SpeculativeTokenStats>& speculative_token_stats) {
-  auto& next_tokens = cpu_output.sample_output.next_tokens;
-  auto& logprobs = cpu_output.sample_output.logprobs;
-  auto& top_tokens = cpu_output.sample_output.top_tokens;
-  auto& top_logprobs = cpu_output.sample_output.top_logprobs;
-  auto& embeddings = cpu_output.sample_output.embeddings;
-  auto& mm_embeddings = cpu_output.sample_output.mm_embeddings;
-  auto& dit_images = cpu_output.dit_forward_output.tensors;
-  auto& dit_audio = cpu_output.dit_forward_output.audio_tensors;
-  auto& dit_text_output = cpu_output.dit_forward_output.text_output;
-  auto& expert_load_data = cpu_output.expert_load_data;
-  int64_t& prepared_token = cpu_output.prepared_token;
-  auto& src_seq_idxes = cpu_output.beam_search_output.src_seq_idxes;
-  auto& out_tokens = cpu_output.beam_search_output.out_tokens;
-  auto& out_logprobs = cpu_output.beam_search_output.out_logprobs;
-  auto& json_object_errors = cpu_output.json_object_errors;
-  speculative_token_stats.clear();
-  const bool use_default_stream =
-      !options_.enable_schedule_overlap() && options_.backend() == "llm";
-  const bool task_pipeline = options_.enable_task_pipeline();
-  const bool cpu_ready_task_result =
-      task_pipeline && !worker_->task_pipeline_uses_worker_prepare();
-  const bool worker_owned_packed_input =
-      task_pipeline && worker_->task_pipeline_uses_worker_prepare() &&
-      fwd_input.runtime.input_host_buffer_has_layout &&
-      fwd_input.runtime.input_host_buffer.defined();
-  if (options_.enable_schedule_overlap() &&
-      (!task_pipeline || (worker_->task_pipeline_uses_worker_prepare() &&
-                          !worker_owned_packed_input))) {
-    // A worker-owned task slot retains the packed host buffer through Consume.
-    // Its prepare path reconstructs host views from that owner, so cloning the
-    // three SHM views here would only be overwritten by task submit.
-    stabilize_schedule_overlap_host_views(fwd_input);
-  }
-  // execute model
-  auto future = worker_->step_async(fwd_input);
-  if (!options_.enable_schedule_overlap()) {
-    auto forward_outputs = std::move(future).get();
-    // convert ForwardOutput to proto::ForwardOutput which contain Tokens.
-    if (forward_outputs) {
-      DCHECK(forward_outputs.has_value()) << "Failed to execute model";
-      const ForwardOutput& forward_output = forward_outputs.value();
-      const auto& sample_output = forward_output.sample_output;
-      const auto& beam_search_output = forward_output.beam_search_output;
-      const auto& dit_forward_output = forward_output.dit_forward_output;
-      expert_load_data = safe_to(forward_output.expert_load_data,
-                                 torch::kCPU,
-                                 /*non_blocking=*/true);
-      prepared_token = forward_output.prepared_token;
-      json_object_errors = forward_output.json_object_errors;
-
-      {
-        auto copy_output_to_host = [&]() {
-          // only driver worker (rank=0) need to fill this
-          // [num_seq, ..., embed_dim] FloatTensor
-          embeddings =
-              safe_to(sample_output.embeddings,
-                      torch::dtype(torch::kFloat32).device(torch::kCPU),
-                      /*non_blocking=*/true);
-
-          mm_embeddings.clear();
-          mm_embeddings.reserve(sample_output.mm_embeddings.size());
-          for (const auto& seq_mm_embeddings : sample_output.mm_embeddings) {
-            std::vector<torch::Tensor> seq_out;
-            seq_out.reserve(seq_mm_embeddings.size());
-            for (const auto& mm_embedding : seq_mm_embeddings) {
-              seq_out.emplace_back(
-                  safe_to(mm_embedding, torch::kCPU, /*non_blocking=*/true));
-            }
-            mm_embeddings.emplace_back(std::move(seq_out));
-          }
-
-          dit_images.clear();
-          dit_images.reserve(dit_forward_output.tensors.size());
-          for (auto dit_image : dit_forward_output.tensors) {
-            dit_images.emplace_back(
-                safe_to(dit_image, torch::kCPU, /*non_blocking=*/true));
-          }
-          dit_audio.clear();
-          dit_audio.reserve(dit_forward_output.audio_tensors.size());
-          for (auto dit_audio_tensor : dit_forward_output.audio_tensors) {
-            dit_audio.emplace_back(
-                safe_to(dit_audio_tensor, torch::kCPU, /*non_blocking=*/true));
-          }
-          dit_text_output = dit_forward_output.text_output;
-
-          // [num_seq]
-          next_tokens = safe_to(sample_output.next_tokens,
-                                torch::kCPU,
-                                /*non_blocking=*/true);
-          if (next_tokens.defined()) {
-            // [num_seq]
-            logprobs = safe_to(sample_output.logprobs,
-                               torch::kCPU,
-                               /*non_blocking=*/true);
-
-            if (!beam_search_output.src_seq_idxes.defined()) {
-              // beam search kernel will provide final tokens/logprobs in beam
-              // search output, so keep top_tokens/top_logprobs undefined to
-              // avoid returning them.
-              // [num_seq, topk]
-              top_tokens = safe_to(sample_output.top_tokens,
-                                   torch::kCPU,
-                                   /*non_blocking=*/true);
-              // [num_seq, topk]
-              top_logprobs = safe_to(sample_output.top_logprobs,
-                                     torch::kCPU,
-                                     /*non_blocking=*/true);
-            }
-          }
-
-          // beam search output
-          // [num_seq]
-          src_seq_idxes = safe_to(beam_search_output.src_seq_idxes,
-                                  torch::kCPU,
-                                  /*non_blocking=*/true);
-          if (src_seq_idxes.defined()) {
-            // [num_seq]
-            out_tokens = safe_to(beam_search_output.out_tokens,
-                                 torch::kCPU,
-                                 /*non_blocking=*/true);
-            // [num_seq]
-            out_logprobs =
-                safe_to(beam_search_output.out_logprobs,
-                        torch::dtype(torch::kFloat32).device(torch::kCPU),
-                        /*non_blocking=*/true);
-          }
-        };
-        if (cpu_ready_task_result) {
-          // The pipeline Future completes after Consume produces CPU results.
-          copy_output_to_host();
-        } else {
-          if (use_default_stream) {
-            copy_output_to_host();
-            device_.synchronize_default_stream();
-          } else {
-            c10::StreamGuard stream_guard = stream_->set_stream_guard();
-            copy_output_to_host();
-            stream_->synchronize();
-          }
-        }
-        speculative_token_stats =
-            record_speculative_metrics_from_output(forward_output);
-      }
-    }
-  } else {
-    if (task_pipeline) {
-      // Never publish placeholders before the Worker accepts and owns input.
-      const auto ack = std::move(future).get();
-      CHECK(!ack.has_value()) << "Two-Slot Step must return PrepareAck.";
-    }
-    auto int_options = torch::TensorOptions().device(torch::kCPU);
-    if (worker_->is_driver()) {
-      // construct fake output tensor
-      int32_t num_decode_seqs =
-          get_num_decode_seqs_for_schedule_overlap(fwd_input);
-      // Negative values identify rows in the previous sampling output.
-      next_tokens = torch::arange(
-          -1, -1 * (num_decode_seqs + 1), -1, int_options.dtype(torch::kInt32));
-      if (!task_pipeline) {
-        std::move(future).deferValue([](auto&&) {});
-      }
-    }
-    expert_load_data = torch::zeros({1, 1}, int_options.dtype(torch::kInt64));
-  }
 }
 
 void WorkerService::create_polling_shm_thread(
@@ -566,85 +439,20 @@ void WorkerService::create_polling_shm_thread(
     std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager) {
   CHECK(!polling_thread_) << "SHM polling thread has already been created.";
   input_shm_manager_ = std::move(input_shm_manager);
-  polling_thread_ = std::make_unique<std::thread>(
-      [this, output_shm_manager = std::move(output_shm_manager)]() mutable {
-        device_.set_device();
-        Timer timer;
-        while (true) {
-          std::variant<LlmForwardInput,
-                       VlmForwardInput,
-                       RecForwardInput,
-                       DiTForwardInput>
-              input;
-          if (options_.backend() == "dit") {
-            input.emplace<DiTForwardInput>();
-          } else if (options_.backend() == "rec") {
-            input.emplace<RecForwardInput>();
-          } else if (options_.backend() == "vlm") {
-            input.emplace<VlmForwardInput>();
-          }
-          // NPU graph task updates cannot safely overlap an H2D enqueue from
-          // the SHM polling thread. Keep scheduler overlap, but defer device
-          // materialization to WorkerImpl's ordered prepare stream.
-          const InputDeviceMaterializationPolicy materialization_policy =
-              options_.enable_task_pipeline() ||
-                      (options_.enable_schedule_overlap() &&
-                       options_.enable_graph())
-                  ? InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE
-                  : InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ;
-          const bool input_ready = std::visit(
-              [&](auto& typed_input) {
-                using Input = std::decay_t<decltype(typed_input)>;
-                if constexpr (std::is_same_v<Input, DiTForwardInput>) {
-                  return input_shm_manager_->input_read(typed_input);
-                } else {
-                  return input_shm_manager_->input_read(
-                      typed_input, device_, materialization_policy);
-                }
-              },
-              input);
-          if (!input_ready) {
-            break;
-          }
-          timer.reset();
-          // Model output is collected in the domain object before it is
-          // written to the raw shared-memory transport.
-          ForwardOutput cpu_output;
-          std::vector<SpeculativeTokenStats> speculative_token_stats;
-
-          std::visit(
-              [&](auto& typed_input) {
-                using Input = std::decay_t<decltype(typed_input)>;
-                if constexpr (std::is_same_v<Input, DiTForwardInput>) {
-                  step(typed_input, cpu_output.dit_forward_output);
-                } else {
-                  step(typed_input, cpu_output, speculative_token_stats);
-                }
-              },
-              input);
-
-          const bool shm_write_ok = output_shm_manager->raw_output_write(
-              cpu_output.sample_output.next_tokens,
-              cpu_output.sample_output.logprobs,
-              cpu_output.sample_output.top_tokens,
-              cpu_output.sample_output.top_logprobs,
-              cpu_output.sample_output.embeddings,
-              cpu_output.sample_output.mm_embeddings,
-              speculative_token_stats,
-              cpu_output.dit_forward_output.tensors,
-              cpu_output.dit_forward_output.text_output,
-              cpu_output.dit_forward_output.audio_tensors,
-              cpu_output.expert_load_data,
-              cpu_output.prepared_token,
-              cpu_output.beam_search_output.src_seq_idxes,
-              cpu_output.beam_search_output.out_tokens,
-              cpu_output.beam_search_output.out_logprobs,
-              cpu_output.json_object_errors);
-          CHECK(shm_write_ok) << "Worker output shared memory write failed.";
-          COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
-        }
-      });
-  return;
+  if (options_.backend() == "llm") {
+    polling_thread_ = std::make_unique<std::thread>(
+        &WorkerService::poll_llm_shm, this, std::move(output_shm_manager));
+  } else if (options_.backend() == "vlm") {
+    polling_thread_ = std::make_unique<std::thread>(
+        &WorkerService::poll_vlm_shm, this, std::move(output_shm_manager));
+  } else if (options_.backend() == "rec") {
+    polling_thread_ = std::make_unique<std::thread>(
+        &WorkerService::poll_rec_shm, this, std::move(output_shm_manager));
+  } else {
+    CHECK_EQ(options_.backend(), "dit") << "Unsupported worker backend";
+    polling_thread_ = std::make_unique<std::thread>(
+        &WorkerService::poll_dit_shm, this, std::move(output_shm_manager));
+  }
 }
 
 void WorkerService::Hello(::google::protobuf::RpcController* controller,
@@ -682,6 +490,663 @@ void WorkerService::InitModel(::google::protobuf::RpcController* controller,
     response->set_ok(true);
   });
   return;
+}
+
+void WorkerService::collect_llm_output(const ForwardOutput& output,
+                                       ForwardOutput& cpu_output,
+                                       bool cpu_ready_result) {
+  cpu_output.prepared_token = output.prepared_token;
+  cpu_output.json_object_errors = output.json_object_errors;
+  const auto& sample = output.sample_output;
+  const auto& beam = output.beam_search_output;
+  auto copy_output_to_host = [&]() {
+    // Every D2H, including expert data, runs under the selected output stream.
+    cpu_output.expert_load_data =
+        safe_to(output.expert_load_data, torch::kCPU, /*non_blocking=*/true);
+    cpu_output.sample_output.embeddings =
+        safe_to(sample.embeddings,
+                torch::dtype(torch::kFloat32).device(torch::kCPU),
+                /*non_blocking=*/true);
+    auto& mm_embeddings = cpu_output.sample_output.mm_embeddings;
+    mm_embeddings.clear();
+    mm_embeddings.reserve(sample.mm_embeddings.size());
+    for (const auto& sequence : sample.mm_embeddings) {
+      std::vector<torch::Tensor> cpu_sequence;
+      cpu_sequence.reserve(sequence.size());
+      for (const torch::Tensor& embedding : sequence) {
+        cpu_sequence.emplace_back(
+            safe_to(embedding, torch::kCPU, /*non_blocking=*/true));
+      }
+      mm_embeddings.emplace_back(std::move(cpu_sequence));
+    }
+    cpu_output.sample_output.next_tokens =
+        safe_to(output.next_tokens_host.defined() ? output.next_tokens_host
+                                                  : sample.next_tokens,
+                torch::kCPU,
+                /*non_blocking=*/true);
+    if (cpu_output.sample_output.next_tokens.defined()) {
+      cpu_output.sample_output.logprobs =
+          safe_to(sample.logprobs, torch::kCPU, /*non_blocking=*/true);
+      // Beam results already carry the final tokens and logprobs.
+      if (!beam.src_seq_idxes.defined()) {
+        cpu_output.sample_output.top_tokens =
+            safe_to(sample.top_tokens, torch::kCPU, /*non_blocking=*/true);
+        cpu_output.sample_output.top_logprobs =
+            safe_to(sample.top_logprobs, torch::kCPU, /*non_blocking=*/true);
+      }
+    }
+    // Keep optional beam results independent of sample next_tokens.
+    cpu_output.beam_search_output.src_seq_idxes =
+        safe_to(beam.src_seq_idxes, torch::kCPU, /*non_blocking=*/true);
+    if (beam.src_seq_idxes.defined()) {
+      cpu_output.beam_search_output.out_tokens =
+          safe_to(beam.out_tokens, torch::kCPU, /*non_blocking=*/true);
+      cpu_output.beam_search_output.out_logprobs =
+          safe_to(beam.out_logprobs,
+                  torch::dtype(torch::kFloat32).device(torch::kCPU),
+                  /*non_blocking=*/true);
+    }
+  };
+  const bool use_default_stream = !options_.enable_schedule_overlap();
+  if (cpu_ready_result) {
+    copy_output_to_host();
+  } else if (use_default_stream) {
+    copy_output_to_host();
+    device_.synchronize_default_stream();
+  } else {
+    c10::StreamGuard stream_guard = stream_->set_stream_guard();
+    if (output.ready_event != nullptr) {
+      CHECK(stream_->wait_event(output.ready_event))
+          << "wait LLM output ready event failed";
+    }
+    copy_output_to_host();
+    stream_->synchronize();
+  }
+#if defined(USE_NPU)
+  if (!use_default_stream) {
+    DeviceMonitor::get_instance().update_active_activation_memory(
+        device_.index());
+  }
+#endif
+}
+
+void WorkerService::step_llm_model(
+    LlmForwardInput& input,
+    ForwardOutput& cpu_output,
+    std::vector<SpeculativeTokenStats>& speculative_token_stats) {
+  speculative_token_stats.clear();
+  const bool task_pipeline = options_.enable_task_pipeline();
+  const bool worker_prepare =
+      task_pipeline && worker_->task_pipeline_uses_worker_prepare();
+  const bool worker_rebuilds_host_views =
+      input.runtime.input_host_buffer_has_layout &&
+      input.runtime.input_host_buffer.defined() &&
+      input.runtime.input_host_buffer.device().is_cpu() &&
+      input.runtime.input_host_buffer.is_contiguous() &&
+      input.runtime.input_host_buffer.numel() > 0 &&
+      !input.runtime.device_tensors_ready;
+  if (options_.enable_schedule_overlap() && !worker_rebuilds_host_views &&
+      (!task_pipeline || worker_prepare)) {
+    // Packed preparation rebuilds views from its retained owner. Device-ready
+    // inputs reuse their existing views, which can still borrow shared memory.
+    stabilize_llm_host_views(input);
+  }
+  auto future = worker_->step_async(input);
+  if (!options_.enable_schedule_overlap()) {
+    auto output = std::move(future).get();
+    if (!output.has_value()) {
+      return;
+    }
+    const bool cpu_ready_result =
+        task_pipeline && (!worker_prepare || has_cpu_llm_output(*output));
+    collect_llm_output(*output, cpu_output, cpu_ready_result);
+    speculative_token_stats =
+        record_llm_speculative_metrics(*output,
+                                       cpu_output.sample_output.next_tokens,
+                                       options_.enable_speculative_decode());
+    return;
+  }
+  if (task_pipeline) {
+    // Do not publish placeholders until the Worker accepts and owns the input.
+    auto ack = std::move(future).get();
+    CHECK(!ack.has_value()) << "LLM task Step must return PrepareAck";
+  }
+  const auto int_options = torch::TensorOptions().device(torch::kCPU);
+  if (worker_->is_driver()) {
+    const int32_t sequence_count = get_llm_decode_sequence_count(input);
+    cpu_output.sample_output.next_tokens = torch::arange(
+        -1, -(sequence_count + 1), -1, int_options.dtype(torch::kInt32));
+    if (!task_pipeline) {
+      std::move(future).deferValue([](auto&&) {});
+    }
+  }
+  cpu_output.expert_load_data =
+      torch::zeros({1, 1}, int_options.dtype(torch::kInt64));
+}
+
+void WorkerService::poll_llm_shm(
+    std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager) {
+  device_.set_device();
+  // Graph updates and task preparation must stay on the ordered worker stream.
+  const InputDeviceMaterializationPolicy policy =
+      options_.enable_task_pipeline() ||
+              (options_.enable_schedule_overlap() && options_.enable_graph())
+          ? InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE
+          : InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ;
+  while (true) {
+    LlmForwardInput input;
+    if (!input_shm_manager_->input_read(input, device_, policy)) {
+      break;
+    }
+    Timer timer;
+    ForwardOutput cpu_output;
+    std::vector<SpeculativeTokenStats> speculative_token_stats;
+    step_llm_model(input, cpu_output, speculative_token_stats);
+    const bool write_ok = output_shm_manager->llm_output_write(
+        cpu_output, speculative_token_stats);
+    CHECK(write_ok) << "llm worker output shared memory write failed";
+    COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+  }
+}
+
+void WorkerService::ExecuteLLMModel(
+    ::google::protobuf::RpcController* controller,
+    const proto::LLMForwardRequest* request,
+    proto::LLMForwardResponse* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, request, response, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    if (!initialized_) {
+      controller->SetFailed("Worker is not initialized");
+      return;
+    }
+    if (options_.backend() != "llm") {
+      controller->SetFailed("LLM RPC does not match the configured backend");
+      return;
+    }
+    Timer timer;
+    if (!request->has_packed_input()) {
+      controller->SetFailed("LLM requires a packed input payload");
+      return;
+    }
+    LlmForwardInput input;
+    // The native reader checks schema, layout, and domain before preparation.
+    if (!input.from_packed_proto(request->packed_input())) {
+      controller->SetFailed("Invalid LLM input domain, schema, or layout");
+      return;
+    }
+    ForwardOutput cpu_output;
+    std::vector<SpeculativeTokenStats> speculative_token_stats;
+    step_llm_model(input, cpu_output, speculative_token_stats);
+    if (!encode_llm_output(cpu_output, speculative_token_stats, response)) {
+      controller->SetFailed("Failed to serialize LLM model output");
+      return;
+    }
+    COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+  });
+}
+
+void WorkerService::GetLastLLMStepResult(
+    ::google::protobuf::RpcController* controller,
+    const proto::Empty* /*request*/,
+    proto::LLMForwardResponse* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, response, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    if (!initialized_) {
+      controller->SetFailed("Worker is not initialized");
+      return;
+    }
+    if (options_.backend() != "llm" || !options_.enable_schedule_overlap()) {
+      controller->SetFailed(
+          "LLM last-step results require the matching overlap backend");
+      return;
+    }
+    auto output = std::move(worker_->get_last_step_result_async()).get();
+    ForwardOutput cpu_output;
+    std::vector<SpeculativeTokenStats> speculative_token_stats;
+    if (output.has_value()) {
+      const bool task_pipeline = options_.enable_task_pipeline();
+      const bool worker_prepare =
+          task_pipeline && worker_->task_pipeline_uses_worker_prepare();
+      const bool cpu_ready_result =
+          task_pipeline && (!worker_prepare || has_cpu_llm_output(*output));
+      collect_llm_output(*output, cpu_output, cpu_ready_result);
+      speculative_token_stats =
+          record_llm_speculative_metrics(*output,
+                                         cpu_output.sample_output.next_tokens,
+                                         options_.enable_speculative_decode());
+    }
+    // Embedding-only and beam-only results are valid completed outputs.
+    if (!encode_llm_output(cpu_output, speculative_token_stats, response)) {
+      controller->SetFailed("Failed to serialize LLM last-step output");
+    }
+  });
+}
+
+void WorkerService::collect_vlm_output(const ForwardOutput& output,
+                                       ForwardOutput& cpu_output) {
+  cpu_output.prepared_token = output.prepared_token;
+  cpu_output.json_object_errors = output.json_object_errors;
+  const auto& sample = output.sample_output;
+  const auto& beam = output.beam_search_output;
+  auto copy_output_to_host = [&]() {
+    // Every D2H, including expert data, runs under the selected output stream.
+    cpu_output.expert_load_data =
+        safe_to(output.expert_load_data, torch::kCPU, /*non_blocking=*/true);
+    cpu_output.sample_output.embeddings =
+        safe_to(sample.embeddings,
+                torch::dtype(torch::kFloat32).device(torch::kCPU),
+                /*non_blocking=*/true);
+    auto& mm_embeddings = cpu_output.sample_output.mm_embeddings;
+    mm_embeddings.clear();
+    mm_embeddings.reserve(sample.mm_embeddings.size());
+    for (const auto& sequence : sample.mm_embeddings) {
+      std::vector<torch::Tensor> cpu_sequence;
+      cpu_sequence.reserve(sequence.size());
+      for (const torch::Tensor& embedding : sequence) {
+        cpu_sequence.emplace_back(
+            safe_to(embedding, torch::kCPU, /*non_blocking=*/true));
+      }
+      mm_embeddings.emplace_back(std::move(cpu_sequence));
+    }
+    cpu_output.sample_output.next_tokens =
+        safe_to(output.next_tokens_host.defined() ? output.next_tokens_host
+                                                  : sample.next_tokens,
+                torch::kCPU,
+                /*non_blocking=*/true);
+    if (cpu_output.sample_output.next_tokens.defined()) {
+      cpu_output.sample_output.logprobs =
+          safe_to(sample.logprobs, torch::kCPU, /*non_blocking=*/true);
+      // Beam results already carry the final tokens and logprobs.
+      if (!beam.src_seq_idxes.defined()) {
+        cpu_output.sample_output.top_tokens =
+            safe_to(sample.top_tokens, torch::kCPU, /*non_blocking=*/true);
+        cpu_output.sample_output.top_logprobs =
+            safe_to(sample.top_logprobs, torch::kCPU, /*non_blocking=*/true);
+      }
+    }
+    // Keep optional beam results independent of sample next_tokens.
+    cpu_output.beam_search_output.src_seq_idxes =
+        safe_to(beam.src_seq_idxes, torch::kCPU, /*non_blocking=*/true);
+    if (beam.src_seq_idxes.defined()) {
+      cpu_output.beam_search_output.out_tokens =
+          safe_to(beam.out_tokens, torch::kCPU, /*non_blocking=*/true);
+      cpu_output.beam_search_output.out_logprobs =
+          safe_to(beam.out_logprobs,
+                  torch::dtype(torch::kFloat32).device(torch::kCPU),
+                  /*non_blocking=*/true);
+    }
+  };
+  c10::StreamGuard stream_guard = stream_->set_stream_guard();
+  if (output.ready_event != nullptr) {
+    CHECK(stream_->wait_event(output.ready_event))
+        << "wait VLM output ready event failed";
+  }
+  copy_output_to_host();
+  stream_->synchronize();
+#if defined(USE_NPU)
+  if (options_.enable_schedule_overlap()) {
+    DeviceMonitor::get_instance().update_active_activation_memory(
+        device_.index());
+  }
+#endif
+}
+
+void WorkerService::step_vlm_model(
+    VlmForwardInput& input,
+    ForwardOutput& cpu_output,
+    std::vector<SpeculativeTokenStats>& speculative_token_stats) {
+  speculative_token_stats.clear();
+  CHECK(!options_.enable_task_pipeline())
+      << "VLM does not support task pipeline";
+  const bool worker_rebuilds_host_views =
+      input.runtime.input_host_buffer_has_layout &&
+      input.runtime.input_host_buffer.defined() &&
+      input.runtime.input_host_buffer.device().is_cpu() &&
+      input.runtime.input_host_buffer.is_contiguous() &&
+      input.runtime.input_host_buffer.numel() > 0 &&
+      !input.runtime.device_tensors_ready;
+  if (options_.enable_schedule_overlap() && !worker_rebuilds_host_views) {
+    // Device-ready inputs can still borrow host views from shared memory.
+    stabilize_vlm_host_views(input);
+  }
+  auto future = worker_->step_async(input);
+  if (!options_.enable_schedule_overlap()) {
+    auto output = std::move(future).get();
+    if (output.has_value()) {
+      collect_vlm_output(*output, cpu_output);
+      speculative_token_stats =
+          record_vlm_speculative_metrics(*output,
+                                         cpu_output.sample_output.next_tokens,
+                                         options_.enable_speculative_decode());
+    }
+    return;
+  }
+  const auto int_options = torch::TensorOptions().device(torch::kCPU);
+  if (worker_->is_driver()) {
+    const int32_t sequence_count = get_vlm_decode_sequence_count(input);
+    cpu_output.sample_output.next_tokens = torch::arange(
+        -1, -(sequence_count + 1), -1, int_options.dtype(torch::kInt32));
+    std::move(future).deferValue([](auto&&) {});
+  }
+  cpu_output.expert_load_data =
+      torch::zeros({1, 1}, int_options.dtype(torch::kInt64));
+}
+
+void WorkerService::poll_vlm_shm(
+    std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager) {
+  device_.set_device();
+  const InputDeviceMaterializationPolicy policy =
+      options_.enable_schedule_overlap() && options_.enable_graph()
+          ? InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE
+          : InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ;
+  while (true) {
+    VlmForwardInput input;
+    if (!input_shm_manager_->input_read(input, device_, policy)) {
+      break;
+    }
+    Timer timer;
+    ForwardOutput cpu_output;
+    std::vector<SpeculativeTokenStats> speculative_token_stats;
+    step_vlm_model(input, cpu_output, speculative_token_stats);
+    const bool write_ok = output_shm_manager->vlm_output_write(
+        cpu_output, speculative_token_stats);
+    CHECK(write_ok) << "vlm worker output shared memory write failed";
+    COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+  }
+}
+
+void WorkerService::ExecuteVLMModel(
+    ::google::protobuf::RpcController* controller,
+    const proto::VLMForwardRequest* request,
+    proto::VLMForwardResponse* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, request, response, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    if (!initialized_) {
+      controller->SetFailed("Worker is not initialized");
+      return;
+    }
+    if (options_.backend() != "vlm") {
+      controller->SetFailed("VLM RPC does not match the configured backend");
+      return;
+    }
+    Timer timer;
+    if (!request->has_packed_input()) {
+      controller->SetFailed("VLM requires a packed input payload");
+      return;
+    }
+    VlmForwardInput input;
+    // The native reader checks schema, layout, and domain before preparation.
+    if (!input.from_packed_proto(request->packed_input())) {
+      controller->SetFailed("Invalid VLM input domain, schema, or layout");
+      return;
+    }
+    ForwardOutput cpu_output;
+    std::vector<SpeculativeTokenStats> speculative_token_stats;
+    step_vlm_model(input, cpu_output, speculative_token_stats);
+    if (!encode_vlm_output(cpu_output, speculative_token_stats, response)) {
+      controller->SetFailed("Failed to serialize VLM model output");
+      return;
+    }
+    COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+  });
+}
+
+void WorkerService::GetLastVLMStepResult(
+    ::google::protobuf::RpcController* controller,
+    const proto::Empty* /*request*/,
+    proto::VLMForwardResponse* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, response, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    if (!initialized_) {
+      controller->SetFailed("Worker is not initialized");
+      return;
+    }
+    if (options_.backend() != "vlm" || !options_.enable_schedule_overlap()) {
+      controller->SetFailed(
+          "VLM last-step results require the matching overlap backend");
+      return;
+    }
+    auto output = std::move(worker_->get_last_step_result_async()).get();
+    ForwardOutput cpu_output;
+    std::vector<SpeculativeTokenStats> speculative_token_stats;
+    if (output.has_value()) {
+      collect_vlm_output(*output, cpu_output);
+      speculative_token_stats =
+          record_vlm_speculative_metrics(*output,
+                                         cpu_output.sample_output.next_tokens,
+                                         options_.enable_speculative_decode());
+    }
+    // Embedding-only and beam-only results are valid completed outputs.
+    if (!encode_vlm_output(cpu_output, speculative_token_stats, response)) {
+      controller->SetFailed("Failed to serialize VLM last-step output");
+    }
+  });
+}
+
+void WorkerService::step_rec_model(
+    RecForwardInput& input,
+    ForwardOutput& cpu_output,
+    std::vector<SpeculativeTokenStats>& speculative_token_stats) {
+  speculative_token_stats.clear();
+  CHECK(!options_.enable_task_pipeline())
+      << "REC does not support task pipeline";
+  CHECK(!options_.enable_schedule_overlap())
+      << "REC does not support schedule overlap";
+  // RecWorkerImpl captures input by reference. Wait before releasing this
+  // owner.
+  auto result = std::move(worker_->step_async(input)).get();
+  if (!result.has_value()) {
+    return;
+  }
+  const ForwardOutput& output = *result;
+  cpu_output.prepared_token = output.prepared_token;
+  cpu_output.json_object_errors = output.json_object_errors;
+  const auto& sample = output.sample_output;
+  const auto& beam = output.beam_search_output;
+  auto copy_output_to_host = [&]() {
+    // Every D2H, including expert data, runs under the selected output stream.
+    cpu_output.expert_load_data =
+        safe_to(output.expert_load_data, torch::kCPU, /*non_blocking=*/true);
+    cpu_output.sample_output.embeddings =
+        safe_to(sample.embeddings,
+                torch::dtype(torch::kFloat32).device(torch::kCPU),
+                /*non_blocking=*/true);
+    auto& mm_embeddings = cpu_output.sample_output.mm_embeddings;
+    mm_embeddings.clear();
+    mm_embeddings.reserve(sample.mm_embeddings.size());
+    for (const auto& sequence : sample.mm_embeddings) {
+      std::vector<torch::Tensor> cpu_sequence;
+      cpu_sequence.reserve(sequence.size());
+      for (const torch::Tensor& embedding : sequence) {
+        cpu_sequence.emplace_back(
+            safe_to(embedding, torch::kCPU, /*non_blocking=*/true));
+      }
+      mm_embeddings.emplace_back(std::move(cpu_sequence));
+    }
+    cpu_output.sample_output.next_tokens =
+        safe_to(output.next_tokens_host.defined() ? output.next_tokens_host
+                                                  : sample.next_tokens,
+                torch::kCPU,
+                /*non_blocking=*/true);
+    if (cpu_output.sample_output.next_tokens.defined()) {
+      cpu_output.sample_output.logprobs =
+          safe_to(sample.logprobs, torch::kCPU, /*non_blocking=*/true);
+      // Beam results already carry the final tokens and logprobs.
+      if (!beam.src_seq_idxes.defined()) {
+        cpu_output.sample_output.top_tokens =
+            safe_to(sample.top_tokens, torch::kCPU, /*non_blocking=*/true);
+        cpu_output.sample_output.top_logprobs =
+            safe_to(sample.top_logprobs, torch::kCPU, /*non_blocking=*/true);
+      }
+    }
+    // REC multi-round results can contain beams without sample next_tokens.
+    cpu_output.beam_search_output.src_seq_idxes =
+        safe_to(beam.src_seq_idxes, torch::kCPU, /*non_blocking=*/true);
+    if (beam.src_seq_idxes.defined()) {
+      cpu_output.beam_search_output.out_tokens =
+          safe_to(beam.out_tokens, torch::kCPU, /*non_blocking=*/true);
+      cpu_output.beam_search_output.out_logprobs =
+          safe_to(beam.out_logprobs,
+                  torch::dtype(torch::kFloat32).device(torch::kCPU),
+                  /*non_blocking=*/true);
+    }
+  };
+  c10::StreamGuard stream_guard = stream_->set_stream_guard();
+  if (output.ready_event != nullptr) {
+    CHECK(stream_->wait_event(output.ready_event))
+        << "wait REC output ready event failed";
+  }
+  copy_output_to_host();
+  stream_->synchronize();
+  speculative_token_stats =
+      record_rec_speculative_metrics(output,
+                                     cpu_output.sample_output.next_tokens,
+                                     options_.enable_speculative_decode());
+}
+
+void WorkerService::poll_rec_shm(
+    std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager) {
+  device_.set_device();
+
+  while (true) {
+    RecForwardInput input;
+    if (!input_shm_manager_->input_read(input, device_)) {
+      break;
+    }
+    Timer timer;
+    ForwardOutput cpu_output;
+    std::vector<SpeculativeTokenStats> speculative_token_stats;
+    step_rec_model(input, cpu_output, speculative_token_stats);
+    const bool write_ok = output_shm_manager->rec_output_write(
+        cpu_output, speculative_token_stats);
+    CHECK(write_ok) << "rec worker output shared memory write failed";
+    COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+  }
+}
+
+void WorkerService::ExecuteRECModel(
+    ::google::protobuf::RpcController* controller,
+    const proto::RECForwardRequest* request,
+    proto::RECForwardResponse* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, request, response, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    if (!initialized_) {
+      controller->SetFailed("Worker is not initialized");
+      return;
+    }
+    if (options_.backend() != "rec") {
+      controller->SetFailed("REC RPC does not match the configured backend");
+      return;
+    }
+    Timer timer;
+    if (!request->has_packed_input()) {
+      controller->SetFailed("REC requires a packed input payload");
+      return;
+    }
+    RecForwardInput input;
+    // The native reader checks schema, layout, and domain before preparation.
+    if (!input.from_packed_proto(request->packed_input())) {
+      controller->SetFailed("Invalid REC input domain, schema, or layout");
+      return;
+    }
+    ForwardOutput cpu_output;
+    std::vector<SpeculativeTokenStats> speculative_token_stats;
+    step_rec_model(input, cpu_output, speculative_token_stats);
+    if (!encode_rec_output(cpu_output, speculative_token_stats, response)) {
+      controller->SetFailed("Failed to serialize REC model output");
+      return;
+    }
+    COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+  });
+}
+
+void WorkerService::step_dit_model(const DiTForwardInput& input,
+                                   ForwardOutput& cpu_output) {
+  CHECK(!options_.enable_task_pipeline())
+      << "DiT does not support task pipeline";
+  auto result = std::move(worker_->step_async(input)).get();
+  if (!result.has_value()) {
+    return;
+  }
+  const auto& output = result->dit_forward_output;
+  c10::StreamGuard stream_guard = stream_->set_stream_guard();
+  if (result->ready_event != nullptr) {
+    CHECK(stream_->wait_event(result->ready_event))
+        << "wait DiT output ready event failed";
+  }
+  auto& tensors = cpu_output.dit_forward_output.tensors;
+  tensors.reserve(output.tensors.size());
+  for (const torch::Tensor& tensor : output.tensors) {
+    tensors.emplace_back(safe_to(tensor, torch::kCPU, /*non_blocking=*/true));
+  }
+  auto& audio_tensors = cpu_output.dit_forward_output.audio_tensors;
+  audio_tensors.reserve(output.audio_tensors.size());
+  for (const torch::Tensor& tensor : output.audio_tensors) {
+    audio_tensors.emplace_back(
+        safe_to(tensor, torch::kCPU, /*non_blocking=*/true));
+  }
+  cpu_output.dit_forward_output.text_output = output.text_output;
+  stream_->synchronize();
+}
+
+void WorkerService::poll_dit_shm(
+    std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager) {
+  device_.set_device();
+
+  while (true) {
+    DiTForwardInput input;
+    if (!input_shm_manager_->input_read(input)) {
+      break;
+    }
+    Timer timer;
+    ForwardOutput cpu_output;
+    step_dit_model(input, cpu_output);
+    const bool write_ok =
+        output_shm_manager->dit_output_write(cpu_output.dit_forward_output);
+    CHECK(write_ok) << "dit worker output shared memory write failed";
+    COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+  }
+}
+
+void WorkerService::ExecuteDITModel(
+    ::google::protobuf::RpcController* controller,
+    const proto::DITForwardRequest* request,
+    proto::DITForwardResponse* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, request, response, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    if (!initialized_) {
+      controller->SetFailed("Worker is not initialized");
+      return;
+    }
+    if (options_.backend() != "dit") {
+      controller->SetFailed("DIT RPC does not match the configured backend");
+      return;
+    }
+    Timer timer;
+    if (!request->has_packed_input()) {
+      controller->SetFailed("DIT requires a packed input payload");
+      return;
+    }
+    DiTForwardInput input;
+    // The native reader checks schema, layout, and domain before preparation.
+    if (!input.from_packed_proto(request->packed_input())) {
+      controller->SetFailed("Invalid DIT input domain, schema, or layout");
+      return;
+    }
+    ForwardOutput cpu_output;
+    step_dit_model(input, cpu_output);
+    if (!encode_dit_output(cpu_output, response)) {
+      controller->SetFailed("Failed to serialize DIT model output");
+      return;
+    }
+    COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+  });
 }
 
 void WorkerService::ProcessGroupTest(
@@ -982,226 +1447,6 @@ void WorkerService::StopProfile(::google::protobuf::RpcController* controller,
     resp->set_ok(status);
   });
 
-  return;
-}
-
-void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
-                                 const proto::ForwardInput* pb_forward_input,
-                                 proto::ForwardOutput* pb_forward_output,
-                                 ::google::protobuf::Closure* done) {
-  threadpool_->schedule(
-      [this, controller, pb_forward_input, pb_forward_output, done]() mutable {
-        brpc::ClosureGuard done_guard(done);
-        // convert proto::ForwardInput to LlmForwardInput
-
-        Timer timer;
-        std::variant<LlmForwardInput,
-                     VlmForwardInput,
-                     RecForwardInput,
-                     DiTForwardInput>
-            input;
-        if (options_.backend() == "dit") {
-          input.emplace<DiTForwardInput>();
-        } else if (options_.backend() == "rec") {
-          input.emplace<RecForwardInput>();
-        } else if (options_.backend() == "vlm") {
-          input.emplace<VlmForwardInput>();
-        }
-        if (!pb_forward_input->has_packed_input()) {
-          controller->SetFailed(
-              "LlmForwardInput requires a packed input payload");
-          return;
-        }
-        const proto::PackedForwardInput& packed_input =
-            pb_forward_input->packed_input();
-        // Dispatch follows the configured domain, including token-only VLM
-        // decode. A mismatched domain is rejected before tensor preparation.
-        const bool valid_input = std::visit(
-            [&](auto& typed_input) {
-              return typed_input.from_packed_proto(packed_input);
-            },
-            input);
-        if (!valid_input) {
-          controller->SetFailed(
-              "Invalid forward input domain, schema, or layout");
-          return;
-        }
-
-        ForwardOutput cpu_output;
-        std::vector<SpeculativeTokenStats> speculative_token_stats;
-
-        std::visit(
-            [&](auto& typed_input) {
-              using Input = std::decay_t<decltype(typed_input)>;
-              if constexpr (std::is_same_v<Input, DiTForwardInput>) {
-                step(typed_input, cpu_output.dit_forward_output);
-              } else {
-                step(typed_input, cpu_output, speculative_token_stats);
-              }
-            },
-            input);
-        // convert to proto output
-        if (!cpu_output.to_proto(speculative_token_stats, pb_forward_output)) {
-          controller->SetFailed("Failed to serialize model output");
-          return;
-        }
-        COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
-      });
-}
-
-void WorkerService::GetLastStepResult(
-    ::google::protobuf::RpcController* controller,
-    const proto::Empty* req,
-    proto::ForwardOutput* pb_forward_output,
-    ::google::protobuf::Closure* done) {
-  threadpool_->schedule([this,
-                         controller,
-                         req,
-                         pb_forward_output,
-                         done]() mutable {
-    brpc::ClosureGuard done_guard(done);
-    const bool use_default_stream =
-        !options_.enable_schedule_overlap() && options_.backend() == "llm";
-
-    const bool task_pipeline = options_.enable_task_pipeline();
-    const bool worker_task_pipeline =
-        task_pipeline && worker_->task_pipeline_uses_worker_prepare();
-    auto future = worker_->get_last_step_result_async();
-    auto forward_outputs = std::move(future).get();
-    if (forward_outputs) {
-      const ForwardOutput& forward_output = forward_outputs.value();
-      const auto& sample_output = forward_output.sample_output;
-      // Worker-owned Consume retires the producer event before fulfilling
-      // this Future. A CPU-only result needs no second event wait/stream
-      // fence. Device-valued optional outputs still require the D2H path.
-      const bool cpu_ready_worker_result =
-          worker_task_pipeline && has_cpu_serialization_inputs(forward_output);
-      const bool cpu_ready_task_result =
-          (task_pipeline && !worker_task_pipeline) || cpu_ready_worker_result;
-      ForwardOutput cpu_output;
-      cpu_output.prepared_token = forward_output.prepared_token;
-      cpu_output.json_object_errors = forward_output.json_object_errors;
-      const auto& beam_search_output = forward_output.beam_search_output;
-      std::vector<SpeculativeTokenStats> speculative_token_stats;
-      auto& next_tokens = cpu_output.sample_output.next_tokens;
-      auto& logprobs = cpu_output.sample_output.logprobs;
-      auto& top_tokens = cpu_output.sample_output.top_tokens;
-      auto& top_logprobs = cpu_output.sample_output.top_logprobs;
-      auto& embeddings = cpu_output.sample_output.embeddings;
-      auto& dit_images = cpu_output.dit_forward_output.tensors;
-      auto& dit_audio = cpu_output.dit_forward_output.audio_tensors;
-      auto& dit_text_output = cpu_output.dit_forward_output.text_output;
-      auto& expert_load_data = cpu_output.expert_load_data;
-      auto& src_seq_idxes = cpu_output.beam_search_output.src_seq_idxes;
-      auto& out_tokens = cpu_output.beam_search_output.out_tokens;
-      auto& out_logprobs = cpu_output.beam_search_output.out_logprobs;
-      auto copy_output_to_host = [&]() {
-        expert_load_data = safe_to(forward_output.expert_load_data,
-                                   torch::kCPU,
-                                   /*non_blocking=*/true);
-
-        // [num_seq, ..., embed_dim]
-        embeddings = safe_to(sample_output.embeddings,
-                             torch::kCPU,
-                             /*non_blocking=*/true);
-        embeddings = safe_to(embeddings,
-                             torch::kFloat32,
-                             /*non_blocking=*/true);
-
-        dit_images.reserve(forward_output.dit_forward_output.tensors.size());
-        for (auto image : forward_output.dit_forward_output.tensors) {
-          dit_images.emplace_back(
-              safe_to(image, torch::kCPU, /*non_blocking=*/true));
-        }
-        dit_audio.reserve(
-            forward_output.dit_forward_output.audio_tensors.size());
-        for (auto audio : forward_output.dit_forward_output.audio_tensors) {
-          dit_audio.emplace_back(
-              safe_to(audio, torch::kCPU, /*non_blocking=*/true));
-        }
-        dit_text_output = forward_output.dit_forward_output.text_output;
-
-        // [num_seq]
-        next_tokens = safe_to(forward_output.next_tokens_host.defined()
-                                  ? forward_output.next_tokens_host
-                                  : sample_output.next_tokens,
-                              torch::kCPU,
-                              /*non_blocking=*/true);
-        if (next_tokens.defined() ||
-            ::xllm::EPLBConfig::get_instance().enable_eplb()) {
-          // [num_seq] FloatTensor
-          logprobs = safe_to(sample_output.logprobs,
-                             torch::kCPU,
-                             /*non_blocking=*/true);
-          // [num_seq, topk]
-          top_tokens = safe_to(sample_output.top_tokens,
-                               torch::kCPU,
-                               /*non_blocking=*/true);
-          // [num_seq, topk]
-          top_logprobs = safe_to(sample_output.top_logprobs,
-                                 torch::kCPU,
-                                 /*non_blocking=*/true);
-          // [num_seq]
-          src_seq_idxes = safe_to(beam_search_output.src_seq_idxes,
-                                  torch::kCPU,
-                                  /*non_blocking=*/true);
-          // [num_seq]
-          out_tokens = safe_to(beam_search_output.out_tokens,
-                               torch::kCPU,
-                               /*non_blocking=*/true);
-          // [num_seq]
-          out_logprobs =
-              safe_to(beam_search_output.out_logprobs,
-                      torch::dtype(torch::kFloat32).device(torch::kCPU),
-                      /*non_blocking=*/true);
-        }
-      };
-
-      if (cpu_ready_task_result) {
-        // The pipeline Future completes after Consume produces CPU results.
-        copy_output_to_host();
-#if defined(USE_NPU)
-        if (cpu_ready_worker_result && !use_default_stream) {
-          DeviceMonitor::get_instance().update_active_activation_memory(
-              device_.index());
-        }
-#endif
-      } else {
-        if (use_default_stream) {
-          copy_output_to_host();
-        } else {
-          c10::StreamGuard stream_guard = stream_->set_stream_guard();
-          if (forward_output.ready_event != nullptr) {
-            CHECK(stream_->wait_event(forward_output.ready_event))
-                << "wait forward output ready event failed.";
-          }
-          copy_output_to_host();
-        }
-        if (use_default_stream) {
-          device_.synchronize_default_stream();
-        } else {
-          stream_->synchronize();
-#if defined(USE_NPU)
-          DeviceMonitor::get_instance().update_active_activation_memory(
-              device_.index());
-#endif
-        }
-      }
-      speculative_token_stats =
-          record_speculative_metrics_from_output(forward_output);
-
-      if (next_tokens.defined() || !dit_images.empty() ||
-          !cpu_output.dit_forward_output.audio_tensors.empty() ||
-          !dit_text_output.empty() ||
-          ::xllm::EPLBConfig::get_instance().enable_eplb() ||
-          !forward_output.json_object_errors.empty()) {
-        if (!cpu_output.to_proto(speculative_token_stats, pb_forward_output)) {
-          controller->SetFailed("Failed to serialize model output");
-          return;
-        }
-      }
-    }
-  });
   return;
 }
 
