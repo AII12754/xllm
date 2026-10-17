@@ -877,10 +877,12 @@ TEST(BatchPackedInputTest, VlmPackedSampleCountAvoidsMaterialization) {
 }
 
 TEST(BatchPackedInputDeathTest, LlmPackedSampleCountMustMatchPayload) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
   expect_packed_sample_count_mismatch_rejected<LlmForwardInput>();
 }
 
 TEST(BatchPackedInputDeathTest, VlmPackedSampleCountMustMatchPayload) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
   expect_packed_sample_count_mismatch_rejected<VlmForwardInput>();
 }
 
