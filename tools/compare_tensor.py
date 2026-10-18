@@ -38,10 +38,12 @@ def compare_tensors(a: torch.Tensor, b: torch.Tensor, tol: float = 1e-6, verbose
     if verbose and diff_count > 0:
         indices = torch.nonzero(diff_mask, as_tuple=False)
         for idx in indices:
-            i, j = idx[0].item(), idx[1].item()
-            logger.info(
-                f"diff at {i},{j}: {a[i, j].item():.6f} - {b[i, j].item():.6f} = {(a[i, j] - b[i, j]).item():.6f}"
-            )
+            coordinate = tuple(idx.tolist())
+            coordinate_text = ",".join(str(value) for value in coordinate)
+            a_value = a[coordinate].item()
+            b_value = b[coordinate].item()
+            difference = (a[coordinate] - b[coordinate]).item()
+            logger.info(f"diff at {coordinate_text}: {a_value:.6f} - {b_value:.6f} = {difference:.6f}")
 
     return diff_count
 
