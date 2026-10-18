@@ -1,7 +1,5 @@
 ---
-title: "在线性能采集 (Online Profiling)"
-sidebar:
-  order: 3
+title: "在线服务性能分析"
 ---
 
 ## 背景

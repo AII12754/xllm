@@ -1,7 +1,5 @@
 ---
-title: "xLLM Ascend TileLang Kernel Development Guide"
-sidebar:
-  order: 2
+title: "TileLang Kernel Development on Ascend NPU"
 ---
 This document explains how to add or modify an Ascend TileLang kernel in xLLM. The examples use the current `rope` kernel throughout.
 

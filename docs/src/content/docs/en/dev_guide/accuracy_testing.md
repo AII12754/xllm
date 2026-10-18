@@ -1,5 +1,5 @@
 ---
-title: "Accuracy Testing with EvalScope"
+title: "Accuracy Evaluation with EvalScope"
 description: "Evaluate xLLM LLM and VLM accuracy through the OpenAI-compatible API."
 ---
 

@@ -1,7 +1,5 @@
 ---
-title: "Graph Mode 设计文档"
-sidebar:
-  order: 1
+title: "图执行与显存复用"
 ---
 ## 概述
 
@@ -29,7 +27,7 @@ xLLM 的 Graph Mode 覆盖多种图执行后端。其目标是在推理服务场
 
 相关设计文档：
 
-- 若希望看一个更偏业务推理场景、并且聚焦固定调度、多步执行和定制算子的案例，可参考：[生成式推荐设计文档](/zh/design/generative_recommendation_design/)
+- 若希望看一个更偏业务推理场景、并且聚焦固定调度、多步执行和定制算子的案例，可参考：[生成式推荐推理架构](/zh/design/generative_recommendation_design/)
 
 ## 1. Graph Mode 原理和在 xLLM 中的落地
 

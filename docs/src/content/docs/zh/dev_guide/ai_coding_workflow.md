@@ -1,7 +1,5 @@
 ---
-title: "AI Coding 工作流"
-sidebar:
-  order: 4
+title: "AI 辅助开发工作流"
 ---
 
 本文总结一套面向 xLLM 开发者的实践工作流，用于 NPU 推理优化、回归定位，以及为

@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "runtime/llm_worker_impl.h"
+#include "runtime/rec_executor.h"
 #include "runtime/rec_forward_params.h"
 #include "util/blockingconcurrentqueue.h"
 #include "util/rec_model_utils.h"
@@ -79,7 +80,7 @@ class RecWorkerImpl : public LLMWorkerImpl {
     }
     std::unique_ptr<Stream> stream;
     std::unique_ptr<CausalLM> model;
-    std::unique_ptr<Executor> executor;
+    std::unique_ptr<RecExecutor> executor;
     std::unique_ptr<ModelContext> context;
     std::unique_ptr<EplbExecutor> eplb_executor;
     torch::Tensor expert_load_data;

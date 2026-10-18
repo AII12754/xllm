@@ -18,6 +18,8 @@ cc_library(
     executor_impl_factory.h
     vlm_executor_impl.h
     base_executor_impl.h
+    rec_executor.h
+    rec_executor_impl.h
     dit_executor.h
     $<$<BOOL:${USE_NPU}>:acl_graph_bucket_policy.h>
     $<$<BOOL:${USE_NPU}>:acl_graph_executor_impl.h>
@@ -61,6 +63,8 @@ cc_library(
     task_execution_pipeline_speculative.cpp
     executor_impl_factory.cpp
     base_executor_impl.cpp
+    rec_executor.cpp
+    rec_executor_impl.cpp
     vlm_executor_impl.cpp
     dit_executor.cpp
     $<$<BOOL:${USE_NPU}>:acl_graph_executor_impl.cpp>

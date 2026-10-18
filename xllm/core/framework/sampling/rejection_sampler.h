@@ -36,39 +36,20 @@ class RejectionSampler final {
     return this->forward(::std::forward<Args>(args)...);
   }
 
+  // The single sampling owner for speculative verification. The
+  // general-purpose Sampler never runs for verify steps.
   SampleOutput forward(const DraftProposal& draft_proposal,
-                       const torch::Tensor& target_logits,
-                       const torch::Tensor& bonus_token_ids,
-                       bool mask_out_rejected_tokens = false) const;
+                       const torch::Tensor& target_logits) const;
 
   // build mask from accepted matrix
   // for example: [[1, 1, 0, 1],   ->   [[1, 1, 1, 0, 0],
   //               [1, 0, 0, 0]]         [1, 1, 0, 0, 0]]
   static torch::Tensor build_accepted_mask(const torch::Tensor& accepted);
 
-  static std::tuple<torch::Tensor, torch::Tensor> random_sample(
-      const DraftProposal& draft_proposal,
-      const torch::Tensor& target_probs,
-      const torch::Tensor& uniform_rand,
-      const torch::Tensor& bonus_token_ids,
-      bool mask_out_rejected_tokens);
-
-  static std::tuple<torch::Tensor, torch::Tensor> greedy_sample(
-      const torch::Tensor& draft_token_ids,
-      const torch::Tensor& target_scores,
-      const torch::Tensor& bonus_token_ids,
-      bool mask_out_rejected_tokens);
-
-  // NPU requires int32-representable int32/int64 IDs and returns int32;
-  // this value-range precondition is not validated per element.
-  // Input views retain their dtype and strides; conversion happens in
-  // kernel UB. Return all target IDs plus bonus, and optionally the
-  // prefix-masked output.
-  static std::tuple<torch::Tensor, torch::Tensor> greedy_sample_from_token_ids(
-      const torch::Tensor& draft_token_ids,
-      const torch::Tensor& target_token_ids,
-      const torch::Tensor& bonus_token_ids,
-      bool mask_out_rejected_tokens);
+  static torch::Tensor random_sample(const DraftProposal& draft_proposal,
+                                     const torch::Tensor& target_probs,
+                                     const torch::Tensor& uniform_rand,
+                                     const torch::Tensor& bonus_token_ids);
 
  private:
   // whether to return logprobs

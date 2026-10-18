@@ -230,7 +230,7 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `enable_profile_kv_blocks` | `bool` | `true` | profiling 时是否生成 KV Cache blocks。 |
 | `disable_ttft_profiling` | `bool` | `false` | 是否禁用 TTFT profiling。 |
 | `enable_online_profile` | `bool` | `false` | 是否启用在线 timeline 接口（`/start_profile` 和 `/stop_profile`），支持 Ascend NPU 及文档中列出的 profiling 后端。 |
-| `profile_backend` | `string` | `"torch"` | 在线 profiling 后端。`torch`（默认）在 Ascend 上通过 torch_npu 采集 CPU+NPU，在其他支持的平台通过 Kineto 采集 CPU+CUDA；`ascend` 采集 CANN 原始数据，使用 msprof 导出；`cuda` 控制外部 nsys 的 capture range。部署限制见[在线性能采集](/zh/dev_guide/online_profiling/)。 |
+| `profile_backend` | `string` | `"torch"` | 在线 profiling 后端。`torch`（默认）在 Ascend 上通过 torch_npu 采集 CPU+NPU，在其他支持的平台通过 Kineto 采集 CPU+CUDA；`ascend` 采集 CANN 原始数据，使用 msprof 导出；`cuda` 控制外部 nsys 的 capture range。部署限制见[在线服务性能分析](/zh/dev_guide/online_profiling/)。 |
 | `profile_dir` | `string` | `""` | `torch` 和 `ascend` 后端的 trace 输出目录；为空表示当前工作目录。 |
 
 ## ExecutionConfig

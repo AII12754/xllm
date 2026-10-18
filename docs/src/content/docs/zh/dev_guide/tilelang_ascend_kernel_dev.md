@@ -1,7 +1,5 @@
 ---
-title: "xLLM Ascend TileLang Kernel 开发指南"
-sidebar:
-  order: 2
+title: "昇腾 TileLang 算子开发"
 ---
 本文说明在 xLLM 中新增或修改 Ascend TileLang kernel 的开发方式。示例全程使用当前的 `rope` kernel。
 

@@ -1,11 +1,11 @@
 ---
-title: "使用 EvalScope 进行性能测试"
+title: "使用 EvalScope 测试推理性能"
 description: "通过流式负载测试 xLLM LLM 和 VLM 的延迟与吞吐量。"
 ---
 
 使用 `evalscope perf` 测量已启动的 xLLM 服务的延迟和吞吐量。本文提供基于随机文本的
 LLM 脚本，以及基于真实图文输入的 VLM 脚本。回答正确率评测请参见
-[使用 EvalScope 进行精度测试](/zh/dev_guide/accuracy_testing/)。
+[使用 EvalScope 评测模型精度](/zh/dev_guide/accuracy_testing/)。
 
 ## 准备环境与服务
 
@@ -213,7 +213,7 @@ TTFT 和输出吞吐，并说明输入 token 的统计口径。
 | 成功与失败请求数 | 用于确认预定负载是否完整执行。 |
 
 保留 `--stream`，才能观测 TTFT 和 token 到达间隔。这些指标反映客户端看到的服务性能；
-设备执行分析请参见[在线 Profiling](/zh/dev_guide/online_profiling/)。
+设备执行分析请参见[在线服务性能分析](/zh/dev_guide/online_profiling/)。
 
 EvalScope 会打印 `RUN_DIR`下的实际结果路径，写入 `benchmark.log`，并为多档并发运行生成
 `performance_summary.txt`。保留各次运行的请求数据库 `benchmark_data.db`，便于在结果

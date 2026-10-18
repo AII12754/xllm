@@ -1,7 +1,5 @@
 ---
-title: "AI Coding Workflow"
-sidebar:
-  order: 4
+title: "AI-Assisted Development Workflow"
 ---
 
 This guide summarizes a practical workflow for xLLM developers who need to

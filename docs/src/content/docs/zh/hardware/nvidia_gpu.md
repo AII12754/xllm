@@ -75,4 +75,4 @@ done
 
 - CUDA 开发镜像和 Dockerfile 入口维护在 [快速开始](/zh/getting_started/quick_start/) 中。
 - 当前 CUDA 启动示例使用 `--block_size=32` 和 `--max_memory_utilization=0.8`；实际部署时按模型规模和 GPU 显存调整。
-- CUDA timeline 采集入口见 [在线性能采集](/zh/dev_guide/online_profiling/)。
+- CUDA timeline 采集入口见 [在线服务性能分析](/zh/dev_guide/online_profiling/)。

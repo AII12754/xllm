@@ -1,7 +1,5 @@
 ---
-title: "自动调优配置 (Auto Config) 开发指南"
-sidebar:
-  order: 5
+title: "自动调优配置扩展"
 ---
 
 ## 背景

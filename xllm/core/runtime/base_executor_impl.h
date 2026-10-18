@@ -53,7 +53,4 @@ class BaseExecutorImpl : public ExecutorImpl {
   runtime::Options options_;
 };
 REGISTER_EXECUTOR("llm", BaseExecutorImpl);
-
-using RecExecutorImpl = BaseExecutorImpl;
-REGISTER_EXECUTOR("rec", RecExecutorImpl);
 }  // namespace xllm

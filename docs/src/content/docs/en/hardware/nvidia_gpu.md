@@ -77,4 +77,4 @@ For a single-device run, `<device-id>` usually starts from `0`. For multi-device
 
 - The CUDA development image and Dockerfile references are maintained in [Quick Start](/en/getting_started/quick_start/).
 - The default CUDA launch example uses `--block_size=32` and `--max_memory_utilization=0.8`; adjust these values according to the target model and available GPU memory.
-- CUDA timeline collection is available through the profiling endpoints described in [Online Profiling](/en/dev_guide/online_profiling/).
+- CUDA timeline collection is available through the profiling endpoints described in [Profiling a Running Service](/en/dev_guide/online_profiling/).

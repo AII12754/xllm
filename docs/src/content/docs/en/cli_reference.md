@@ -230,7 +230,7 @@ Current support covers ordinary non-PD text inference with prefix caching enable
 | `enable_profile_kv_blocks` | `bool` | `true` | Whether to generate KV Cache blocks for profiling. |
 | `disable_ttft_profiling` | `bool` | `false` | Whether to disable TTFT profiling. |
 | `enable_online_profile` | `bool` | `false` | Enable the online timeline endpoints (`/start_profile`, `/stop_profile`). Supports Ascend NPU and the documented profiling backends. |
-| `profile_backend` | `string` | `"torch"` | Online profiling backend. `torch` (default) records CPU+NPU using torch_npu on Ascend, or CPU+CUDA using Kineto. `ascend` records native CANN data for export with msprof. `cuda` toggles the external nsys capture range. See [Online Profiling](/en/dev_guide/online_profiling/) for deployment requirements. |
+| `profile_backend` | `string` | `"torch"` | Online profiling backend. `torch` (default) records CPU+NPU using torch_npu on Ascend, or CPU+CUDA using Kineto. `ascend` records native CANN data for export with msprof. `cuda` toggles the external nsys capture range. See [Profiling a Running Service](/en/dev_guide/online_profiling/) for deployment requirements. |
 | `profile_dir` | `string` | `""` | Output directory for `torch` and `ascend` traces. Empty means the current working directory. |
 
 ## ExecutionConfig

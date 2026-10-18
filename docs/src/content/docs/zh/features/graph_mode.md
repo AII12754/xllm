@@ -75,5 +75,5 @@ xLLM 支持 Graph Mode，通过预捕获计算图并在后续执行中重放，�
 | GLM4V-MoE | ✅ | | |
 
 ## 相关文档
-- 更详细的 Graph Mode 设计与实现说明（含 ACL Graph / CUDA Graph 基本原理、动态维度参数化、Piecewise Graph 与多 shape 复用内存方案）见：[Graph Mode 设计文档](/zh/design/graph_mode_design/)
+- 更详细的 Graph Mode 设计与实现说明（含 ACL Graph / CUDA Graph 基本原理、动态维度参数化、Piecewise Graph 与多 shape 复用内存方案）见：[图执行与显存复用](/zh/design/graph_mode_design/)
 

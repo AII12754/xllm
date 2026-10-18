@@ -1,7 +1,5 @@
 ---
-title: "C++ Serving Framework + Python Model Execution 架构决策"
-sidebar:
-  order: 3
+title: "C++ 服务框架与 Python 模型执行"
 ---
 <!--
 Copyright 2026 The xLLM Authors. All Rights Reserved.

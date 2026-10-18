@@ -80,5 +80,5 @@ Ensure that the kernels used in the computation implement dynamic dimension para
 :::
 ## Related Documentation
 
-- For more detailed Graph Mode design and implementation notes, including ACL Graph / CUDA Graph fundamentals, dynamic dimension parameterization, Piecewise Graph, and multi-shape memory reuse, see: [Graph Mode Design Document](/en/design/graph_mode_design/)
+- For more detailed Graph Mode design and implementation notes, including ACL Graph / CUDA Graph fundamentals, dynamic dimension parameterization, Piecewise Graph, and multi-shape memory reuse, see: [Graph Execution and Memory Reuse](/en/design/graph_mode_design/)
 

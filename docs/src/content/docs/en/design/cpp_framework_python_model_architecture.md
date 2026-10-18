@@ -1,7 +1,5 @@
 ---
-title: "C++ Serving Framework + Python Model Execution Architecture Decision"
-sidebar:
-  order: 3
+title: "C++ Serving and Python Model Execution"
 ---
 <!--
 Copyright 2026 The xLLM Authors. All Rights Reserved.

@@ -2870,10 +2870,9 @@ RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
 }
 
 RecWorkerImpl::~RecWorkerImpl() {
-  // Release model_, model_executor_, eplb_executor_ in destructor to avoid
+  // Release model_ and eplb_executor_ in destructor to avoid
   // double deletion. Ownership actually belongs to work_pipelines_[0].
   model_.release();
-  model_executor_.release();
 
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     eplb_executor_.release();
@@ -2933,10 +2932,10 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
     CHECK(runtime.model != nullptr) << "Failed to create model instance " << i;
 
     runtime.executor =
-        std::make_unique<Executor>(runtime.model.get(),
-                                   runtime.context->get_model_args(),
-                                   runtime.worker.device(),
-                                   runtime.worker.options_);
+        std::make_unique<RecExecutor>(runtime.model.get(),
+                                      runtime.context->get_model_args(),
+                                      runtime.worker.device(),
+                                      runtime.worker.options_);
 
     if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
       runtime.eplb_executor = std::make_unique<EplbExecutor>(
@@ -2948,7 +2947,6 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
   }
 
   model_.reset(work_pipelines_[0]->runtime().model.get());
-  model_executor_.reset(work_pipelines_[0]->runtime().executor.get());
 
   // Complete other initialization (EPLB, BeamSearcher, etc.)
   if (::xllm::BeamSearchConfig::get_instance().enable_beam_search_kernel()) {

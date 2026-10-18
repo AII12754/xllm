@@ -1,7 +1,5 @@
 ---
-title: "代码结构"
-sidebar:
-  order: 1
+title: "代码架构与请求流程"
 ---
 
 ## 第一次阅读，从这些文件开始
@@ -354,6 +352,6 @@ POST /v1/chat/completions
 选择了 Python 模型实现。
 
 更详细的说明见
-[C++ 框架与 Python 模型设计](/zh/design/cpp_framework_python_model_architecture/)、
-[图模式设计](/zh/design/graph_mode_design/)以及
+[C++ 服务框架与 Python 模型执行](/zh/design/cpp_framework_python_model_architecture/)、
+[图执行与显存复用](/zh/design/graph_mode_design/)以及
 [`xllm/python/` 包说明](https://github.com/xLLM-AI/xllm/blob/main/xllm/python/README_zh.md)。

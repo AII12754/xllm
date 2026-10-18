@@ -1,12 +1,12 @@
 ---
-title: "Performance Testing with EvalScope"
+title: "Inference Benchmarking with EvalScope"
 description: "Measure xLLM LLM and VLM latency and throughput with streaming workloads."
 ---
 
 Use `evalscope perf` to measure a running xLLM service's latency and throughput.
 This guide includes an LLM script with random text and a VLM script with real
 image-text inputs. For answer correctness, use
-[Accuracy Testing with EvalScope](/en/dev_guide/accuracy_testing/).
+[Accuracy Evaluation with EvalScope](/en/dev_guide/accuracy_testing/).
 
 ## Prepare the environment and service
 
@@ -244,7 +244,7 @@ tokens are counted.
 
 Keep `--stream` enabled to observe TTFT and token arrival intervals. These are
 client-observed service metrics; use
-[Online Profiling](/en/dev_guide/online_profiling/) for device execution analysis.
+[Profiling a Running Service](/en/dev_guide/online_profiling/) for device execution analysis.
 
 EvalScope prints the actual output path under `RUN_DIR`, writes `benchmark.log`,
 and creates a `performance_summary.txt` for the multiple-concurrency run. Preserve

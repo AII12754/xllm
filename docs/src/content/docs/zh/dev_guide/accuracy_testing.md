@@ -1,5 +1,5 @@
 ---
-title: "使用 EvalScope 进行精度测试"
+title: "使用 EvalScope 评测模型精度"
 description: "通过 OpenAI 兼容接口评测 xLLM 的 LLM 和 VLM 精度。"
 ---
 
@@ -7,7 +7,7 @@ description: "通过 OpenAI 兼容接口评测 xLLM 的 LLM 和 VLM 精度。"
 GSM8K 的纯文本 LLM 脚本，以及基于 AI2D 的图文 VLM 脚本。两者均使用 EvalScope
 原生评测后端和规则评分，无需单独部署裁判模型，也无需安装 VLMEvalKit。
 
-延迟和吞吐量测试请参见[使用 EvalScope 进行性能测试](/zh/dev_guide/performance_testing/)。
+延迟和吞吐量测试请参见[使用 EvalScope 测试推理性能](/zh/dev_guide/performance_testing/)。
 
 ## 准备环境与服务
 

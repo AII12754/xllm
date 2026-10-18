@@ -1,7 +1,5 @@
 ---
-title: "Auto Config Development Guide"
-sidebar:
-  order: 5
+title: "Extending Auto Config"
 ---
 
 ## Background

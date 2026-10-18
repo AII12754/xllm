@@ -1,7 +1,5 @@
 ---
-title: "Generative Recommendation Design Document"
-sidebar:
-  order: 2
+title: "Generative Recommendation Inference Architecture"
 ---
 ## Overview
 

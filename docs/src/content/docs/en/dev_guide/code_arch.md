@@ -1,7 +1,5 @@
 ---
-title: "Code Architecture"
-sidebar:
-  order: 1
+title: "Code Architecture and Request Flow"
 ---
 
 ## Start with these files
@@ -395,6 +393,6 @@ Keep three choices separate when tracing configuration:
 does not by itself select a Python model implementation.
 
 For more detail, read the
-[C++ Framework + Python Model design](/en/design/cpp_framework_python_model_architecture/),
-[Graph Mode design](/en/design/graph_mode_design/), and the
+[C++ Serving and Python Model Execution](/en/design/cpp_framework_python_model_architecture/),
+[Graph Execution and Memory Reuse](/en/design/graph_mode_design/), and the
 [`xllm/python/` package guide](https://github.com/xLLM-AI/xllm/blob/main/xllm/python/README.md).

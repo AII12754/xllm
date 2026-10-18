@@ -1,7 +1,5 @@
 ---
-title: "Graph Mode Design Document"
-sidebar:
-  order: 1
+title: "Graph Execution and Memory Reuse"
 ---
 ## Overview
 
@@ -29,7 +27,7 @@ The non-goals of this document are:
 
 Related design documents:
 
-- for a recommendation-oriented case study that focuses on fixed scheduling, multi-step execution, and custom operators, see: [Generative Recommendation Design Document](/en/design/generative_recommendation_design/)
+- for a recommendation-oriented case study that focuses on fixed scheduling, multi-step execution, and custom operators, see: [Generative Recommendation Inference Architecture](/en/design/generative_recommendation_design/)
 
 ## 1. Graph Mode Fundamentals
 

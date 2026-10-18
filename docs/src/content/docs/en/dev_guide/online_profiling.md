@@ -1,7 +1,5 @@
 ---
-title: "Online Profiling"
-sidebar:
-  order: 3
+title: "Profiling a Running Service"
 ---
 
 ## Background
