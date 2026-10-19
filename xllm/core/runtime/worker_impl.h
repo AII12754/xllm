@@ -210,6 +210,8 @@ class WorkerImpl {
                                            LlmForwardInput& prepared);
   virtual std::optional<ForwardOutput> execute_task_pipeline(
       const LlmForwardInput& prepared);
+  // Warmup waits for execution allocations; serving keeps stream overlap.
+  void observe_execution_memory(bool is_warmup);
   void sanitize_json_object_error_inputs(LlmForwardInput& inputs);
   virtual VlmForwardInput update_input_by_last_step_output(
       VlmForwardInput& inputs);

@@ -125,6 +125,7 @@ cc_test(
     :distributed_virtual_memory_coordinator
     GTest::gtest_main
     glog::glog
+    brpc
 )
 
 if(USE_NPU)

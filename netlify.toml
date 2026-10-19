@@ -31,11 +31,19 @@
   command = "npm ci && npm run build"
   publish = "dist"
 
-  # Production docs remain on GitHub Pages. Skip Netlify production builds so
-  # merges to main do not create an unused production deploy (15 credits each
-  # on credit-based plans). Pull request previews use
-  # CONTEXT=deploy-preview, so they still build.
-  ignore = 'test "$CONTEXT" = "production"'
+  # Production docs remain on GitHub Pages, and Deploy Previews are only
+  # rebuilt when the docs inputs change. Netlify native CD does not use GitHub
+  # Actions path filters, so both checks live in this ignore command.
+  # README.md and README_zh.md are included because the docs homepages are
+  # symlinks to them; assets/ and this config are also docs inputs.
+  ignore = '''
+  if [ "$CONTEXT" = "production" ]; then
+    exit 0
+  fi
+
+  repo_root="$(git rev-parse --show-toplevel)"
+  git -C "$repo_root" diff --quiet "$CACHED_COMMIT_REF" "$COMMIT_REF" -- docs README.md README_zh.md assets netlify.toml
+  '''
 
 [build.environment]
   NODE_VERSION = "22"

@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/kv_cache/storage/virtual_kv_cache_tensor_allocator.h"
+#include "core/kv_cache/storage/vmm_kv_tensor_allocator.h"
 
 #include <glog/logging.h>
 
@@ -25,12 +25,12 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-class VirtualKVCacheTensorAllocator final : public KVCacheTensorAllocator {
+class VmmKVTensorAllocator final : public KVCacheTensorAllocator {
  public:
-  VirtualKVCacheTensorAllocator(VirtualKVCacheMemoryRegistry& registry,
-                                std::string model_id,
-                                int64_t num_layers,
-                                std::vector<bool> index_layer_owned)
+  VmmKVTensorAllocator(VirtualKVCacheMemoryRegistry& registry,
+                       std::string model_id,
+                       int64_t num_layers,
+                       std::vector<bool> index_layer_owned)
       : registry_(registry),
         model_id_(std::move(model_id)),
         num_layers_(num_layers),
@@ -94,12 +94,12 @@ class VirtualKVCacheTensorAllocator final : public KVCacheTensorAllocator {
 
 }  // namespace
 
-std::shared_ptr<KVCacheTensorAllocator>
-create_virtual_kv_cache_tensor_allocator(VirtualKVCacheMemoryRegistry& registry,
-                                         std::string model_id,
-                                         int64_t num_layers,
-                                         std::vector<bool> index_layer_owned) {
-  return std::make_shared<VirtualKVCacheTensorAllocator>(
+std::shared_ptr<KVCacheTensorAllocator> create_vmm_kv_tensor_allocator(
+    VirtualKVCacheMemoryRegistry& registry,
+    std::string model_id,
+    int64_t num_layers,
+    std::vector<bool> index_layer_owned) {
+  return std::make_shared<VmmKVTensorAllocator>(
       registry, std::move(model_id), num_layers, std::move(index_layer_owned));
 }
 

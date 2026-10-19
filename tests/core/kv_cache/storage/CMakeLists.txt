@@ -39,6 +39,8 @@ if(USE_NPU)
                         $<$<BOOL:${USE_NPU}>:nnopbase>)
   # Each process initializes the NPU runtime and owns the device-0 page pool.
   set_tests_properties(
+    VirtualKVCacheMemoryRegistryTest.PrepareRejectsDuplicateAndInvalidOffsetsWithoutAllocation
+    VirtualKVCacheMemoryRegistryTest.PrepareRejectsExistingMappingsWithoutChangingOwnership
     VirtualKVCacheMemoryRegistryTest.ModelsKeepIndependentMappingsAndMetadata
     VirtualKVCacheMemoryRegistryTest.ShortageDoesNotPartiallyMapAnotherModel
     VirtualKVCacheMemoryRegistryTest.TensorAllocatorUsesItsInjectedRegistry
@@ -62,11 +64,11 @@ endif()
 cc_test(
   NO_NPU_RUNTIME
   NAME
-    virtual_kv_cache_page_allocator_impl_test
+    vmm_kv_page_allocator_impl_test
   SRCS
-    virtual_kv_cache_page_allocator_impl_test.cpp
+    vmm_kv_page_allocator_impl_test.cpp
   DEPS
-    :virtual_kv_cache_page_allocator_impl
+    :vmm_kv_page_allocator_impl
     :virtual_kv_cache_page_layout
     GTest::gtest_main
     glog::glog

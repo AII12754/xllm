@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <functional>
+#include <utility>
 #include <vector>
 
 #include "common/macros.h"
@@ -34,6 +35,8 @@ struct HostCacheRestorePoint {
 
 class KVCacheManager {
  public:
+  using KVCacheReservation = std::pair<Sequence*, size_t>;
+
   using PrefetchDoneCallback = std::function<void(std::shared_ptr<Request>)>;
   using PrefetchCompletionCallback = std::function<void()>;
 
@@ -42,6 +45,22 @@ class KVCacheManager {
   virtual bool allocate(Sequence* sequence) = 0;
   virtual bool allocate(std::vector<Sequence*>& sequences) = 0;
   virtual bool allocate(Sequence* sequence, size_t num_tokens) = 0;
+  // Return true only when the requested token footprint cannot fit even if
+  // every block in the selected pool were available. Unknown layouts return
+  // false so callers can preserve the request for a later allocation retry.
+  virtual bool exceeds_total_capacity(Sequence* sequence,
+                                      size_t num_tokens) const {
+    return false;
+  }
+  virtual bool exceeds_total_capacity(
+      const std::vector<KVCacheReservation>& reservations) const {
+    for (const auto& [sequence, num_tokens] : reservations) {
+      if (exceeds_total_capacity(sequence, num_tokens)) {
+        return true;
+      }
+    }
+    return false;
+  }
   virtual bool try_allocate(Sequence* sequence) = 0;
 
   virtual void transfer_blocks(BatchGroup& batches) {};
@@ -98,6 +117,13 @@ class KVCacheManager {
   get_swap_block_transfer_infos() = 0;
 
   virtual uint32_t num_blocks() const = 0;
+  // Advisory total capacity, including held blocks. Elastic caches may return
+  // a stale physical-budget snapshot; a low value alone cannot prove that an
+  // otherwise idle request will fail allocation. num_blocks() is the configured
+  // limit, while allocate() validates the current backing capacity.
+  virtual size_t admission_capacity(int32_t /*dp_rank*/) const {
+    return num_blocks();
+  }
   virtual int32_t block_size() const = 0;
   virtual std::vector<size_t> num_blocks_in_prefix_cache() const = 0;
   virtual std::vector<size_t> num_free_blocks() const = 0;

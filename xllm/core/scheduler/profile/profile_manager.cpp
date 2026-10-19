@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/batch/batch_factory.h"
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
@@ -180,17 +181,28 @@ ProfileManager::ProfileManager(
 #if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MLU)
   if (!is_rec_multi_round_mode()) {
     const auto& execution_config = ::xllm::ExecutionConfig::get_instance();
+    const auto& cache_config = KVCacheConfig::get_instance();
+    const bool elastic_vmm =
+        cache_config.enable_virtual_memory() && cache_config.vmm_elastic();
     if (execution_config.enable_graph()) {
       if (execution_config.disable_graph_warmup()) {
+        CHECK(!elastic_vmm)
+            << "Elastic VMM requires startup graph warmup to establish the "
+               "execution budget; enable graph warmup or use "
+               "--vmm_elastic=false";
         LOG(INFO) << "Graph warmup disabled by execution config; graphs will "
                      "be captured lazily from real requests";
       } else {
         warmup_for_graph();
       }
+    }
+    if (elastic_vmm) {
+      warmup_for_vmm();
 #if defined(USE_NPU)
-    } else if (options_.instance_role() == InstanceRole::DECODE) {
+    } else if (!execution_config.enable_graph() &&
+               options_.instance_role() == InstanceRole::DECODE) {
       LOG(INFO) << "Skipping eager warmup for decode-only instance";
-    } else {
+    } else if (!execution_config.enable_graph()) {
       warmup_for_eager();
 #endif
     }
@@ -861,7 +873,8 @@ double ProfileManager::predict_copy_blocks_time(
 std::shared_ptr<Request> ProfileManager::generate_single_request(
     int32_t token_length,
     int32_t prefix_length,
-    bool is_graph_warmup) {
+    bool is_graph_warmup,
+    std::optional<int32_t> dp_rank) {
   auto& model_args = engine_->model_args();
   int32_t vocab_size = model_args.vocab_size();
   int32_t eos_token_id = model_args.eos_token_id();
@@ -887,6 +900,11 @@ std::shared_ptr<Request> ProfileManager::generate_single_request(
       /*x_request_id=*/"",
       /*x_request_time=*/"",
       std::move(req_state));
+  if (dp_rank.has_value()) {
+    CHECK_GE(*dp_rank, 0);
+    CHECK_LT(*dp_rank, options_.dp_size());
+    request->sequences()[0]->set_dp_rank(*dp_rank);
+  }
 
   // TODO: better disable prefix cache
   if (prefix_length > 0) {
@@ -1264,6 +1282,94 @@ void ProfileManager::warmup_for_eager() {
                                              /*is_graph_warmup=*/true);
   LOG(INFO) << "Eager warmup completed: tokens=" << prefill_tokens
             << ", latency=" << prefill_latency << " ms";
+}
+
+void ProfileManager::run_vmm_warmup_batch(
+    const std::vector<int32_t>& token_lengths,
+    int32_t dp_rank,
+    bool decode) {
+  std::vector<std::shared_ptr<Request>> requests;
+  std::vector<Sequence*> sequences;
+  std::vector<size_t> budgets;
+  requests.reserve(token_lengths.size());
+  sequences.reserve(token_lengths.size());
+  budgets.reserve(token_lengths.size());
+  // Capacity snapshots can lag KV released by the previous warmup batch.
+  // Allocate against the live budget instead of rejecting an advisory sample.
+  for (int32_t length : token_lengths) {
+    std::shared_ptr<Request> request =
+        decode ? generate_single_decode_request(
+                     length, dp_rank, /*is_graph_warmup=*/true)
+               : generate_single_request(length,
+                                         /*prefix_length=*/0,
+                                         /*is_graph_warmup=*/true,
+                                         dp_rank);
+    sequences.emplace_back(request->sequences()[0].get());
+    budgets.emplace_back(decode ? 1 : length);
+    requests.emplace_back(std::move(request));
+  }
+  auto batches = batch_factory_.create_batches(
+      requests, sequences, budgets, /*swap_block_transfer_infos=*/nullptr);
+  step_callback_(batches);
+  if (options_.enable_schedule_overlap()) {
+    // KV must stay mapped until the last asynchronous warmup has retired.
+    result_callback_(batches);
+  }
+  for (const auto& request : requests) {
+    block_manager_pool_->deallocate_without_cache(
+        request->sequences()[0].get());
+  }
+}
+
+void ProfileManager::warmup_for_vmm() {
+  const auto& model_args = engine_->model_args();
+  const int32_t max_context_len = model_args.max_position_embeddings();
+  CHECK_GT(max_context_len, 1);
+  CHECK_GT(model_args.vocab_size(), 2);
+  CHECK_GT(options_.dp_size(), 0);
+  CHECK_GT(options_.max_tokens_per_batch(), 0);
+  CHECK_GT(options_.max_seqs_per_batch(), 0);
+  int32_t max_sequences = options_.max_seqs_per_batch();
+  const int32_t max_concurrent =
+      ServiceConfig::get_instance().max_concurrent_requests();
+  if (max_concurrent > 0) {
+    max_sequences = std::min(max_sequences, max_concurrent);
+  }
+  const int32_t prefill_tokens = static_cast<int32_t>(
+      std::min<int64_t>(options_.max_tokens_per_batch(),
+                        static_cast<int64_t>(max_context_len) * max_sequences));
+  const int32_t packed_count = (prefill_tokens - 1) / max_context_len + 1;
+  std::vector<int32_t> packed_lengths(packed_count, max_context_len);
+  packed_lengths.back() = prefill_tokens - (packed_count - 1) * max_context_len;
+  const int32_t wide_count = std::min(max_sequences, prefill_tokens);
+  std::vector<int32_t> wide_lengths(wide_count, prefill_tokens / wide_count);
+  for (int32_t i = 0; i < prefill_tokens % wide_count; ++i) {
+    ++wide_lengths[i];
+  }
+  const int32_t decode_length = warmup_decode_seq_len(
+      Platform::is_npu() && ExecutionConfig::get_instance().enable_fia_decode(),
+      max_context_len);
+  const std::vector<int32_t> decode_lengths(max_sequences, decode_length);
+
+  // Warm every DP rank, including ranks that an ordinary single-request
+  // warmup leaves empty. Exercise both long and wide prefill shapes as well as
+  // configured decode concurrency, including eager shapes above graph limits.
+  // Device allocator caches retain most workspace; explicit reserve covers
+  // unretained SDK scratch that end-of-step samples cannot measure.
+  for (int32_t dp_rank = 0; dp_rank < options_.dp_size(); ++dp_rank) {
+    if (options_.instance_role() != InstanceRole::DECODE) {
+      run_vmm_warmup_batch(packed_lengths, dp_rank, /*decode=*/false);
+      if (wide_lengths != packed_lengths) {
+        run_vmm_warmup_batch(wide_lengths, dp_rank, /*decode=*/false);
+      }
+    }
+    if (options_.instance_role() != InstanceRole::PREFILL) {
+      run_vmm_warmup_batch(decode_lengths, dp_rank, /*decode=*/true);
+    }
+  }
+  LOG(INFO) << "Elastic VMM execution warmup completed: prefill_tokens="
+            << prefill_tokens << ", decode_sequences=" << max_sequences
+            << ", dp_size=" << options_.dp_size();
 }
 
 void ProfileManager::warmup_for_graph() {

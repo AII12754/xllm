@@ -21,8 +21,10 @@ limitations under the License.
 #include <utility>
 
 #include "core/framework/block/block_manager_pool.h"
+#include "core/framework/block/vmm_kv_block_manager.h"
 #include "core/kv_cache/block/block_utils.h"
-#include "core/kv_cache/storage/virtual_kv_cache_page_allocator.h"
+#include "core/kv_cache/block/concurrent_block_manager_impl.h"
+#include "core/kv_cache/storage/vmm_kv_page_allocator.h"
 #include "framework/config/scheduler_config.h"
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
@@ -146,11 +148,17 @@ std::vector<Block> C128Blocks(Sequence& seq) {
 }
 
 // Supplies a small logical page pool without device mappings or RPCs.
-class TestVirtualKVCachePageAllocator final
-    : public VirtualKVCachePageAllocator {
+class TestVmmKVPageAllocator final : public VmmKVPageAllocator {
  public:
-  explicit TestVirtualKVCachePageAllocator(int32_t dp_size)
-      : allocated_pages_(dp_size), next_page_ids_(dp_size, 0) {}
+  explicit TestVmmKVPageAllocator(int32_t dp_size, size_t max_pages_per_dp = 1)
+      : allocated_pages_(dp_size),
+        next_page_ids_(dp_size, 0),
+        admission_page_limits_(dp_size, 0),
+        max_pages_per_dp_(max_pages_per_dp) {}
+
+  void set_admission_page_limit(int32_t dp_rank, size_t page_limit) {
+    admission_page_limits_.at(dp_rank) = page_limit;
+  }
 
   bool is_initialized() const override { return true; }
   void start_prealloc_thread(const std::string& /*model_id*/) override {
@@ -161,7 +169,7 @@ class TestVirtualKVCachePageAllocator final
       const std::string& model_id,
       int32_t dp_rank) override {
     allocation_requests.emplace_back(model_id, dp_rank);
-    if (!allocated_pages_.at(dp_rank).empty()) {
+    if (allocated_pages_.at(dp_rank).size() >= max_pages_per_dp_) {
       return nullptr;
     }
     const int64_t page_id = next_page_ids_.at(dp_rank)++;
@@ -181,6 +189,13 @@ class TestVirtualKVCachePageAllocator final
 
   void trim_kv_cache(const std::string& /*model_id*/,
                      int32_t /*dp_rank*/) override {}
+
+  size_t get_num_available_virt_pages(const std::string& /*model_id*/,
+                                      int32_t dp_rank) const override {
+    const size_t inuse_pages = allocated_pages_.at(dp_rank).size();
+    const size_t page_limit = admission_page_limits_.at(dp_rank);
+    return page_limit > inuse_pages ? page_limit - inuse_pages : 0;
+  }
 
   size_t get_num_inuse_virt_pages(const std::string& /*model_id*/,
                                   int32_t dp_rank) const override {
@@ -208,6 +223,8 @@ class TestVirtualKVCachePageAllocator final
  private:
   std::vector<std::set<int64_t>> allocated_pages_;
   std::vector<int64_t> next_page_ids_;
+  std::vector<size_t> admission_page_limits_;
+  size_t max_pages_per_dp_;
 };
 
 }  // namespace
@@ -1157,7 +1174,7 @@ TEST(CompositeBlockManagerTest, DecodeRoleLinearDefaultStrideDoesNotAbort) {
 
 TEST(CompositeBlockManagerTest,
      VirtualMemoryPoolUsesInjectedAllocatorForEveryDpRank) {
-  TestVirtualKVCachePageAllocator allocator(/*dp_size=*/2);
+  TestVmmKVPageAllocator allocator(/*dp_size=*/2);
   BlockManagerPool::Options options;
   options.num_blocks(8)
       .block_size(4)
@@ -1191,7 +1208,7 @@ TEST(CompositeBlockManagerTest,
 }
 
 TEST(CompositeBlockManagerTest, PagedShortageReturnsPagesToInjectedAllocator) {
-  TestVirtualKVCachePageAllocator allocator(/*dp_size=*/1);
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
   BlockManager::Options options;
   options.num_blocks(8)
       .block_size(4)
@@ -1215,6 +1232,202 @@ TEST(CompositeBlockManagerTest, PagedShortageReturnsPagesToInjectedAllocator) {
   EXPECT_EQ(allocator.get_num_inuse_virt_pages("injected-cache", /*dp_rank=*/0),
             0u);
   EXPECT_EQ(allocator.released_pages.size(), 2u);
+}
+
+TEST(CompositeBlockManagerTest,
+     TotalCapacityChecksEveryAdmissionLeafInCompressedLayout) {
+  const BlockManager::Options composite_options =
+      MakeCompositeOptions(/*base_num_blocks=*/512,
+                           /*block_size=*/kBaseBlockSize,
+                           /*window_size=*/128,
+                           /*max_seqs_per_batch=*/4);
+  BlockManagerPool::Options options;
+  options.num_blocks(composite_options.num_blocks())
+      .block_size(composite_options.block_size())
+      .sliding_window_size(composite_options.sliding_window_size())
+      .swa_blocks_per_seq(composite_options.swa_blocks_per_seq())
+      .swa_num_blocks(composite_options.swa_num_blocks())
+      .max_tokens_per_batch(composite_options.max_tokens_per_batch())
+      .max_seqs_per_batch(composite_options.max_seqs_per_batch())
+      .manager_types(composite_options.manager_types())
+      .compress_ratios(composite_options.compress_ratios())
+      .enable_prefix_cache(false);
+  BlockManagerPool pool(options);
+
+  Sequence fits = MakeTestSequence(0, std::vector<int32_t>(49152, 1));
+  Sequence exceeds_c128 = MakeTestSequence(1, std::vector<int32_t>(49153, 1));
+  EXPECT_FALSE(pool.exceeds_total_capacity(&fits, 49152));
+  EXPECT_TRUE(pool.exceeds_total_capacity(&exceeds_c128, 49153));
+}
+
+TEST(CompositeBlockManagerTest,
+     TotalCapacityExcludesVirtualMemoryPaddingBlock) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  BlockManagerPool::Options options;
+  options.num_blocks(8)
+      .block_size(4)
+      .enable_virtual_memory(true)
+      .num_layers(2)
+      .slot_size(36)
+      .virtual_block_bytes(16)
+      .model_id("capacity-boundary");
+  BlockManagerPool pool(options, /*dp_size=*/1, &allocator);
+  pool.reserve_virtual_memory_padding_blocks();
+
+  Sequence fits = MakeTestSequence(0, std::vector<int32_t>(28, 1));
+  Sequence exceeds = MakeTestSequence(1, std::vector<int32_t>(32, 1));
+  EXPECT_FALSE(pool.exceeds_total_capacity(&fits, 28));
+  EXPECT_TRUE(pool.exceeds_total_capacity(&exceeds, 32));
+}
+
+TEST(CompositeBlockManagerTest,
+     VirtualMemoryAdmissionTracksLiveGrowthPerDpRank) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/2, /*max_pages_per_dp=*/3);
+  BlockManagerPool::Options options;
+  options.num_blocks(8)
+      .block_size(4)
+      .enable_virtual_memory(true)
+      .num_layers(2)
+      .slot_size(36)
+      .virtual_block_bytes(16)
+      .model_id("injected-cache");
+  BlockManagerPool pool(options, /*dp_size=*/2, &allocator);
+
+  EXPECT_EQ(pool.admission_capacity(/*dp_rank=*/0), 0u);
+  EXPECT_EQ(pool.admission_capacity(/*dp_rank=*/1), 0u);
+  allocator.set_admission_page_limit(/*dp_rank=*/0, 1);
+  EXPECT_EQ(pool.admission_capacity(/*dp_rank=*/0), 4u);
+  EXPECT_EQ(pool.admission_capacity(/*dp_rank=*/1), 0u);
+
+  // Live growth is capped by the logical arena and remains specific to a DP
+  // group. Losing headroom must lower admission before another allocation.
+  allocator.set_admission_page_limit(/*dp_rank=*/0, 3);
+  allocator.set_admission_page_limit(/*dp_rank=*/1, 1);
+  EXPECT_EQ(pool.admission_capacity(/*dp_rank=*/0), 8u);
+  EXPECT_EQ(pool.admission_capacity(/*dp_rank=*/1), 4u);
+  allocator.set_admission_page_limit(/*dp_rank=*/0, 0);
+  EXPECT_EQ(pool.admission_capacity(/*dp_rank=*/0), 0u);
+  EXPECT_EQ(pool.admission_capacity(/*dp_rank=*/1), 4u);
+  // Route to a rank with real headroom even though both virtual arenas have
+  // the same logical size and neither owns blocks yet.
+  EXPECT_EQ(pool.select_dp_rank(), 1);
+  EXPECT_TRUE(allocator.allocation_requests.empty());
+}
+
+TEST(CompositeBlockManagerTest,
+     VirtualMemoryAdmissionCountsReservedBlocksOnce) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1, /*max_pages_per_dp=*/2);
+  allocator.set_admission_page_limit(/*dp_rank=*/0, 2);
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4);
+  VmmKVBlockManager leaf(options,
+                         allocator,
+                         /*num_layers=*/2,
+                         /*block_mem_size=*/16,
+                         /*page_size=*/64,
+                         /*dp_rank=*/0,
+                         "injected-cache");
+
+  EXPECT_EQ(leaf.admission_capacity(), 8u);
+  ASSERT_TRUE(leaf.try_to_reserve(/*need_size=*/4));
+  EXPECT_EQ(leaf.admission_capacity(), 8u);
+  std::vector<Block> blocks = leaf.allocate(/*num_blocks=*/4);
+  ASSERT_EQ(blocks.size(), 4u);
+  EXPECT_EQ(leaf.admission_capacity(), 8u);
+  blocks.clear();
+  EXPECT_EQ(leaf.admission_capacity(), 8u);
+  EXPECT_EQ(allocator.get_num_inuse_virt_pages("injected-cache", /*dp_rank=*/0),
+            0u);
+}
+
+TEST(CompositeBlockManagerTest,
+     PhysicalPoolRetainsConfiguredAdmissionCapacity) {
+  BlockManagerPool::Options options;
+  options.num_blocks(8).block_size(4).enable_prefix_cache(false);
+  BlockManagerPool pool(options, /*dp_size=*/2);
+
+  EXPECT_EQ(pool.admission_capacity(/*dp_rank=*/0), pool.num_blocks());
+  EXPECT_EQ(pool.admission_capacity(/*dp_rank=*/1), pool.num_blocks());
+}
+
+TEST(CompositeBlockManagerTest, ConcurrentAdapterPreservesVirtualAdmission) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1, /*max_pages_per_dp=*/2);
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4);
+  auto leaf = std::make_unique<VmmKVBlockManager>(options,
+                                                  allocator,
+                                                  /*num_layers=*/2,
+                                                  /*block_mem_size=*/16,
+                                                  /*page_size=*/64,
+                                                  /*dp_rank=*/0,
+                                                  "injected-cache");
+  ConcurrentBlockManagerImpl manager(std::move(leaf));
+
+  EXPECT_EQ(manager.admission_capacity(), 0u);
+  allocator.set_admission_page_limit(/*dp_rank=*/0, 1);
+  EXPECT_EQ(manager.admission_capacity(), 4u);
+  allocator.set_admission_page_limit(/*dp_rank=*/0, 0);
+  EXPECT_EQ(manager.admission_capacity(), 0u);
+}
+
+TEST(CompositeBlockManagerTest,
+     VirtualMemoryReservationRollsBackPartialGrowth) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  allocator.set_admission_page_limit(/*dp_rank=*/0, 2);
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4);
+  VmmKVBlockManager leaf(options,
+                         allocator,
+                         /*num_layers=*/2,
+                         /*block_mem_size=*/16,
+                         /*page_size=*/64,
+                         /*dp_rank=*/0,
+                         "injected-cache");
+
+  // The advisory snapshot promises two pages, but a concurrent budget change
+  // leaves backing for only one. Failure must return every partial block.
+  EXPECT_FALSE(leaf.try_to_reserve(/*need_size=*/5));
+  EXPECT_EQ(leaf.num_used_blocks(), 0u);
+  EXPECT_EQ(allocator.get_num_inuse_virt_pages("injected-cache", /*dp_rank=*/0),
+            0u);
+  ASSERT_EQ(allocator.released_pages.size(), 1u);
+
+  ASSERT_TRUE(leaf.try_to_reserve(/*need_size=*/4));
+  leaf.free_reserved();
+  EXPECT_EQ(leaf.num_used_blocks(), 0u);
+  EXPECT_EQ(allocator.get_num_inuse_virt_pages("injected-cache", /*dp_rank=*/0),
+            0u);
+  EXPECT_EQ(allocator.released_pages.size(), 2u);
+}
+
+TEST(CompositeBlockManagerTest,
+     VirtualMemoryReservationFailurePreservesLiveBlocks) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  allocator.set_admission_page_limit(/*dp_rank=*/0, 2);
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4);
+  VmmKVBlockManager leaf(options,
+                         allocator,
+                         /*num_layers=*/2,
+                         /*block_mem_size=*/16,
+                         /*page_size=*/64,
+                         /*dp_rank=*/0,
+                         "injected-cache");
+  std::vector<Block> held = leaf.allocate(/*num_blocks=*/1);
+  ASSERT_EQ(held.size(), 1u);
+
+  // Roll back only this reservation's three partial blocks. The live block
+  // must keep its page mapped until its original owner releases it.
+  EXPECT_FALSE(leaf.try_to_reserve(/*need_size=*/4));
+  EXPECT_EQ(leaf.num_used_blocks(), 1u);
+  EXPECT_EQ(allocator.get_num_inuse_virt_pages("injected-cache", /*dp_rank=*/0),
+            1u);
+  EXPECT_TRUE(allocator.released_pages.empty());
+  held.clear();
+  EXPECT_EQ(leaf.num_used_blocks(), 0u);
+  EXPECT_EQ(allocator.get_num_inuse_virt_pages("injected-cache", /*dp_rank=*/0),
+            0u);
+  EXPECT_EQ(allocator.released_pages.size(), 1u);
 }
 
 }  // namespace xllm

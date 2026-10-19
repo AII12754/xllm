@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <utility>
+
 #include "core/framework/allocator/global_virtual_memory_region.h"
 
 namespace xllm {
@@ -44,15 +46,25 @@ bool MooncakeWeightTransfer::register_global_virtual_memory_region() {
     return false;
   }
 
+  // Registering the entire VA reservation is unsafe while it contains holes.
+  // The lease pins an already resident arena and never materializes free pages
+  // merely to preserve the legacy buffer-0 transfer protocol.
+  auto lifetime =
+      global_virtual_memory_region.try_acquire_contiguous_mapping_lease();
+  if (lifetime == nullptr) {
+    LOG(ERROR)
+        << "Mooncake weight transfer requires a fully resident global arena; "
+           "sparse elastic arenas need an extent-aware transfer protocol; use "
+           "--vmm_elastic=false for legacy dense VMM transfer";
+    return false;
+  }
+
   std::vector<void*> addrs = {global_virtual_memory_region.base_vaddr()};
   std::vector<size_t> lens = {global_virtual_memory_region.total_size()};
   std::vector<uint64_t> buf_bytes = {
       static_cast<uint64_t>(global_virtual_memory_region.page_size())};
   if (!mooncake_te_->register_memory(
-          addrs,
-          lens,
-          buf_bytes,
-          global_virtual_memory_region.acquire_mapping_lease())) {
+          addrs, lens, buf_bytes, std::move(lifetime))) {
     LOG(ERROR) << "register GlobalVirtualMemoryRegion failed";
     return false;
   }

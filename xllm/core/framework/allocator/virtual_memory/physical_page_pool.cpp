@@ -18,117 +18,166 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <limits>
 #include <unordered_set>
+
+#include "core/framework/allocator/virtual_memory/shared_physical_page_mapping.h"
+#include "core/platform/device.h"
 
 namespace xllm {
 
 void PhysicalPagePool::init(const torch::Device& device,
                             size_t num_pages,
-                            size_t page_size) {
+                            size_t page_size,
+                            bool lazy) {
   std::lock_guard<std::mutex> lock(mtx_);
-
   if (initialized_) {
     LOG(WARNING) << "PhysicalPagePool already initialized, ignoring re-init";
     return;
   }
-
-  device_ = device;
   CHECK_GT(page_size, 0);
+  CHECK_LE(num_pages,
+           static_cast<size_t>(std::numeric_limits<page_id_t>::max()));
+  CHECK_LE(num_pages, std::numeric_limits<size_t>::max() / page_size);
+  device_ = device;
+  lazy_ = lazy;
   page_size_ = page_size;
   num_total_pages_ = num_pages;
-
-  LOG(INFO) << "PhysicalPagePool: pre-allocating " << num_pages
-            << " physical pages on device " << device;
-
-  // Pre-allocate all physical pages for data with unique page_ids
-  all_pages_.reserve(num_pages);
+  all_pages_.resize(num_pages);
+  all_page_ptrs_.resize(num_pages, nullptr);
   page_allocated_.resize(num_pages, false);
-
-  all_page_ptrs_.reserve(num_pages);
+  free_memory_query_ = [this]() { return Device(device_).free_memory(); };
+  page_factory_ = [this](page_id_t page_id) {
+    return PhysicalPage::try_create(device_, page_size_, page_id);
+  };
+  // Slot geometry remains stable independently of resident physical backing.
   for (size_t i = 0; i < num_pages; ++i) {
-    page_id_t page_id = static_cast<page_id_t>(i);
-    all_pages_.push_back(
-        std::make_unique<PhysicalPage>(device_, page_size_, page_id));
-    all_page_ptrs_.push_back(all_pages_.back().get());
-    free_page_ids_.push_back(page_id);
+    const page_id_t page_id = static_cast<page_id_t>(i);
+    if (!lazy) {
+      all_pages_[i] =
+          std::make_unique<PhysicalPage>(device_, page_size_, page_id);
+      all_page_ptrs_[i] = all_pages_[i].get();
+      ++num_committed_pages_;
+    }
+    free_page_ids_.emplace_back(page_id);
   }
-
   initialized_ = true;
-
-  LOG(INFO) << "PhysicalPagePool: successfully pre-allocated " << num_pages
-            << " physical pages (page_id 0-" << (num_pages - 1) << ")";
+  LOG(INFO) << "PhysicalPagePool: initialized " << num_pages
+            << " stable slots with " << num_committed_pages_
+            << " resident pages on device " << device_;
 }
 
 bool PhysicalPagePool::reset() {
   std::lock_guard<std::mutex> lock(mtx_);
-
   if (!initialized_) {
     return true;
   }
-  if (free_page_ids_.size() != num_total_pages_) {
-    LOG(ERROR) << "PhysicalPagePool reset requested with "
-               << (num_total_pages_ - free_page_ids_.size())
-               << " pages still in use";
+  if (free_page_ids_.size() != num_total_pages_ || !shared_mapping_.expired()) {
+    LOG(ERROR) << "PhysicalPagePool reset requested with live pages or aliases";
     return false;
   }
-
   free_page_ids_.clear();
   all_page_ptrs_.clear();
   all_pages_.clear();
   page_allocated_.clear();
+  page_factory_ = {};
+  free_memory_query_ = {};
   num_total_pages_ = 0;
+  num_committed_pages_ = 0;
+  allocation_headroom_bytes_ = 0;
+  execution_memory_budget_.reset();
+  lazy_ = false;
   page_size_ = 0;
   device_ = torch::Device(torch::kCPU);
   initialized_ = false;
   return true;
 }
 
-std::unique_ptr<PhysicalPage> PhysicalPagePool::get() {
-  std::lock_guard<std::mutex> lock(mtx_);
-
-  CHECK(initialized_) << "PhysicalPagePool not initialized";
-
-  if (free_page_ids_.empty()) {
-    LOG(WARNING) << "PhysicalPagePool: no free pages available";
-    return nullptr;
+bool PhysicalPagePool::materialize_pages_locked(
+    const std::vector<page_id_t>& page_ids) {
+  std::vector<page_id_t> missing;
+  missing.reserve(page_ids.size());
+  for (page_id_t page_id : page_ids) {
+    CHECK_GE(page_id, 0);
+    CHECK_LT(static_cast<size_t>(page_id), num_total_pages_);
+    if (all_page_ptrs_[page_id] == nullptr) {
+      missing.emplace_back(page_id);
+    }
   }
+  if (missing.empty()) {
+    return true;
+  }
+  // A scheduler snapshot is not a reservation: recheck under the growth lock.
+  const int64_t free_bytes = free_memory_query_();
+  if (free_bytes < 0) {
+    return false;
+  }
+  const size_t headroom =
+      execution_memory_budget_.headroom(static_cast<size_t>(free_bytes),
+                                        num_committed_pages_ * page_size_,
+                                        allocation_headroom_bytes_);
+  if (missing.size() >
+      (std::numeric_limits<size_t>::max() - headroom) / page_size_) {
+    return false;
+  }
+  const size_t required_bytes = missing.size() * page_size_ + headroom;
+  if (static_cast<uint64_t>(free_bytes) < required_bytes) {
+    return false;
+  }
+  std::vector<std::unique_ptr<PhysicalPage>> pending;
+  std::vector<PhysicalPage*> pending_ptrs;
+  pending.reserve(missing.size());
+  pending_ptrs.reserve(missing.size());
+  for (page_id_t page_id : missing) {
+    auto page = page_factory_(page_id);
+    if (page == nullptr) {
+      // Private handles are destroyed without publishing slots or accounting.
+      return false;
+    }
+    pending_ptrs.emplace_back(page.get());
+    pending.emplace_back(std::move(page));
+  }
+  auto mapping = shared_mapping_.lock();
+  if (mapping != nullptr && !mapping->map_pages(pending_ptrs)) {
+    return false;
+  }
+  for (size_t i = 0; i < missing.size(); ++i) {
+    const page_id_t page_id = missing[i];
+    all_page_ptrs_[page_id] = pending[i].get();
+    all_pages_[page_id] = std::move(pending[i]);
+  }
+  num_committed_pages_ += missing.size();
+  return true;
+}
 
-  // FIFO: pop from front to allocate left-to-right
-  page_id_t page_id = free_page_ids_.front();
-  free_page_ids_.pop_front();
-  page_allocated_[page_id] = true;
-
-  // Move ownership to caller
-  return std::move(all_pages_[page_id]);
+std::unique_ptr<PhysicalPage> PhysicalPagePool::get() {
+  auto pages = batch_get(/*count=*/1);
+  return pages.empty() ? nullptr : std::move(pages.front());
 }
 
 std::vector<std::unique_ptr<PhysicalPage>> PhysicalPagePool::batch_get(
     size_t count) {
   std::lock_guard<std::mutex> lock(mtx_);
-
   CHECK(initialized_) << "PhysicalPagePool not initialized";
-
-  if (count == 0) {
+  if (count == 0 || free_page_ids_.size() < count) {
     return {};
   }
-
-  if (free_page_ids_.size() < count) {
-    LOG(WARNING) << "PhysicalPagePool: not enough free pages, requested "
-                 << count << ", available " << free_page_ids_.size();
-    return {};
+  std::vector<page_id_t> page_ids;
+  page_ids.reserve(count);
+  auto it = free_page_ids_.begin();
+  for (size_t i = 0; i < count; ++i, ++it) {
+    page_ids.emplace_back(*it);
   }
-
   std::vector<std::unique_ptr<PhysicalPage>> result;
   result.reserve(count);
-
-  // FIFO: pop from front to allocate left-to-right
-  for (size_t i = 0; i < count; ++i) {
-    page_id_t page_id = free_page_ids_.front();
+  if (!materialize_pages_locked(page_ids)) {
+    return {};
+  }
+  for (page_id_t page_id : page_ids) {
     free_page_ids_.pop_front();
     page_allocated_[page_id] = true;
-    result.push_back(std::move(all_pages_[page_id]));
+    result.emplace_back(std::move(all_pages_[page_id]));
   }
-
   return result;
 }
 
@@ -136,27 +185,10 @@ void PhysicalPagePool::put(std::unique_ptr<PhysicalPage> page) {
   if (page == nullptr) {
     return;
   }
-
-  std::lock_guard<std::mutex> lock(mtx_);
-
-  CHECK(initialized_) << "PhysicalPagePool not initialized";
-
-  // Verify the page belongs to this pool (same device)
-  CHECK(page->device() == device_) << "Page device mismatch: expected "
-                                   << device_ << ", got " << page->device();
-  CHECK_EQ(page->page_size(), page_size_)
-      << "Page size mismatch: expected " << page_size_ << ", got "
-      << page->page_size();
-
-  page_id_t page_id = page->page_id();
-  CHECK(page_id >= 0 && page_id < static_cast<page_id_t>(num_total_pages_))
-      << "Invalid page_id: " << page_id;
-
-  // Return ownership to pool
-  all_pages_[page_id] = std::move(page);
-  page_allocated_[page_id] = false;
-  // Use push_front to keep smaller page_ids at front for later allocations
-  free_page_ids_.push_front(page_id);
+  std::vector<std::unique_ptr<PhysicalPage>> pages;
+  pages.reserve(1);
+  pages.emplace_back(std::move(page));
+  batch_put(pages);
 }
 
 void PhysicalPagePool::batch_put(
@@ -164,168 +196,130 @@ void PhysicalPagePool::batch_put(
   if (pages.empty()) {
     return;
   }
-
   std::lock_guard<std::mutex> lock(mtx_);
-
   CHECK(initialized_) << "PhysicalPagePool not initialized";
-
+  std::unordered_set<page_id_t> seen;
+  seen.reserve(pages.size());
+  for (const auto& page : pages) {
+    if (page == nullptr) {
+      continue;
+    }
+    CHECK_EQ(page->device(), device_);
+    CHECK_EQ(page->page_size(), page_size_);
+    const page_id_t page_id = page->page_id();
+    CHECK_GE(page_id, 0);
+    CHECK_LT(static_cast<size_t>(page_id), num_total_pages_);
+    CHECK(seen.emplace(page_id).second) << "Duplicate returned physical page";
+    CHECK(page_allocated_[page_id]);
+    CHECK(all_pages_[page_id] == nullptr);
+    CHECK_EQ(all_page_ptrs_[page_id], page.get());
+  }
   for (auto& page : pages) {
     if (page == nullptr) {
       continue;
     }
-    // Verify the page belongs to this pool (same device)
-    CHECK(page->device() == device_) << "Page device mismatch: expected "
-                                     << device_ << ", got " << page->device();
-    CHECK_EQ(page->page_size(), page_size_)
-        << "Page size mismatch: expected " << page_size_ << ", got "
-        << page->page_size();
-
-    page_id_t page_id = page->page_id();
-    CHECK(page_id >= 0 && page_id < static_cast<page_id_t>(num_total_pages_))
-        << "Invalid page_id: " << page_id;
-
-    // Return ownership to pool
+    const page_id_t page_id = page->page_id();
     all_pages_[page_id] = std::move(page);
     page_allocated_[page_id] = false;
-    // Use push_front to keep smaller page_ids at front for later allocations
-    free_page_ids_.push_front(page_id);
+    free_page_ids_.emplace_front(page_id);
   }
   pages.clear();
 }
 
+void PhysicalPagePool::reserve_pages_locked(
+    const std::vector<page_id_t>& page_ids) {
+  std::unordered_set<page_id_t> reserved(page_ids.begin(), page_ids.end());
+  for (page_id_t page_id : page_ids) {
+    CHECK(!page_allocated_[page_id]);
+    CHECK(all_pages_[page_id] != nullptr);
+    page_allocated_[page_id] = true;
+  }
+  const auto end = std::remove_if(
+      free_page_ids_.begin(),
+      free_page_ids_.end(),
+      [&reserved](page_id_t page_id) { return reserved.count(page_id) != 0; });
+  free_page_ids_.erase(end, free_page_ids_.end());
+}
+
 page_id_t PhysicalPagePool::allocate_contiguous_from_right(size_t count) {
   std::lock_guard<std::mutex> lock(mtx_);
-
   CHECK(initialized_) << "PhysicalPagePool not initialized";
-
   if (count == 0 || count > free_page_ids_.size()) {
     return -1;
   }
-
-  // Scan from right to left in page_allocated_ to find contiguous free segment
   size_t run = 0;
   page_id_t start_page = -1;
-
   for (int64_t i = static_cast<int64_t>(num_total_pages_) - 1; i >= 0; --i) {
-    if (!page_allocated_[i]) {
-      run++;
-      if (run == count) {
-        start_page = static_cast<page_id_t>(i);
-        break;
-      }
-    } else {
+    if (page_allocated_[i]) {
       run = 0;
+      continue;
+    }
+    if (++run == count) {
+      start_page = i;
+      break;
     }
   }
-
   if (start_page < 0) {
-    LOG(WARNING) << "PhysicalPagePool: cannot find " << count
-                 << " contiguous free pages from right";
     return -1;
   }
-
-  // Mark these pages as allocated
-  page_id_t end_page = start_page + static_cast<page_id_t>(count);
-  for (page_id_t page_id = start_page; page_id < end_page; ++page_id) {
-    page_allocated_[page_id] = true;
+  std::vector<page_id_t> page_ids;
+  page_ids.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    page_ids.emplace_back(start_page + static_cast<page_id_t>(i));
   }
-
-  // Remove from free_page_ids_ in one pass - O(n)
-  auto new_end = std::remove_if(free_page_ids_.begin(),
-                                free_page_ids_.end(),
-                                [start_page, end_page](page_id_t id) {
-                                  return id >= start_page && id < end_page;
-                                });
-  free_page_ids_.erase(new_end, free_page_ids_.end());
-
-  LOG(INFO) << "PhysicalPagePool: allocated " << count
-            << " contiguous pages from right, start_page=" << start_page;
-
+  // Weight reservations retain pool ownership but pin backing as active KV
+  // ownership does. No reservation is visible on partial allocation failure.
+  if (!materialize_pages_locked(page_ids)) {
+    return -1;
+  }
+  reserve_pages_locked(page_ids);
   return start_page;
 }
 
 std::vector<page_id_t> PhysicalPagePool::allocate_pages_from_right(
     size_t count) {
   std::lock_guard<std::mutex> lock(mtx_);
-
   CHECK(initialized_) << "PhysicalPagePool not initialized";
-
   if (count == 0 || count > free_page_ids_.size()) {
-    LOG(WARNING)
-        << "PhysicalPagePool: not enough free pages for non-contiguous "
-           "allocation, requested "
-        << count << ", available " << free_page_ids_.size();
     return {};
   }
-
-  std::vector<page_id_t> result;
-  result.reserve(count);
-
-  // Scan from right to left to collect free pages (non-contiguous ok)
+  std::vector<page_id_t> page_ids;
+  page_ids.reserve(count);
   for (int64_t i = static_cast<int64_t>(num_total_pages_) - 1;
-       i >= 0 && result.size() < count;
+       i >= 0 && page_ids.size() < count;
        --i) {
     if (!page_allocated_[i]) {
-      result.push_back(static_cast<page_id_t>(i));
+      page_ids.emplace_back(i);
     }
   }
-
-  if (result.size() < count) {
-    LOG(WARNING)
-        << "PhysicalPagePool: cannot find enough free pages from right, "
-           "requested "
-        << count << ", found " << result.size();
+  if (!materialize_pages_locked(page_ids)) {
     return {};
   }
-
-  // Mark these pages as allocated
-  for (page_id_t page_id : result) {
-    page_allocated_[page_id] = true;
-  }
-
-  // Remove from free_page_ids_ in one pass - O(n)
-  std::unordered_set<page_id_t> allocated_set(result.begin(), result.end());
-  auto new_end =
-      std::remove_if(free_page_ids_.begin(),
-                     free_page_ids_.end(),
-                     [&allocated_set](page_id_t id) {
-                       return allocated_set.find(id) != allocated_set.end();
-                     });
-  free_page_ids_.erase(new_end, free_page_ids_.end());
-
-  LOG(INFO) << "PhysicalPagePool: allocated " << count
-            << " non-contiguous pages from right";
-
-  return result;
+  reserve_pages_locked(page_ids);
+  return page_ids;
 }
 
 void PhysicalPagePool::release_reserved_pages(
     const std::vector<page_id_t>& page_ids) {
-  if (page_ids.empty()) {
-    return;
-  }
-
   std::lock_guard<std::mutex> lock(mtx_);
-
   CHECK(initialized_) << "PhysicalPagePool not initialized";
-
   for (page_id_t page_id : page_ids) {
-    CHECK(page_id >= 0 && page_id < static_cast<page_id_t>(num_total_pages_))
-        << "Invalid page_id: " << page_id;
-
+    CHECK_GE(page_id, 0);
+    CHECK_LT(static_cast<size_t>(page_id), num_total_pages_);
     if (!page_allocated_[page_id]) {
-      LOG(WARNING) << "PhysicalPagePool: page " << page_id
-                   << " is not allocated, skipping";
       continue;
     }
-
+    CHECK(all_pages_[page_id] != nullptr)
+        << "Cannot release transferred KV ownership as a weight reservation";
     page_allocated_[page_id] = false;
-    // Push to back so large page_ids stay towards the right
-    free_page_ids_.push_back(page_id);
+    free_page_ids_.emplace_back(page_id);
   }
-
-  LOG(INFO) << "PhysicalPagePool: freed " << page_ids.size()
-            << " reserved pages";
+  // Reuse resident backing before requiring a new device allocation. This
+  // preserves admission snapshots when weight pages return behind empty slots.
+  std::stable_partition(
+      free_page_ids_.begin(), free_page_ids_.end(), [this](page_id_t page_id) {
+        return all_page_ptrs_[page_id] != nullptr;
+      });
 }
 
 size_t PhysicalPagePool::num_available() const {
@@ -333,11 +327,136 @@ size_t PhysicalPagePool::num_available() const {
   return free_page_ids_.size();
 }
 
-// ============== Shared Mapping Support ==============
+size_t PhysicalPagePool::num_committed() const {
+  std::lock_guard<std::mutex> lock(mtx_);
+  return num_committed_pages_;
+}
 
-const std::vector<PhysicalPage*>& PhysicalPagePool::get_all_pages() const {
+size_t PhysicalPagePool::num_allocatable() const {
+  std::lock_guard<std::mutex> lock(mtx_);
+  if (!initialized_) {
+    return 0;
+  }
+  const size_t idle_pages =
+      num_committed_pages_ - (num_total_pages_ - free_page_ids_.size());
+  const size_t uncommitted_pages = num_total_pages_ - num_committed_pages_;
+  if (uncommitted_pages == 0) {
+    return idle_pages;
+  }
+  const int64_t free_bytes = free_memory_query_();
+  if (free_bytes <= 0) {
+    return idle_pages;
+  }
+  const size_t headroom =
+      execution_memory_budget_.headroom(static_cast<size_t>(free_bytes),
+                                        num_committed_pages_ * page_size_,
+                                        allocation_headroom_bytes_);
+  if (static_cast<uint64_t>(free_bytes) <= headroom) {
+    return idle_pages;
+  }
+  const size_t growth_pages =
+      (static_cast<size_t>(free_bytes) - headroom) / page_size_;
+  return idle_pages + std::min(uncommitted_pages, growth_pages);
+}
+
+void PhysicalPagePool::set_allocation_headroom(size_t bytes) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  allocation_headroom_bytes_ = bytes;
+}
+
+void PhysicalPagePool::observe_execution_memory() {
+  std::lock_guard<std::mutex> lock(mtx_);
+  if (!initialized_) {
+    return;
+  }
+  const int64_t free_bytes = free_memory_query_();
+  if (free_bytes >= 0) {
+    execution_memory_budget_.observe(static_cast<size_t>(free_bytes),
+                                     num_committed_pages_ * page_size_);
+  }
+}
+
+size_t PhysicalPagePool::trim_idle(size_t keep_pages) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  if (!initialized_ || !lazy_) {
+    return 0;
+  }
+  auto mapping = shared_mapping_.lock();
+  // Registrations keep their lease until all device/remote users finish. A
+  // lease pins resident backing as well as the shared virtual address range.
+  if (mapping != nullptr && mapping.use_count() > 2) {
+    return 0;
+  }
+  const size_t idle_pages =
+      num_committed_pages_ - (num_total_pages_ - free_page_ids_.size());
+  if (idle_pages <= keep_pages) {
+    return 0;
+  }
+  const size_t release_count = idle_pages - keep_pages;
+  std::vector<page_id_t> page_ids;
+  page_ids.reserve(release_count);
+  for (int64_t i = static_cast<int64_t>(num_total_pages_) - 1;
+       i >= 0 && page_ids.size() < release_count;
+       --i) {
+    if (!page_allocated_[i] && all_pages_[i] != nullptr) {
+      page_ids.emplace_back(i);
+    }
+  }
+  // Model-local aliases are gone before pages return here. Remove every shared
+  // alias before destroying handles, without relocating surviving slots.
+  if (mapping != nullptr) {
+    mapping->unmap_pages(page_ids);
+  }
+  for (page_id_t page_id : page_ids) {
+    all_page_ptrs_[page_id] = nullptr;
+    all_pages_[page_id].reset();
+  }
+  num_committed_pages_ -= page_ids.size();
+  std::stable_partition(
+      free_page_ids_.begin(), free_page_ids_.end(), [this](page_id_t page_id) {
+        return all_page_ptrs_[page_id] != nullptr;
+      });
+  return page_ids.size();
+}
+
+std::vector<PhysicalPage*> PhysicalPagePool::get_all_pages() const {
+  std::lock_guard<std::mutex> lock(mtx_);
   CHECK(initialized_) << "PhysicalPagePool not initialized";
   return all_page_ptrs_;
+}
+
+void PhysicalPagePool::attach_shared_mapping(
+    const std::shared_ptr<SharedPhysicalPageMapping>& mapping) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  CHECK(initialized_);
+  CHECK(shared_mapping_.expired());
+  mapping->init(device_, all_page_ptrs_, page_size_);
+  CHECK(mapping->is_initialized());
+  shared_mapping_ = mapping;
+}
+
+bool PhysicalPagePool::detach_shared_mapping(
+    const SharedPhysicalPageMapping* mapping) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  auto current = shared_mapping_.lock();
+  CHECK(current.get() == mapping);
+  if (current.use_count() != 2) {
+    return false;
+  }
+  shared_mapping_.reset();
+  return true;
+}
+
+std::shared_ptr<void> PhysicalPagePool::acquire_shared_mapping_lease(
+    bool require_contiguous) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  auto mapping = shared_mapping_.lock();
+  if (mapping == nullptr ||
+      (require_contiguous &&
+       (lazy_ || num_committed_pages_ != num_total_pages_))) {
+    return nullptr;
+  }
+  return std::shared_ptr<void>(mapping, mapping->base_vaddr());
 }
 
 }  // namespace xllm

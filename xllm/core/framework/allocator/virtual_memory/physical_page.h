@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 #include "core/platform/vmm_api.h"
 
@@ -31,6 +32,12 @@ class PhysicalPage final {
  public:
   // Constructor with page_id (-1 means unassigned)
   PhysicalPage(torch::Device device, size_t page_size, page_id_t page_id = -1);
+
+  // Expected device-memory exhaustion returns nullptr without publishing a
+  // partially initialized page. Other driver failures retain fatal semantics.
+  static std::unique_ptr<PhysicalPage> try_create(torch::Device device,
+                                                  size_t page_size,
+                                                  page_id_t page_id);
 
   ~PhysicalPage();
 
@@ -46,9 +53,17 @@ class PhysicalPage final {
   page_id_t page_id() const { return page_id_; }
 
  private:
+  friend class PhysicalPagePoolTestPeer;
+
+  PhysicalPage(torch::Device device,
+               size_t page_size,
+               page_id_t page_id,
+               std::nullptr_t);
+
   torch::Device device_;
   size_t page_size_;
-  PhyMemHandle phy_handle_;
+  PhyMemHandle phy_handle_ = {};
   page_id_t page_id_;  // Unique identifier for this page in the pool
+  bool owns_handle_ = false;
 };
 }  // namespace xllm

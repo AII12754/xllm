@@ -25,7 +25,7 @@ limitations under the License.
 
 namespace xllm {
 
-class VirtualKVCachePageAllocator;
+class VmmKVPageAllocator;
 
 // Composition of BlockManager leaves keyed by BlockType. The map key decides
 // which KVCacheState slot a leaf's blocks land in; the leaf itself is
@@ -133,6 +133,7 @@ class CompositeBlockManager : public BlockManager {
   void free(int32_t block_id) override;
   Block allocate() override;
   size_t num_total_blocks() const override;
+  size_t admission_capacity() const override;
 
   void reserve_virtual_memory_padding_blocks() override;
 
@@ -164,6 +165,6 @@ class CompositeBlockManager : public BlockManager {
 CompositeBlockManager::LeafMap build_composite_leaves(
     const BlockManager::Options& options,
     int32_t dp_rank = 0,
-    VirtualKVCachePageAllocator* page_allocator = nullptr);
+    VmmKVPageAllocator* page_allocator = nullptr);
 
 }  // namespace xllm

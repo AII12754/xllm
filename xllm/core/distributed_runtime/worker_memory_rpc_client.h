@@ -19,6 +19,7 @@ limitations under the License.
 #include <folly/futures/Future.h>
 #include <torch/types.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -35,8 +36,13 @@ namespace xllm {
 
 // Memory info returned by GetMemoryInfo RPC
 struct MemoryInfo {
-  int64_t available_memory;  // Available memory in bytes
-  int64_t total_memory;      // Total memory in bytes
+  int64_t available_memory = 0;  // Available memory in bytes
+  int64_t total_memory = 0;      // Total memory in bytes
+  bool pool_initialized = false;
+  size_t pool_capacity_pages = 0;
+  size_t pool_committed_pages = 0;
+  size_t pool_allocatable_pages = 0;
+  size_t execution_memory_reserve_bytes = 0;
 };
 
 // Sends memory resource commands to a worker via brpc.
@@ -51,10 +57,25 @@ class WorkerMemoryRpcClient final {
   bool wait_for_server_ready(const std::string& server_address);
 
   // Get memory info from remote worker (available/total memory)
-  folly::SemiFuture<MemoryInfo> get_memory_info_async();
+  folly::SemiFuture<MemoryInfo> get_memory_info_async(
+      int32_t timeout_ms = 1000);
 
   // Initialize PhysicalPagePool on remote worker with specified number of pages
-  folly::SemiFuture<bool> init_physical_page_pool_async(int64_t num_pages);
+  folly::SemiFuture<bool> init_physical_page_pool_async(int64_t num_pages,
+                                                        bool lazy = true);
+
+  folly::SemiFuture<bool> prepare_kv_mapping_async(
+      uint64_t transaction_id,
+      const std::string& model_id,
+      const std::vector<offset_t>& offsets);
+  folly::SemiFuture<bool> commit_kv_mapping_async(uint64_t transaction_id);
+  folly::SemiFuture<bool> abort_kv_mapping_async(uint64_t transaction_id);
+  folly::SemiFuture<bool> prepare_weight_pages_async(
+      uint64_t transaction_id,
+      const std::string& model_id,
+      size_t num_pages);
+  folly::SemiFuture<bool> commit_weight_pages_async(uint64_t transaction_id);
+  folly::SemiFuture<bool> abort_weight_pages_async(uint64_t transaction_id);
 
   // KV tensor operations (partial mapping by offsets)
   folly::SemiFuture<bool> map_to_kv_tensors_async(
@@ -79,10 +100,14 @@ class WorkerMemoryRpcClient final {
 
  private:
   DISALLOW_COPY_AND_ASSIGN(WorkerMemoryRpcClient);
+  folly::SemiFuture<bool> finish_mapping_async(uint64_t transaction_id,
+                                               bool commit,
+                                               bool weight);
 
  private:
   int32_t global_rank_;
   torch::Device device_;
+  const int32_t transaction_timeout_ms_;
 
   // brpc connection resources
   brpc::Channel channel_;
@@ -93,6 +118,12 @@ class WorkerMemoryRpcClient final {
   ThreadPool threadpool_{/*num_threads=*/1,
                          /*cpu_binding=*/false,
                          /*pool_name=*/"WorkerMemoryRpcClient.async"};
+
+  // Capacity probes must not wait behind mutation RPCs.
+  ThreadPool capacity_query_threadpool_{
+      /*num_threads=*/1,
+      /*cpu_binding=*/false,
+      /*pool_name=*/"WorkerMemoryRpcClient.capacity"};
 };
 
 }  // namespace xllm

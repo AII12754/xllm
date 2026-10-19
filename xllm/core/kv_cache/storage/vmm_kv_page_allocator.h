@@ -28,9 +28,9 @@ namespace xllm {
 // KV page operations supplied by the runtime. Implementations retain the
 // shared memory budget and mapping coordination; cache block managers do not
 // depend on model lifecycle, weight reservations or distributed RPCs.
-class VirtualKVCachePageAllocator {
+class VmmKVPageAllocator {
  public:
-  virtual ~VirtualKVCachePageAllocator() = default;
+  virtual ~VmmKVPageAllocator() = default;
 
   virtual bool is_initialized() const = 0;
   virtual void start_prealloc_thread(const std::string& model_id) = 0;
@@ -44,6 +44,10 @@ class VirtualKVCachePageAllocator {
       const std::vector<int64_t>& virtual_page_ids) = 0;
   virtual void trim_kv_cache(const std::string& model_id, int32_t dp_rank) = 0;
 
+  // Includes resident reserve pages and currently budgeted growth. This is
+  // a scheduling hint; alloc_kv_cache_page performs the actual reservation.
+  virtual size_t get_num_available_virt_pages(const std::string& model_id,
+                                              int32_t dp_rank) const = 0;
   virtual size_t get_num_inuse_virt_pages(const std::string& model_id,
                                           int32_t dp_rank) const = 0;
   virtual size_t get_num_reserved_virt_pages(const std::string& model_id,

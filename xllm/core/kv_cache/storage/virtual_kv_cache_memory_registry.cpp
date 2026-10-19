@@ -70,6 +70,14 @@ std::vector<torch::Tensor> VirtualKVCacheMemoryRegistry::create_index_tensors(
       dims, dtype, num_layers, device_, page_size_, layer_owned);
 }
 
+bool VirtualKVCacheMemoryRegistry::can_prepare_mapping(
+    const std::string& model_id,
+    const std::vector<offset_t>& offsets) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = regions_.find(model_id);
+  return it != regions_.end() && it->second.can_prepare_mapping(offsets);
+}
+
 bool VirtualKVCacheMemoryRegistry::map(const std::string& model_id,
                                        const std::vector<offset_t>& offsets) {
   std::lock_guard<std::mutex> lock(mutex_);

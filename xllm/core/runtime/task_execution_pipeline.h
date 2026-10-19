@@ -270,6 +270,7 @@ class TaskExecutionPipeline final {
   Status prepare(uint32_t slot_id, const LlmForwardInput& input);
   Status prepare_worker(uint32_t slot_id, const LlmForwardInput& input);
   void launch(uint32_t slot_id);
+  void observe_execution_memory(uint32_t slot_id);
   ForwardOutput consume(uint32_t slot_id);
   void discard(uint32_t slot_id);
   void release_outputs(Slot& slot);

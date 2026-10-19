@@ -182,9 +182,11 @@ class ProfileManager {
           time_profiling_data,
       bool is_prefill);
 
-  std::shared_ptr<Request> generate_single_request(int32_t token_length,
-                                                   int32_t prefix_length,
-                                                   bool is_graph_warmup = true);
+  std::shared_ptr<Request> generate_single_request(
+      int32_t token_length,
+      int32_t prefix_length,
+      bool is_graph_warmup = true,
+      std::optional<int32_t> dp_rank = std::nullopt);
   std::shared_ptr<Request> generate_single_decode_request(
       int32_t total_length,
       std::optional<int32_t> dp_rank = std::nullopt,
@@ -213,6 +215,12 @@ class ProfileManager {
 
   // Warm up eager NPU operators before the service becomes ready.
   void warmup_for_eager();
+
+  // Establish execution residency before elastic KV can consume free memory.
+  void warmup_for_vmm();
+  void run_vmm_warmup_batch(const std::vector<int32_t>& token_lengths,
+                            int32_t dp_rank,
+                            bool decode);
 
   // Warmup ACL graph executor according to the instance role.
   void warmup_for_graph();

@@ -16,15 +16,38 @@ limitations under the License.
 #include "core/framework/allocator/virtual_memory/physical_page.h"
 
 namespace xllm {
+
+PhysicalPage::PhysicalPage(torch::Device device,
+                           size_t page_size,
+                           page_id_t page_id,
+                           std::nullptr_t)
+    : device_(device), page_size_(page_size), page_id_(page_id) {}
+
 PhysicalPage::PhysicalPage(torch::Device device,
                            size_t page_size,
                            page_id_t page_id)
-    : device_(device), page_size_(page_size), page_id_(page_id) {
-  int32_t device_id = device_.index();
-
-  // create a physical memory handle for the device
-  vmm::create_phy_mem_handle(phy_handle_, device_id, page_size_);
+    : PhysicalPage(device, page_size, page_id, nullptr) {
+  vmm::create_phy_mem_handle(phy_handle_, device_.index(), page_size_);
+  owns_handle_ = true;
 }
 
-PhysicalPage::~PhysicalPage() { vmm::release_phy_mem_handle(phy_handle_); }
+std::unique_ptr<PhysicalPage> PhysicalPage::try_create(torch::Device device,
+                                                       size_t page_size,
+                                                       page_id_t page_id) {
+  auto page = std::unique_ptr<PhysicalPage>(
+      new PhysicalPage(device, page_size, page_id, nullptr));
+  if (!vmm::try_create_phy_mem_handle(
+          page->phy_handle_, device.index(), page_size)) {
+    return nullptr;
+  }
+  page->owns_handle_ = true;
+  return page;
+}
+
+PhysicalPage::~PhysicalPage() {
+  if (owns_handle_) {
+    vmm::release_phy_mem_handle(phy_handle_);
+  }
+}
+
 }  // namespace xllm

@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <cmath>
+
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
 
@@ -32,7 +34,18 @@ DEFINE_int64(max_cache_size,
 DEFINE_double(max_memory_utilization,
               0.8,
               "The fraction of GPU memory to be used for model inference, "
-              "including model weights and kv cache.");
+              "including model weights and kv cache. Elastic VMM accepts 0 "
+              "to disable this optional utilization ceiling.");
+
+DEFINE_bool(vmm_elastic,
+            true,
+            "Grow and release virtual-memory physical pages on demand. Set "
+            "false for transports requiring a fixed, fully resident arena.");
+
+DEFINE_int64(vmm_memory_reserve_bytes,
+             0,
+             "Additional device memory kept free for execution when elastic "
+             "VMM grows. This supplements runtime execution headroom.");
 
 DEFINE_string(kv_cache_dtype,
               "auto",
@@ -93,6 +106,8 @@ void KVCacheConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_linear_state_cache_slots);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(xxh3_128bits_seed);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_virtual_memory);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(vmm_elastic);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(vmm_memory_reserve_bytes);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(phy_page_granularity_size);
 }
 
@@ -108,6 +123,8 @@ void KVCacheConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_linear_state_cache_slots);
   XLLM_CONFIG_ASSIGN_FROM_JSON(xxh3_128bits_seed);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_virtual_memory);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(vmm_elastic);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(vmm_memory_reserve_bytes);
   XLLM_CONFIG_ASSIGN_FROM_JSON(phy_page_granularity_size);
 }
 
@@ -137,6 +154,10 @@ void KVCacheConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_virtual_memory);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, vmm_elastic);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, vmm_memory_reserve_bytes);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, phy_page_granularity_size);
 }
 
@@ -154,6 +175,16 @@ void KVCacheConfig::initialize() {
 }
 
 void KVCacheConfig::validate() const {
+  CHECK_GE(vmm_memory_reserve_bytes_, 0);
+  CHECK(std::isfinite(max_memory_utilization_));
+  CHECK_LE(max_memory_utilization_, 1.0);
+  CHECK_GE(max_memory_utilization_, 0.0);
+  CHECK_GT(phy_page_granularity_size_, 0);
+  CHECK_GE(max_cache_size_, 0);
+  if (!enable_virtual_memory_ || !vmm_elastic_) {
+    CHECK_GT(max_memory_utilization_, 0.0)
+        << "Only elastic VMM supports an unset utilization ceiling (0)";
+  }
   if (!kv_events_config_.empty()) {
     const nlohmann::json config =
         nlohmann::json::parse(kv_events_config_, nullptr, false);

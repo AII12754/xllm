@@ -20,6 +20,8 @@ limitations under the License.
 #include <algorithm>
 #include <limits>
 
+#include "core/framework/allocator/virtual_memory/physical_page_pool.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
 #include "core/platform/platform.h"
 #include "core/runtime/decode_graph_bucket.h"
@@ -470,6 +472,7 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmForwardInput& input) {
           promise.setValue(TaskSubmission{std::move(status), 0});
           return;
         }
+        slots_[slot_id]->is_warmup = source->input_params.meta.is_graph_warmup;
         const SlotTicket ticket{slot_id, next_task_id_++};
         accepted_.emplace_back(ticket);
         execution_.push(ticket);
@@ -529,9 +532,27 @@ void TaskExecutionPipeline::launch_loop() {
       return;
     }
     launch(ticket.slot_id);
+    observe_execution_memory(ticket.slot_id);
     // The completion queue covers every Slot, including unrequested results.
     completed_.push(ticket);
   }
+}
+
+void TaskExecutionPipeline::observe_execution_memory(uint32_t slot_id) {
+  const bool is_warmup = slots_[slot_id]->is_warmup;
+  if (worker_pipeline_ != nullptr) {
+    worker_pipeline_->observe_execution_memory(is_warmup);
+    return;
+  }
+  const auto& cache_config = KVCacheConfig::get_instance();
+  if (!cache_config.enable_virtual_memory() || !cache_config.vmm_elastic()) {
+    return;
+  }
+  if (is_warmup) {
+    CHECK_EQ(task_stream_.synchronize(), 0)
+        << "Failed to finish elastic VMM task warmup";
+  }
+  PhysicalPagePool::get_instance().observe_execution_memory();
 }
 
 TaskExecutionPipeline::~TaskExecutionPipeline() {
@@ -682,7 +703,6 @@ Status TaskExecutionPipeline::prepare(uint32_t slot_id,
   const uint32_t samples =
       params.sample_idxes.defined() ? params.sample_idxes.numel() : 0;
   slot.sampling = params;
-  slot.is_warmup = meta.is_graph_warmup;
   VLOG(1) << "Task pipeline DP input: rank=" << capacity_.dp_rank
           << " batch_id=" << meta.batch_id << " local_tokens=" << local_tokens
           << " local_rows=" << rows << " samples=" << samples
@@ -708,7 +728,6 @@ Status TaskExecutionPipeline::prepare_worker(uint32_t slot_id,
   slot.worker_input_host_buffer = input.runtime.input_host_buffer;
   worker_pipeline_->prepare_task_pipeline_input(input, slot.worker_input);
   slot.worker_output.reset();
-  slot.is_warmup = input.input_params.meta.is_graph_warmup;
   return Status();
 }
 

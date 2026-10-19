@@ -25,12 +25,12 @@ limitations under the License.
 #include "common/macros.h"
 #include "core/kv_cache/block/block_manager.h"
 #include "core/kv_cache/block/virtual_kv_cache_page_state.h"
-#include "core/kv_cache/storage/virtual_kv_cache_page_allocator.h"
+#include "core/kv_cache/storage/vmm_kv_page_allocator.h"
 
 namespace xllm {
 
 /**
- * VirtualMemoryKVCacheBlockManager is a BlockManager implementation that uses
+ * VmmKVBlockManager is a BlockManager implementation that uses
  * virtual memory management (VMM) for KV cache allocation.
  *
  * This implementation follows the kvcached KVCacheManager design:
@@ -40,22 +40,21 @@ namespace xllm {
  * data
  *
  * Key features:
- * - Uses an injected VirtualKVCachePageAllocator for physical page management
+ * - Uses an injected VmmKVPageAllocator for physical page management
  * - Maps blocks to virtual pages
  * - Supports reserved blocks for pre-allocation
  * - Does NOT support prefix cache (prefix cache disabled)
  */
-class VirtualMemoryKVCacheBlockManager final : public BlockManager {
+class VmmKVBlockManager final : public BlockManager {
  public:
-  explicit VirtualMemoryKVCacheBlockManager(
-      const Options& options,
-      VirtualKVCachePageAllocator& page_allocator,
-      int64_t num_layers,
-      size_t block_mem_size,
-      size_t page_size,
-      int32_t dp_rank = 0,
-      const std::string& model_id = "");
-  ~VirtualMemoryKVCacheBlockManager() override;
+  explicit VmmKVBlockManager(const Options& options,
+                             VmmKVPageAllocator& page_allocator,
+                             int64_t num_layers,
+                             size_t block_mem_size,
+                             size_t page_size,
+                             int32_t dp_rank = 0,
+                             const std::string& model_id = "");
+  ~VmmKVBlockManager() override;
 
   // Allocate num_blocks blocks
   std::vector<Block> allocate(size_t num_blocks) override;
@@ -112,6 +111,7 @@ class VirtualMemoryKVCacheBlockManager final : public BlockManager {
 
   // Get total number of blocks
   size_t num_total_blocks() const override;
+  size_t admission_capacity() const override;
 
   // Get available size (free blocks that can be allocated)
   size_t available_size() const;
@@ -133,7 +133,7 @@ class VirtualMemoryKVCacheBlockManager final : public BlockManager {
   void reserve_virtual_memory_padding_blocks() override;
 
  private:
-  DISALLOW_COPY_AND_ASSIGN(VirtualMemoryKVCacheBlockManager);
+  DISALLOW_COPY_AND_ASSIGN(VmmKVBlockManager);
 
   // Internal allocation
   std::vector<int32_t> alloc_internal(size_t need_size);
@@ -150,7 +150,7 @@ class VirtualMemoryKVCacheBlockManager final : public BlockManager {
  private:
   // Non-owning; the runtime keeps the allocator alive until all blocks and
   // cache managers have been destroyed.
-  VirtualKVCachePageAllocator& page_allocator_;
+  VmmKVPageAllocator& page_allocator_;
 
   // Model ID (from options_.model_id())
   std::string model_id_;

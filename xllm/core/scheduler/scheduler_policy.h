@@ -171,7 +171,8 @@ class SchedulerPolicy {
                             size_t token_budget,
                             size_t* actual_tokens,
                             SchedulerState& state,
-                            bool skip_shared = false);
+                            bool skip_shared = false,
+                            bool reserve_full_prompt = false);
   void allocate_shared_blocks_for(Sequence* seq, SchedulerState& state);
   void schedule_decode_restore(SchedulerState& state, ScheduleBudget& budget);
 

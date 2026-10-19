@@ -32,6 +32,16 @@ limitations under the License.
 
 namespace xllm {
 
+struct WorkerMemoryCapacity {
+  int64_t available_memory = 0;
+  int64_t total_memory = 0;
+  bool pool_initialized = false;
+  size_t pool_capacity_pages = 0;
+  size_t pool_committed_pages = 0;
+  size_t pool_allocatable_pages = 0;
+  size_t execution_memory_reserve_bytes = 0;
+};
+
 // Owns worker-local KV cache mappings and weight allocations under one device
 // lifecycle. Distributed operations are coordinated by a separate service.
 class WorkerMemoryResources final {
@@ -42,7 +52,22 @@ class WorkerMemoryResources final {
   }
 
   void init(const torch::Device& device);
-  void init_physical_page_pool(int64_t num_pages);
+  void init_physical_page_pool(int64_t num_pages, bool lazy = true);
+  WorkerMemoryCapacity memory_capacity_snapshot() const;
+  void set_execution_memory_reserve(size_t bytes);
+  size_t trim_idle_physical_pages(size_t keep_pages = 0);
+
+  // Prepare owns real mappings until the entire worker group commits.
+  bool prepare_kv_mapping(uint64_t transaction_id,
+                          const std::string& model_id,
+                          const std::vector<offset_t>& offsets);
+  bool commit_kv_mapping(uint64_t transaction_id);
+  bool abort_kv_mapping(uint64_t transaction_id);
+  bool prepare_weight_pages(uint64_t transaction_id,
+                            const std::string& model_id,
+                            size_t num_pages);
+  bool commit_weight_pages(uint64_t transaction_id);
+  bool abort_weight_pages(uint64_t transaction_id);
   bool is_initialized() const { return initialized_; }
   const torch::Device& device() const { return device_; }
   VirtualKVCacheMemoryRegistry& kv_cache_memory() { return kv_cache_memory_; }
@@ -95,6 +120,26 @@ class WorkerMemoryResources final {
   void init_device();
   void destroy();
 
+  struct KvMappingTransaction {
+    uint64_t id = 0;
+    std::string model_id;
+    std::vector<offset_t> offsets;
+    bool committed = false;
+  };
+  struct WeightMappingTransaction {
+    uint64_t id = 0;
+    std::string model_id;
+    size_t num_pages = 0;
+    bool committed = false;
+  };
+
+  // Keep one reversible result and a retired watermark. Delayed RPCs must
+  // never recreate mappings from an already aborted transaction.
+  std::optional<KvMappingTransaction> mapping_transaction_;
+  uint64_t retired_mapping_transaction_id_ = 0;
+  std::optional<WeightMappingTransaction> weight_transaction_;
+  uint64_t retired_weight_transaction_id_ = 0;
+  size_t execution_memory_reserve_bytes_ = 0;
   bool initialized_ = false;
   torch::Device device_{torch::kCPU};
   mutable std::mutex mutex_;

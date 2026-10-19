@@ -23,8 +23,11 @@ limitations under the License.
 #include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <vector>
 
+#include "core/framework/allocator/virtual_memory/physical_page_pool.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/runtime/executor_impl_factory.h"
@@ -34,6 +37,16 @@ limitations under the License.
 #include "worker.pb.h"
 
 namespace xllm {
+
+class PhysicalPagePoolTestPeer final {
+ public:
+  static void set_memory_query(PhysicalPagePool& pool,
+                               std::function<int64_t()> query) {
+    std::lock_guard<std::mutex> lock(pool.mtx_);
+    pool.free_memory_query_ = std::move(query);
+  }
+};
+
 namespace {
 
 TEST(UnifiedBlockAdmissionTest, HonorsGraphSwitchAndExpandedBatchLimit) {
@@ -274,7 +287,12 @@ class PreparedTestWorker final : public WorkerImpl {
   }
 
   std::future<void> entered() { return entered_.get_future(); }
-  void release() { release_.set_value(); }
+  void release() {
+    if (!release_signaled_.exchange(true)) {
+      release_.set_value();
+    }
+  }
+  bool finished() const { return finished_.load(); }
   void without_tokens() { with_tokens_ = false; }
   void with_contiguous_input() { contiguous_input_ = true; }
   bool released_early() const { return released_early_.load(); }
@@ -287,6 +305,7 @@ class PreparedTestWorker final : public WorkerImpl {
   std::promise<void> release_;
   std::shared_future<void> release_future_;
   std::atomic<bool> entered_signaled_{false};
+  std::atomic<bool> release_signaled_{false};
   std::atomic<bool> finished_{false};
   std::atomic<bool> released_early_{false};
   std::atomic<int32_t> released_inputs_{0};
@@ -511,6 +530,174 @@ class SpeculativePipelineTest : public ::testing::Test {
   SpeculativeTaskCapacity capacity_;
   std::unique_ptr<TaskExecutionPipeline> pipeline_;
 };
+
+class PipelineExecutionMemoryTest : public SpeculativePipelineTest {
+ protected:
+  static constexpr int64_t kPageSize = 4096;
+
+  void SetUp() override {
+    SpeculativePipelineTest::SetUp();
+    auto& config = KVCacheConfig::get_instance();
+    previous_virtual_memory_ = config.enable_virtual_memory();
+    previous_elastic_ = config.vmm_elastic();
+    config.enable_virtual_memory(true).vmm_elastic(true);
+    auto& pool = PhysicalPagePool::get_instance();
+    ASSERT_TRUE(pool.reset());
+    pool.init(torch::Device(torch::kCPU),
+              /*num_pages=*/8,
+              kPageSize,
+              /*lazy=*/true);
+    PhysicalPagePoolTestPeer::set_memory_query(pool, [this] {
+      if (on_query_) {
+        on_query_();
+      }
+      return free_bytes_.load();
+    });
+  }
+
+  void TearDown() override {
+    if (worker_ != nullptr) {
+      worker_->release();
+    }
+    SpeculativePipelineTest::TearDown();
+    EXPECT_TRUE(PhysicalPagePool::get_instance().reset());
+    auto& config = KVCacheConfig::get_instance();
+    config.enable_virtual_memory(previous_virtual_memory_)
+        .vmm_elastic(previous_elastic_);
+  }
+
+  void create_worker() {
+    worker_ = std::make_unique<PreparedTestWorker>(device_);
+    ASSERT_TRUE(TaskExecutionPipeline::create(
+                    state_thread_,
+                    {*target_, *target_executor_, target_cache_},
+                    *worker_,
+                    capacity_.common,
+                    pipeline_)
+                    .ok());
+  }
+
+  void verify_worker_sampling(bool warmup) {
+    create_worker();
+    ASSERT_NE(pipeline_, nullptr);
+    auto entered = worker_->entered();
+    auto sampled = std::make_shared<std::promise<bool>>();
+    auto sampling = sampled->get_future();
+    on_query_ = [this, sampled] {
+      if (!sampled_.exchange(true)) {
+        sampled->set_value(worker_->finished());
+      }
+    };
+    auto request = input(true);
+    request.input_params.meta.is_graph_warmup = warmup;
+    const auto submitted = pipeline_->submit(request);
+    ASSERT_TRUE(submitted.status.ok()) << submitted.status.message();
+    EXPECT_EQ(entered.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    if (warmup) {
+      EXPECT_EQ(sampling.wait_for(std::chrono::milliseconds(50)),
+                std::future_status::timeout);
+    } else {
+      const auto status = sampling.wait_for(std::chrono::seconds(5));
+      EXPECT_EQ(status, std::future_status::ready);
+      if (status == std::future_status::ready) {
+        EXPECT_FALSE(sampling.get());
+      }
+    }
+    worker_->release();
+    if (warmup) {
+      const auto status = sampling.wait_for(std::chrono::seconds(5));
+      EXPECT_EQ(status, std::future_status::ready);
+      if (status == std::future_status::ready) {
+        EXPECT_TRUE(sampling.get());
+      }
+    }
+    EXPECT_TRUE(
+        pipeline_->take_result_async(submitted.task_id).get().status.ok());
+    pipeline_.reset();
+    on_query_ = {};
+  }
+
+  bool previous_virtual_memory_ = false;
+  bool previous_elastic_ = false;
+  std::atomic<int64_t> free_bytes_{3 * kPageSize};
+  std::atomic<bool> sampled_{false};
+  std::function<void()> on_query_;
+  std::unique_ptr<PreparedTestWorker> worker_;
+};
+
+enum class BudgetExecutionPath { ORDINARY, SPECULATIVE, WORKER };
+
+class PipelineExecutionMemoryPathTest
+    : public PipelineExecutionMemoryTest,
+      public ::testing::WithParamInterface<BudgetExecutionPath> {
+ protected:
+  void create_path() {
+    switch (GetParam()) {
+      case BudgetExecutionPath::ORDINARY:
+        ASSERT_TRUE(TaskExecutionPipeline::create(state_thread_,
+                                                  *target_,
+                                                  *target_executor_,
+                                                  target_cache_,
+                                                  capacity_.common,
+                                                  pipeline_)
+                        .ok());
+        break;
+      case BudgetExecutionPath::SPECULATIVE:
+        create();
+        break;
+      case BudgetExecutionPath::WORKER:
+        create_worker();
+        worker_->release();
+        break;
+    }
+  }
+
+  void execute_warmup() {
+    ASSERT_NE(pipeline_, nullptr);
+    auto request = input(false);
+    if (GetParam() == BudgetExecutionPath::ORDINARY) {
+      request.input_params.embedding = {};
+    }
+    request.input_params.meta.is_graph_warmup = true;
+    execute(request);
+    free_bytes_.store(6 * kPageSize);
+  }
+};
+
+TEST_P(PipelineExecutionMemoryPathTest, WarmupPreservesExecutionBudget) {
+  create_path();
+  execute_warmup();
+  EXPECT_EQ(PhysicalPagePool::get_instance().num_allocatable(), 3U);
+}
+
+TEST_P(PipelineExecutionMemoryPathTest, FixedPoolSkipsExecutionSampling) {
+  create_path();
+  KVCacheConfig::get_instance().vmm_elastic(false);
+  execute_warmup();
+  EXPECT_EQ(PhysicalPagePool::get_instance().num_allocatable(), 6U);
+}
+
+TEST_P(PipelineExecutionMemoryPathTest, DisabledVmmSkipsExecutionSampling) {
+  create_path();
+  KVCacheConfig::get_instance().enable_virtual_memory(false);
+  execute_warmup();
+  EXPECT_EQ(PhysicalPagePool::get_instance().num_allocatable(), 6U);
+}
+
+INSTANTIATE_TEST_SUITE_P(ExecutionPaths,
+                         PipelineExecutionMemoryPathTest,
+                         ::testing::Values(BudgetExecutionPath::ORDINARY,
+                                           BudgetExecutionPath::SPECULATIVE,
+                                           BudgetExecutionPath::WORKER));
+
+TEST_F(PipelineExecutionMemoryTest, WorkerWarmupSamplesAfterExecutionFinishes) {
+  verify_worker_sampling(/*warmup=*/true);
+}
+
+TEST_F(PipelineExecutionMemoryTest, WorkerServingSamplesWithoutStreamWait) {
+  verify_worker_sampling(/*warmup=*/false);
+}
 
 TransferKVInfo push_info() {
   TransferKVInfo info;

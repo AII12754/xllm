@@ -56,6 +56,32 @@ class WorkerMemoryRpcService final : public proto::ModelMemoryDist {
                             ::google::protobuf::Closure* done) override;
 
   // KV tensor operations (partial mapping by offsets)
+  void PrepareKvMapping(::google::protobuf::RpcController* controller,
+                        const proto::PrepareKvMappingRequest* request,
+                        proto::Status* response,
+                        ::google::protobuf::Closure* done) override;
+  void CommitKvMapping(::google::protobuf::RpcController* controller,
+                       const proto::KvMappingTransactionRequest* request,
+                       proto::Status* response,
+                       ::google::protobuf::Closure* done) override;
+  void AbortKvMapping(::google::protobuf::RpcController* controller,
+                      const proto::KvMappingTransactionRequest* request,
+                      proto::Status* response,
+                      ::google::protobuf::Closure* done) override;
+
+  void PrepareWeightPages(::google::protobuf::RpcController* controller,
+                          const proto::PrepareWeightPagesRequest* request,
+                          proto::Status* response,
+                          ::google::protobuf::Closure* done) override;
+  void CommitWeightPages(::google::protobuf::RpcController* controller,
+                         const proto::KvMappingTransactionRequest* request,
+                         proto::Status* response,
+                         ::google::protobuf::Closure* done) override;
+  void AbortWeightPages(::google::protobuf::RpcController* controller,
+                        const proto::KvMappingTransactionRequest* request,
+                        proto::Status* response,
+                        ::google::protobuf::Closure* done) override;
+
   void MapToKvTensors(::google::protobuf::RpcController* controller,
                       const proto::KvTensorRequest* request,
                       proto::Status* response,
@@ -93,9 +119,9 @@ class WorkerMemoryRpcService final : public proto::ModelMemoryDist {
   int32_t global_rank_;
   int32_t world_size_;
   torch::Device device_;
-  ThreadPool threadpool_{/*num_threads=*/4,
-                         /*cpu_binding=*/false,
-                         /*pool_name=*/"WorkerMemoryRpcService.rpc"};
+  // Budget queries and VMM operations require a device context on every RPC
+  // thread, including threads that have not handled a memory snapshot yet.
+  ThreadPool threadpool_;
 };
 
 }  // namespace xllm

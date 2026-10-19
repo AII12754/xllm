@@ -77,7 +77,7 @@ class BlockManager {
     // this is set to make those mutations thread-safe against the scheduler.
     PROPERTY(bool, enable_host_offload) = false;
     // Virtual memory (VMM) KV leaf parameters. When enable_virtual_memory is
-    // set, the KV leaf is a VirtualMemoryKVCacheBlockManager; these carry the
+    // set, the KV leaf is a VmmKVBlockManager; these carry the
     // construction args the spec builder needs.
     PROPERTY(bool, enable_virtual_memory) = false;
     PROPERTY(int64_t, num_layers) = 0;
@@ -169,6 +169,8 @@ class BlockManager {
 
   // get number of total blocks
   virtual size_t num_total_blocks() const = 0;
+  // Physical KV keeps its static capacity; VmmKV supplies a live budget.
+  virtual size_t admission_capacity() const { return num_total_blocks(); }
 
   // True only for CompositeBlockManager. Leaves and flat managers return false.
   virtual bool is_composite() const { return false; }

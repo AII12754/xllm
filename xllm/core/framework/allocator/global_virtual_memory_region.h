@@ -49,6 +49,10 @@ class GlobalVirtualMemoryRegion final {
 
   std::shared_ptr<void> acquire_mapping_lease();
 
+  // Whole-arena transfer registration requires resident backing for every
+  // slot. Test residency and acquire its pin atomically against reclamation.
+  std::shared_ptr<void> try_acquire_contiguous_mapping_lease();
+
  private:
   GlobalVirtualMemoryRegion();
   ~GlobalVirtualMemoryRegion() = default;

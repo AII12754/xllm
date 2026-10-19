@@ -28,8 +28,7 @@ class VirtualKVCacheMemoryRegistry;
 
 // Supplies model-wide virtual mappings through the cache allocation interface.
 // The registry must outlive the allocator and all uses of its tensor views.
-std::shared_ptr<KVCacheTensorAllocator>
-create_virtual_kv_cache_tensor_allocator(
+std::shared_ptr<KVCacheTensorAllocator> create_vmm_kv_tensor_allocator(
     VirtualKVCacheMemoryRegistry& registry,
     std::string model_id,
     int64_t num_layers,

@@ -24,6 +24,37 @@ limitations under the License.
 
 namespace xllm {
 namespace vmm {
+namespace {
+
+bool is_allocation_exhausted(int32_t result) {
+#if defined(USE_NPU)
+  return result == ACL_ERROR_RT_MEMORY_ALLOCATION ||
+         result == ACL_ERROR_BAD_ALLOC;
+#elif defined(USE_MLU)
+  return result == CN_ERROR_OUT_OF_MEMORY;
+#elif defined(USE_CUDA) || defined(USE_ILU)
+  return result == CUDA_ERROR_OUT_OF_MEMORY;
+#elif defined(USE_MUSA)
+  return result == MUSA_ERROR_OUT_OF_MEMORY;
+#elif defined(USE_DCU)
+  return result == hipErrorOutOfMemory;
+#else
+  return false;
+#endif
+}
+
+bool check_allocation_result(int32_t result, const char* operation) {
+  if (result == 0) {
+    return true;
+  }
+  if (is_allocation_exhausted(result)) {
+    return false;
+  }
+  CHECK_EQ(result, 0) << operation;
+  return false;
+}
+
+}  // namespace
 
 size_t get_recommended_granularity(int32_t device_id) {
   size_t granularity_size = 0;
@@ -107,6 +138,13 @@ void create_phy_mem_handle(PhyMemHandle& phy_mem_handle, int32_t device_id) {
 void create_phy_mem_handle(PhyMemHandle& phy_mem_handle,
                            int32_t device_id,
                            size_t size) {
+  CHECK(try_create_phy_mem_handle(phy_mem_handle, device_id, size))
+      << "Failed to create physical memory handle of size " << size;
+}
+
+bool try_create_phy_mem_handle(PhyMemHandle& phy_mem_handle,
+                               int32_t device_id,
+                               size_t size) {
   // `size` is the total bytes of one physical handle (e.g. a 1GiB region
   // chunk), not a single page. It must be a multiple of the device allocation
   // granularity (SleepableRegion aligns to get_recommended_granularity()); on
@@ -121,6 +159,7 @@ void create_phy_mem_handle(PhyMemHandle& phy_mem_handle,
         << granularity;
   }
   int32_t ret = 0;
+  PhyMemHandle pending_handle = {};
 #if defined(USE_NPU)
   aclrtPhysicalMemProp prop = {};
   prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
@@ -134,7 +173,7 @@ void create_phy_mem_handle(PhyMemHandle& phy_mem_handle,
   prop.location.id = device_id;
   prop.reserve = 0;
 
-  ret = aclrtMallocPhysical(&phy_mem_handle, size, &prop, /*flags=*/0);
+  ret = aclrtMallocPhysical(&pending_handle, size, &prop, /*flags=*/0);
 #elif defined(USE_MLU)
   CNmemAllocationProp prop = {};
   prop.type = CN_MEM_ALLOCATION_TYPE_DEFAULT;
@@ -143,26 +182,34 @@ void create_phy_mem_handle(PhyMemHandle& phy_mem_handle,
   prop.requestedHandleTypes = CN_MEM_HANDLE_TYPE_NONE;
   prop.allocFlags.compressionType = CN_MEM_ALLOCATION_COMP_NONE;
 
-  ret = cnMemCreate(&phy_mem_handle, size, &prop, /*flags=*/0);
+  ret = cnMemCreate(&pending_handle, size, &prop, /*flags=*/0);
 
+  if (!check_allocation_result(ret,
+                               "Failed to create physical memory handle")) {
+    return false;
+  }
   CNmemAccessDesc accessDesc = {};
   accessDesc.location.type = CN_MEM_LOCATION_TYPE_DEVICE;
   accessDesc.location.id = device_id;
   accessDesc.accessFlags = CN_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  ret = cnMemSetAccess(phy_mem_handle, size, &accessDesc, /*count=*/1);
+  ret = cnMemSetAccess(pending_handle, size, &accessDesc, /*count=*/1);
+  if (ret != 0) {
+    release_phy_mem_handle(pending_handle);
+    return check_allocation_result(ret, "Failed to set physical memory access");
+  }
 #elif defined(USE_MUSA)
   MUmemAllocationProp prop = {};
   prop.type = MU_MEM_ALLOCATION_TYPE_PINNED;
   prop.location.type = MU_MEM_LOCATION_TYPE_DEVICE;
   prop.location.id = device_id;
-  ret = muMemCreate(&phy_mem_handle, size, &prop, 0);
+  ret = muMemCreate(&pending_handle, size, &prop, 0);
 #elif defined(USE_CUDA) || defined(USE_ILU)
   CUmemAllocationProp prop = {};
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
   prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
   prop.location.id = device_id;
 
-  ret = cuMemCreate(&phy_mem_handle, size, &prop, /*flags=*/0);
+  ret = cuMemCreate(&pending_handle, size, &prop, /*flags=*/0);
   // Note: cuMemSetAccess is called in map() after cuMemMap, not here
 #elif defined(USE_DCU)
   hipMemAllocationProp prop = {};
@@ -170,13 +217,17 @@ void create_phy_mem_handle(PhyMemHandle& phy_mem_handle,
   prop.location.type = hipMemLocationTypeDevice;
   prop.location.id = device_id;
 
-  ret = hipMemCreate(&phy_mem_handle, size, &prop, /*flags=*/0);
+  ret = hipMemCreate(&pending_handle, size, &prop, /*flags=*/0);
 #else
   (void)device_id;
   (void)size;
 #endif
-  CHECK_EQ(ret, 0) << "Failed to create physical memory handle of size "
-                   << size;
+  if (!check_allocation_result(ret,
+                               "Failed to create physical memory handle")) {
+    return false;
+  }
+  phy_mem_handle = pending_handle;
+  return true;
 }
 
 void create_vir_ptr(VirPtr& vir_ptr, size_t aligned_size) {
@@ -239,6 +290,14 @@ void map(VirPtr& vir_ptr,
          PhyMemHandle& phy_mem_handle,
          size_t granularity_size,
          int32_t device_id) {
+  CHECK(try_map(vir_ptr, phy_mem_handle, granularity_size, device_id))
+      << "Failed to map virtual memory to physical memory";
+}
+
+bool try_map(VirPtr& vir_ptr,
+             PhyMemHandle& phy_mem_handle,
+             size_t granularity_size,
+             int32_t device_id) {
   int ret = 0;
 #if defined(USE_NPU)
   ret = aclrtMapMem(vir_ptr, granularity_size, 0, phy_mem_handle, 0);
@@ -246,7 +305,9 @@ void map(VirPtr& vir_ptr,
   ret = cnMemMap(vir_ptr, granularity_size, 0, phy_mem_handle, 0);
 #elif defined(USE_CUDA) || defined(USE_ILU)
   ret = cuMemMap(vir_ptr, granularity_size, 0, phy_mem_handle, 0);
-  CHECK_EQ(ret, 0) << "Failed to map virtual memory to physical memory";
+  if (!check_allocation_result(ret, "Failed to map virtual memory")) {
+    return false;
+  }
 
   // Set access permissions on the mapped virtual address range
   CUmemAccessDesc accessDesc = {};
@@ -254,9 +315,16 @@ void map(VirPtr& vir_ptr,
   accessDesc.location.id = device_id;
   accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   ret = cuMemSetAccess(vir_ptr, granularity_size, &accessDesc, 1);
+  if (ret != 0) {
+    unmap_chunk(vir_ptr, granularity_size);
+    return check_allocation_result(ret,
+                                   "Failed to set memory access permissions");
+  }
 #elif defined(USE_MUSA)
   ret = muMemMap(vir_ptr, granularity_size, 0, phy_mem_handle, 0);
-  CHECK_EQ(ret, 0) << "Failed to map virtual memory to physical memory";
+  if (!check_allocation_result(ret, "Failed to map virtual memory")) {
+    return false;
+  }
 
   // Set access permissions on the mapped virtual address range
   MUmemAccessDesc accessDesc = {};
@@ -264,9 +332,16 @@ void map(VirPtr& vir_ptr,
   accessDesc.location.id = device_id;
   accessDesc.flags = MU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   ret = muMemSetAccess(vir_ptr, granularity_size, &accessDesc, 1);
+  if (ret != 0) {
+    unmap_chunk(vir_ptr, granularity_size);
+    return check_allocation_result(ret,
+                                   "Failed to set memory access permissions");
+  }
 #elif defined(USE_DCU)
   ret = hipMemMap(vir_ptr, granularity_size, 0, phy_mem_handle, 0);
-  CHECK_EQ(ret, 0) << "Failed to map virtual memory to physical memory";
+  if (!check_allocation_result(ret, "Failed to map virtual memory")) {
+    return false;
+  }
 
   // Set access permissions on the mapped virtual address range
   hipMemAccessDesc accessDesc = {};
@@ -274,8 +349,13 @@ void map(VirPtr& vir_ptr,
   accessDesc.location.id = device_id;
   accessDesc.flags = hipMemAccessFlagsProtReadWrite;
   ret = hipMemSetAccess(vir_ptr, granularity_size, &accessDesc, 1);
+  if (ret != 0) {
+    unmap_chunk(vir_ptr, granularity_size);
+    return check_allocation_result(ret,
+                                   "Failed to set memory access permissions");
+  }
 #endif
-  CHECK_EQ(ret, 0) << "Failed to set memory access permissions";
+  return check_allocation_result(ret, "Failed to map virtual memory");
 }
 
 void unmap(VirPtr& vir_ptr, size_t aligned_size) {

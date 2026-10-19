@@ -15,11 +15,13 @@ limitations under the License.
 
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -33,7 +35,7 @@ namespace xllm {
 
 class WorkerMemoryRpcClient;
 class WorkerMemoryRpcServer;
-class VirtualKVCachePageAllocatorImpl;
+class VmmKVPageAllocatorImpl;
 struct KVCacheMappingPlan;
 
 // Coordinates the virtual-memory subsystem across workers, including shared
@@ -59,18 +61,21 @@ class DistributedVirtualMemoryCoordinator final : public KVCachePageBackend {
                         bool enable_prealloc = true);
   bool is_initialized() const;
   size_t get_num_total_phy_pages() const;
-  VirtualKVCachePageAllocatorImpl& virtual_kv_cache_page_allocator();
+  VmmKVPageAllocatorImpl& vmm_kv_page_allocator();
 
   bool reserve_weight_pages(const std::string& model_id, size_t num_pages);
   void set_weight_page_count(const std::string& model_id, size_t num_pages);
   size_t get_weight_page_count(const std::string& model_id) const;
   void release_weight_pages(const std::string& model_id);
-  void restore_weight_pages(const std::string& model_id);
+  bool restore_weight_pages(const std::string& model_id);
 
   // Reserve every worker's KV and weight demand in one transaction. The KV
   // allocator must freeze the mapping plan throughout the residency transition.
   bool try_reserve_model_memory(const std::string& model_id,
                                 const KVCacheMappingPlan& plan);
+  // Release a failed resume's whole reservation after all mappings roll back.
+  void release_model_memory_budget(const std::string& model_id,
+                                   const KVCacheMappingPlan& plan);
   void release_kv_mapping_budget(const std::string& model_id,
                                  const KVCacheMappingPlan& plan);
   std::vector<size_t> get_worker_free_page_counts() const;
@@ -126,12 +131,18 @@ class DistributedVirtualMemoryCoordinator final : public KVCachePageBackend {
 
   void configure_workers(int32_t world_size, int32_t dp_size, int32_t tp_size);
   void destroy();
+  void refresh_worker_capacity_snapshot();
+  void start_worker_capacity_refresh();
+  void stop_worker_capacity_refresh();
   std::pair<int32_t, int32_t> parallel_strategy_locked(
       const std::string& model_id) const;
   std::pair<int32_t, int32_t> dp_worker_range_locked(
       const std::string& model_id,
       int32_t dp_rank) const;
   int32_t model_worker_count_locked(const std::string& model_id) const;
+  std::vector<size_t> model_memory_demand_locked(
+      const std::string& model_id,
+      const KVCacheMappingPlan& plan) const;
   void update_memory_usage_locked() const;
 
   // No call into the KV allocator may hold this mutex. KV page operations can
@@ -139,6 +150,10 @@ class DistributedVirtualMemoryCoordinator final : public KVCachePageBackend {
   mutable std::mutex mutex_;
   // Serialize initialization without holding the backend budget lock.
   std::mutex initialization_mutex_;
+  // A worker retains one reversible mapping transaction. Serializing map and
+  // unmap prevents a later allocation from retiring undo state too early.
+  std::mutex mapping_transaction_mutex_;
+  uint64_t next_mapping_transaction_id_ = 1;
   WorkerPhysicalPageBudget page_budget_;
   bool budget_initialized_ = false;
   std::unordered_map<std::string, size_t> weight_page_counts_;
@@ -149,8 +164,12 @@ class DistributedVirtualMemoryCoordinator final : public KVCachePageBackend {
   int32_t tp_size_ = 1;
   std::vector<std::shared_ptr<WorkerMemoryRpcClient>> clients_;
   std::vector<std::unique_ptr<WorkerMemoryRpcServer>> servers_;
+  std::vector<size_t> worker_allocatable_pages_;
+  bool capacity_refresh_running_ = false;
+  std::condition_variable capacity_refresh_cv_;
+  std::thread capacity_refresh_thread_;
   std::string collective_server_name_{"WorkerMemoryRpcCollectiveServer"};
-  std::unique_ptr<VirtualKVCachePageAllocatorImpl> kv_cache_pages_;
+  std::unique_ptr<VmmKVPageAllocatorImpl> kv_cache_pages_;
 };
 
 }  // namespace xllm

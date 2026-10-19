@@ -101,6 +101,12 @@ void create_phy_mem_handle(PhyMemHandle& phy_mem_handle,
                            int32_t device_id,
                            size_t size);
 
+// Expected device-memory exhaustion returns false. Invalid configuration and
+// unexpected driver failures keep the checked API's fatal behavior.
+bool try_create_phy_mem_handle(PhyMemHandle& phy_mem_handle,
+                               int32_t device_id,
+                               size_t size);
+
 // create a virtual memory pointer with a specific aligned size
 void create_vir_ptr(VirPtr& vir_ptr, size_t aligned_size);
 
@@ -116,12 +122,14 @@ void map(VirPtr& vir_ptr,
          PhyMemHandle& phy_mem_handle,
          size_t granularity_size,
          int32_t device_id = 0);
+bool try_map(VirPtr& vir_ptr,
+             PhyMemHandle& phy_mem_handle,
+             size_t granularity_size,
+             int32_t device_id = 0);
 
 // unmap a virtual memory pointer with a specific aligned size
 void unmap(VirPtr& vir_ptr, size_t aligned_size);
-void unmap(VirPtr& vir_ptr,
-           size_t aligned_size,
-           size_t granularity_size);
+void unmap(VirPtr& vir_ptr, size_t aligned_size, size_t granularity_size);
 
 // unmap a single contiguous chunk that was mapped by ONE map() call covering
 // the whole `size` (as opposed to per-granularity-page mapping). On NPU this

@@ -22,6 +22,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "core/framework/allocator/global_virtual_memory_region.h"
@@ -124,6 +125,227 @@ TEST_F(WorkerMemoryResourcesTest, KvShortageLeavesEveryLayerUnmapped) {
   EXPECT_EQ(pool.num_available(), kPoolPages - 4);
   ASSERT_TRUE(allocator.unmap_from_kv_tensors(kModelId, {/*offset=*/0}));
   EXPECT_EQ(pool.num_available(), kPoolPages);
+}
+
+TEST_F(WorkerMemoryResourcesTest,
+       CommittedMappingRemainsReversibleUntilRetired) {
+  auto& resources = WorkerMemoryResources::get_instance();
+  auto& pool = PhysicalPagePool::get_instance();
+  const size_t page_size = pool.page_size();
+  const std::vector<int64_t> dims = {static_cast<int64_t>(2 * page_size)};
+  const auto keys = resources.create_k_tensors(
+      kModelId, dims, torch::kUInt8, /*num_layers=*/1);
+  const auto values = resources.create_v_tensors(
+      kModelId, dims, torch::kUInt8, /*num_layers=*/1);
+  ASSERT_TRUE(resources.prepare_kv_mapping(
+      /*transaction_id=*/1, kModelId, {/*offset=*/0}));
+  EXPECT_EQ(pool.num_available(), kPoolPages - 2);
+  ASSERT_TRUE(resources.prepare_kv_mapping(
+      /*transaction_id=*/1, kModelId, {/*offset=*/0}));
+  EXPECT_EQ(pool.num_available(), kPoolPages - 2);
+  ASSERT_TRUE(resources.commit_kv_mapping(/*transaction_id=*/1));
+  EXPECT_TRUE(resources.commit_kv_mapping(/*transaction_id=*/1));
+
+  // A lost commit reply must still permit complete distributed rollback.
+  ASSERT_TRUE(resources.abort_kv_mapping(/*transaction_id=*/1));
+  EXPECT_TRUE(resources.abort_kv_mapping(/*transaction_id=*/1));
+  EXPECT_EQ(pool.num_available(), kPoolPages);
+  EXPECT_FALSE(resources.commit_kv_mapping(/*transaction_id=*/1));
+  EXPECT_FALSE(resources.prepare_kv_mapping(
+      /*transaction_id=*/1, kModelId, {/*offset=*/0}));
+}
+
+TEST_F(WorkerMemoryResourcesTest, AbortBeforePrepareBlocksDelayedRpc) {
+  auto& resources = WorkerMemoryResources::get_instance();
+  auto& pool = PhysicalPagePool::get_instance();
+  const std::vector<int64_t> dims = {static_cast<int64_t>(pool.page_size())};
+  const auto keys = resources.create_k_tensors(
+      kModelId, dims, torch::kUInt8, /*num_layers=*/1);
+  const auto values = resources.create_v_tensors(
+      kModelId, dims, torch::kUInt8, /*num_layers=*/1);
+  ASSERT_TRUE(resources.abort_kv_mapping(/*transaction_id=*/42));
+  EXPECT_FALSE(resources.prepare_kv_mapping(
+      /*transaction_id=*/42, kModelId, {/*offset=*/0}));
+  EXPECT_FALSE(resources.prepare_kv_mapping(
+      /*transaction_id=*/7, kModelId, {/*offset=*/0}));
+  EXPECT_EQ(pool.num_available(), kPoolPages);
+
+  // DP routing may skip transaction numbers for this worker.
+  ASSERT_TRUE(resources.prepare_kv_mapping(
+      /*transaction_id=*/99, kModelId, {/*offset=*/0}));
+  ASSERT_TRUE(resources.abort_kv_mapping(/*transaction_id=*/99));
+  EXPECT_EQ(pool.num_available(), kPoolPages);
+}
+
+TEST_F(WorkerMemoryResourcesTest, ExistingMappingsAreNeverOwnedByRollback) {
+  auto& resources = WorkerMemoryResources::get_instance();
+  auto& pool = PhysicalPagePool::get_instance();
+  const size_t page_size = pool.page_size();
+  const std::vector<int64_t> dims = {static_cast<int64_t>(2 * page_size)};
+  const auto keys = resources.create_k_tensors(
+      kModelId, dims, torch::kUInt8, /*num_layers=*/1);
+  const auto values = resources.create_v_tensors(
+      kModelId, dims, torch::kUInt8, /*num_layers=*/1);
+  ASSERT_TRUE(resources.map_to_kv_tensors(kModelId, {/*offset=*/0}));
+  const auto before = resources.get_global_offsets_for_block(
+      kModelId, /*layer_id=*/0, /*block_id=*/0, page_size);
+  ASSERT_NE(before.first, std::numeric_limits<uint64_t>::max());
+
+  EXPECT_FALSE(resources.prepare_kv_mapping(
+      /*transaction_id=*/1,
+      kModelId,
+      {/*offset=*/0, static_cast<offset_t>(page_size)}));
+  ASSERT_TRUE(resources.abort_kv_mapping(/*transaction_id=*/1));
+  EXPECT_EQ(pool.num_available(), kPoolPages - 2);
+  EXPECT_EQ(resources.get_global_offsets_for_block(
+                kModelId, /*layer_id=*/0, /*block_id=*/0, page_size),
+            before);
+  ASSERT_TRUE(resources.unmap_from_kv_tensors(kModelId, {/*offset=*/0}));
+}
+
+TEST_F(WorkerMemoryResourcesTest, LateAbortCannotTouchNewerMappings) {
+  auto& resources = WorkerMemoryResources::get_instance();
+  auto& pool = PhysicalPagePool::get_instance();
+  const size_t page_size = pool.page_size();
+  const std::vector<int64_t> dims = {static_cast<int64_t>(2 * page_size)};
+  const auto keys = resources.create_k_tensors(
+      kModelId, dims, torch::kUInt8, /*num_layers=*/1);
+  const auto values = resources.create_v_tensors(
+      kModelId, dims, torch::kUInt8, /*num_layers=*/1);
+  ASSERT_TRUE(resources.prepare_kv_mapping(
+      /*transaction_id=*/1, kModelId, {/*offset=*/0}));
+  ASSERT_TRUE(resources.commit_kv_mapping(/*transaction_id=*/1));
+  ASSERT_TRUE(resources.prepare_kv_mapping(
+      /*transaction_id=*/2, kModelId, {static_cast<offset_t>(page_size)}));
+  ASSERT_TRUE(resources.commit_kv_mapping(/*transaction_id=*/2));
+  EXPECT_TRUE(resources.abort_kv_mapping(/*transaction_id=*/1));
+  EXPECT_EQ(pool.num_available(), kPoolPages - 4);
+  EXPECT_TRUE(resources.abort_kv_mapping(/*transaction_id=*/2));
+  EXPECT_EQ(pool.num_available(), kPoolPages - 2);
+  ASSERT_TRUE(resources.unmap_from_kv_tensors(kModelId, {/*offset=*/0}));
+}
+
+TEST_F(WorkerMemoryResourcesTest, FailedPrepareDoesNotRetainPhysicalPages) {
+  auto& resources = WorkerMemoryResources::get_instance();
+  auto& pool = PhysicalPagePool::get_instance();
+  const std::vector<int64_t> dims = {static_cast<int64_t>(pool.page_size())};
+  const auto keys = resources.create_k_tensors(
+      kModelId, dims, torch::kUInt8, /*num_layers=*/2);
+  const auto values = resources.create_v_tensors(
+      kModelId, dims, torch::kUInt8, /*num_layers=*/2);
+  blocking_page_ids_ = pool.allocate_pages_from_right(kPoolPages - 3);
+  EXPECT_FALSE(resources.prepare_kv_mapping(
+      /*transaction_id=*/1, kModelId, {/*offset=*/0}));
+  EXPECT_TRUE(resources.abort_kv_mapping(/*transaction_id=*/1));
+  EXPECT_EQ(pool.num_available(), 3);
+}
+
+TEST_F(WorkerMemoryResourcesTest, LateAbortPreservesNormallyRemappedKvPages) {
+  auto& resources = WorkerMemoryResources::get_instance();
+  auto& pool = PhysicalPagePool::get_instance();
+  const size_t page_size = pool.page_size();
+  const offset_t second_offset = static_cast<offset_t>(page_size);
+  const std::vector<int64_t> dims{static_cast<int64_t>(2 * page_size)};
+  resources.create_k_tensors(kModelId, dims, torch::kUInt8, /*num_layers=*/1);
+  resources.create_v_tensors(kModelId, dims, torch::kUInt8, /*num_layers=*/1);
+  ASSERT_TRUE(resources.prepare_kv_mapping(
+      /*transaction_id=*/1, kModelId, {0, second_offset}));
+  ASSERT_TRUE(resources.commit_kv_mapping(/*transaction_id=*/1));
+  ASSERT_TRUE(resources.unmap_from_kv_tensors(kModelId, {0}));
+  ASSERT_TRUE(resources.map_to_kv_tensors(kModelId, {0}));
+  const auto reused = resources.get_global_offsets_for_block(
+      kModelId, /*layer_id=*/0, /*block_id=*/0, page_size);
+
+  ASSERT_TRUE(resources.abort_kv_mapping(/*transaction_id=*/1));
+  EXPECT_TRUE(resources.abort_kv_mapping(/*transaction_id=*/1));
+  EXPECT_EQ(pool.num_available(), kPoolPages - 2);
+  EXPECT_EQ(resources.get_global_offsets_for_block(
+                kModelId, /*layer_id=*/0, /*block_id=*/0, page_size),
+            reused);
+  EXPECT_EQ(resources.get_global_offsets_for_block(
+                kModelId, /*layer_id=*/0, /*block_id=*/1, page_size),
+            std::make_pair(UINT64_MAX, UINT64_MAX));
+  EXPECT_TRUE(resources.unmap_from_kv_tensors(kModelId, {0}));
+}
+
+TEST_F(WorkerMemoryResourcesTest, LateAbortPreservesReusedWeightModelName) {
+  auto& resources = WorkerMemoryResources::get_instance();
+  auto& pool = PhysicalPagePool::get_instance();
+  ASSERT_TRUE(resources.prepare_weight_pages(
+      /*transaction_id=*/1, kModelId, /*num_pages=*/2));
+  ASSERT_TRUE(resources.commit_weight_pages(/*transaction_id=*/1));
+  ASSERT_EQ(resources.free_weight(kModelId), 2);
+  ASSERT_TRUE(resources.alloc_weight_pages(kModelId, /*num_pages=*/2));
+  const auto reused = resources.get_weight_allocation_info(kModelId);
+  ASSERT_TRUE(reused.has_value());
+
+  ASSERT_TRUE(resources.abort_weight_pages(/*transaction_id=*/1));
+  EXPECT_FALSE(resources.prepare_weight_pages(
+      /*transaction_id=*/1, kModelId, /*num_pages=*/2));
+  const auto actual = resources.get_weight_allocation_info(kModelId);
+  ASSERT_TRUE(actual.has_value());
+  EXPECT_EQ(actual->base_ptr, reused->base_ptr);
+  EXPECT_EQ(actual->num_pages, reused->num_pages);
+  EXPECT_EQ(pool.num_available(), kPoolPages - 2);
+  EXPECT_EQ(resources.free_weight(kModelId), 2);
+}
+
+TEST_F(WorkerMemoryResourcesTest, ExecutionHeadroomNeverShrinksAcrossProfiles) {
+  auto& resources = WorkerMemoryResources::get_instance();
+  const size_t page_size = PhysicalPagePool::get_instance().page_size();
+  resources.set_execution_memory_reserve(2 * page_size);
+  resources.set_execution_memory_reserve(page_size);
+  const WorkerMemoryCapacity capacity = resources.memory_capacity_snapshot();
+  EXPECT_TRUE(capacity.pool_initialized);
+  EXPECT_EQ(capacity.pool_capacity_pages, kPoolPages);
+  EXPECT_EQ(capacity.execution_memory_reserve_bytes, 2 * page_size);
+}
+
+TEST_F(WorkerMemoryResourcesTest, WeightPrepareRollbackReleasesOnlyFreshPages) {
+  auto& resources = WorkerMemoryResources::get_instance();
+  auto& pool = PhysicalPagePool::get_instance();
+  ASSERT_TRUE(resources.alloc_weight_pages(kModelId, /*num_pages=*/2));
+  const auto before = resources.get_weight_allocation_info(kModelId);
+  ASSERT_TRUE(before.has_value());
+  EXPECT_FALSE(resources.prepare_weight_pages(
+      /*transaction_id=*/1, kModelId, /*num_pages=*/2));
+  ASSERT_TRUE(resources.abort_weight_pages(/*transaction_id=*/1));
+  EXPECT_EQ(pool.num_available(), kPoolPages - 2);
+  const auto after = resources.get_weight_allocation_info(kModelId);
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(after->base_ptr, before->base_ptr);
+  EXPECT_EQ(after->num_pages, before->num_pages);
+  EXPECT_EQ(resources.free_weight(kModelId), 2);
+
+  ASSERT_TRUE(resources.prepare_weight_pages(
+      /*transaction_id=*/2, kModelId, /*num_pages=*/3));
+  EXPECT_EQ(pool.num_available(), kPoolPages - 3);
+  ASSERT_TRUE(resources.commit_weight_pages(/*transaction_id=*/2));
+  ASSERT_TRUE(resources.abort_weight_pages(/*transaction_id=*/2));
+  EXPECT_TRUE(resources.abort_weight_pages(/*transaction_id=*/2));
+  EXPECT_EQ(pool.num_available(), kPoolPages);
+}
+
+TEST_F(WorkerMemoryResourcesTest, WeightAbortPreventsDelayedAllocation) {
+  auto& resources = WorkerMemoryResources::get_instance();
+  auto& pool = PhysicalPagePool::get_instance();
+  ASSERT_TRUE(resources.abort_weight_pages(/*transaction_id=*/17));
+  EXPECT_FALSE(resources.prepare_weight_pages(
+      /*transaction_id=*/17, kModelId, /*num_pages=*/2));
+  EXPECT_FALSE(resources.commit_weight_pages(/*transaction_id=*/17));
+  EXPECT_EQ(pool.num_available(), kPoolPages);
+}
+
+TEST_F(WorkerMemoryResourcesTest, WeightShortageIsAnAtomicRejection) {
+  auto& resources = WorkerMemoryResources::get_instance();
+  auto& pool = PhysicalPagePool::get_instance();
+  blocking_page_ids_ = pool.allocate_pages_from_right(kPoolPages - 1);
+  EXPECT_FALSE(resources.prepare_weight_pages(
+      /*transaction_id=*/1, kModelId, /*num_pages=*/2));
+  EXPECT_TRUE(resources.abort_weight_pages(/*transaction_id=*/1));
+  EXPECT_EQ(pool.num_available(), 1);
+  const auto allocation = resources.get_weight_allocation_info(kModelId);
+  EXPECT_TRUE(!allocation.has_value() || allocation->num_pages == 0);
 }
 
 }  // namespace

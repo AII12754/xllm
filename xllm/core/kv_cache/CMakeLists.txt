@@ -19,7 +19,7 @@ cc_library(
   NAME
     kv_cache_memory_interfaces
   HDRS
-    storage/virtual_kv_cache_page_allocator.h
+    storage/vmm_kv_page_allocator.h
     storage/kv_cache_page_backend.h
     storage/kv_cache_tensor_allocator.h
     layout/kv_cache_tensor_role.h
@@ -34,11 +34,11 @@ cc_library(
 # KV page queues and preallocation policy use an injected mapping backend.
 cc_library(
   NAME
-    virtual_kv_cache_page_allocator_impl
+    vmm_kv_page_allocator_impl
   HDRS
-    storage/virtual_kv_cache_page_allocator_impl.h
+    storage/vmm_kv_page_allocator_impl.h
   SRCS
-    storage/virtual_kv_cache_page_allocator_impl.cpp
+    storage/vmm_kv_page_allocator_impl.cpp
   DEPS
     :kv_cache_memory_interfaces
     :virtual_kv_cache_page_state
@@ -62,11 +62,11 @@ cc_library(
   HDRS
     storage/virtual_kv_cache_memory_regions.h
     storage/virtual_kv_cache_memory_registry.h
-    storage/virtual_kv_cache_tensor_allocator.h
+    storage/vmm_kv_tensor_allocator.h
   SRCS
     storage/virtual_kv_cache_memory_regions.cpp
     storage/virtual_kv_cache_memory_registry.cpp
-    storage/virtual_kv_cache_tensor_allocator.cpp
+    storage/vmm_kv_tensor_allocator.cpp
   DEPS
     :kv_cache_memory_interfaces
     :virtual_memory_torch

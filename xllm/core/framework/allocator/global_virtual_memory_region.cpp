@@ -37,7 +37,7 @@ void GlobalVirtualMemoryRegion::init(const torch::Device& device) {
   CHECK(pool.is_initialized()) << "PhysicalPagePool must be initialized first";
   CHECK_EQ(device, pool.device())
       << "GlobalVirtualMemoryRegion device mismatch";
-  mapping_->init(device, pool.get_all_pages(), pool.page_size());
+  pool.attach_shared_mapping(mapping_);
 }
 
 void GlobalVirtualMemoryRegion::reset() {
@@ -46,7 +46,7 @@ void GlobalVirtualMemoryRegion::reset() {
     return;
   }
 
-  CHECK_EQ(mapping_.use_count(), 1)
+  CHECK(PhysicalPagePool::get_instance().detach_shared_mapping(mapping_.get()))
       << "GlobalVirtualMemoryRegion has active mapping leases";
   mapping_->reset();
 }
@@ -55,7 +55,17 @@ std::shared_ptr<void> GlobalVirtualMemoryRegion::acquire_mapping_lease() {
   std::lock_guard<std::mutex> lock(mutex_);
   CHECK(mapping_->is_initialized())
       << "GlobalVirtualMemoryRegion is not initialized";
-  return std::shared_ptr<void>(mapping_, mapping_->base_vaddr());
+  return PhysicalPagePool::get_instance().acquire_shared_mapping_lease();
+}
+
+std::shared_ptr<void>
+GlobalVirtualMemoryRegion::try_acquire_contiguous_mapping_lease() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!mapping_->is_initialized()) {
+    return nullptr;
+  }
+  return PhysicalPagePool::get_instance().acquire_shared_mapping_lease(
+      /*require_contiguous=*/true);
 }
 
 }  // namespace xllm

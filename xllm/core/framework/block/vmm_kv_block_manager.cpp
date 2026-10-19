@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/block/virtual_memory_kv_cache_block_manager.h"
+#include "core/framework/block/vmm_kv_block_manager.h"
 
 #include <glog/logging.h>
 
@@ -23,14 +23,13 @@ limitations under the License.
 
 namespace xllm {
 
-VirtualMemoryKVCacheBlockManager::VirtualMemoryKVCacheBlockManager(
-    const Options& options,
-    VirtualKVCachePageAllocator& page_allocator,
-    int64_t num_layers,
-    size_t block_mem_size,
-    size_t page_size,
-    int32_t dp_rank,
-    const std::string& model_id)
+VmmKVBlockManager::VmmKVBlockManager(const Options& options,
+                                     VmmKVPageAllocator& page_allocator,
+                                     int64_t num_layers,
+                                     size_t block_mem_size,
+                                     size_t page_size,
+                                     int32_t dp_rank,
+                                     const std::string& model_id)
     : BlockManager(options),
       page_allocator_(page_allocator),
       model_id_(model_id),
@@ -39,7 +38,7 @@ VirtualMemoryKVCacheBlockManager::VirtualMemoryKVCacheBlockManager(
       page_size_(page_size),
       block_mem_size_(block_mem_size),
       num_avail_blocks_(0) {
-  LOG(INFO) << "VirtualMemoryKVCacheBlockManager initialized: "
+  LOG(INFO) << "VmmKVBlockManager initialized: "
             << "model_id=" << model_id_ << ", dp_rank=" << dp_rank_
             << ", num_layers=" << num_layers_ << ", page_size=" << page_size_
             << ", block_size=" << options.block_size()
@@ -47,7 +46,7 @@ VirtualMemoryKVCacheBlockManager::VirtualMemoryKVCacheBlockManager(
             << ", num_blocks=" << options.num_blocks();
 }
 
-void VirtualMemoryKVCacheBlockManager::reserve_virtual_memory_padding_blocks() {
+void VmmKVBlockManager::reserve_virtual_memory_padding_blocks() {
   // Reserve the first block as padding block for padding tokens
   auto padding_blocks = alloc_internal(1);
   if (padding_blocks.empty() || padding_blocks[0] != 0) {
@@ -57,7 +56,7 @@ void VirtualMemoryKVCacheBlockManager::reserve_virtual_memory_padding_blocks() {
   padding_block_ = padding_blocks[0];
 }
 
-VirtualMemoryKVCacheBlockManager::~VirtualMemoryKVCacheBlockManager() {
+VmmKVBlockManager::~VmmKVBlockManager() {
   // Release all pages
   std::lock_guard<std::mutex> lock(mtx_);
   std::vector<int64_t> page_ids;
@@ -75,15 +74,8 @@ VirtualMemoryKVCacheBlockManager::~VirtualMemoryKVCacheBlockManager() {
   }
 }
 
-std::vector<int32_t> VirtualMemoryKVCacheBlockManager::alloc_internal(
-    size_t need_size) {
+std::vector<int32_t> VmmKVBlockManager::alloc_internal(size_t need_size) {
   std::lock_guard<std::mutex> lock(mtx_);
-
-  size_t avail = available_size_internal();
-  if (avail < need_size) {
-    LOG(WARNING) << "available_size()=" << avail
-                 << " < need_size=" << need_size;
-  }
 
   std::vector<int32_t> ret_index;
   ret_index.reserve(need_size);
@@ -146,8 +138,7 @@ std::vector<int32_t> VirtualMemoryKVCacheBlockManager::alloc_internal(
   return ret_index;
 }
 
-std::vector<Block> VirtualMemoryKVCacheBlockManager::allocate(
-    size_t num_blocks) {
+std::vector<Block> VmmKVBlockManager::allocate(size_t num_blocks) {
   auto indices = alloc_internal(num_blocks);
   if (indices.size() != num_blocks) {
     free_blocks(indices);
@@ -162,19 +153,19 @@ std::vector<Block> VirtualMemoryKVCacheBlockManager::allocate(
   return blocks;
 }
 
-std::optional<std::vector<Block>>
-VirtualMemoryKVCacheBlockManager::allocate_for_sequence(Sequence* seq,
-                                                        size_t num_tokens) {
+std::optional<std::vector<Block>> VmmKVBlockManager::allocate_for_sequence(
+    Sequence* seq,
+    size_t num_tokens) {
   if (seq == nullptr) {
     return std::nullopt;
   }
   return allocate_for_sequence(seq, seq->kv_state(), num_tokens);
 }
 
-std::optional<std::vector<Block>>
-VirtualMemoryKVCacheBlockManager::allocate_for_sequence(Sequence* seq,
-                                                        KVCacheState& kv_state,
-                                                        size_t num_tokens) {
+std::optional<std::vector<Block>> VmmKVBlockManager::allocate_for_sequence(
+    Sequence* seq,
+    KVCacheState& kv_state,
+    size_t num_tokens) {
   if (seq == nullptr) {
     return std::nullopt;
   }
@@ -195,7 +186,7 @@ VirtualMemoryKVCacheBlockManager::allocate_for_sequence(Sequence* seq,
   return blocks;
 }
 
-Block VirtualMemoryKVCacheBlockManager::allocate() {
+Block VmmKVBlockManager::allocate() {
   auto blocks = allocate(1);
   if (blocks.empty()) {
     return Block();  // Invalid block
@@ -203,8 +194,7 @@ Block VirtualMemoryKVCacheBlockManager::allocate() {
   return std::move(blocks[0]);
 }
 
-void VirtualMemoryKVCacheBlockManager::free_blocks(
-    const std::vector<int32_t>& indices) {
+void VmmKVBlockManager::free_blocks(const std::vector<int32_t>& indices) {
   std::lock_guard<std::mutex> lock(mtx_);
 
   if (indices.empty()) {
@@ -271,17 +261,14 @@ void VirtualMemoryKVCacheBlockManager::free_blocks(
   }
 }
 
-void VirtualMemoryKVCacheBlockManager::deallocate(
-    const Slice<Block>& /*blocks*/) {
+void VmmKVBlockManager::deallocate(const Slice<Block>& /*blocks*/) {
   // No-op: Block destructor will call free() when ref_count reaches 0
   // Prefix cache is not supported in VirtualMemory mode
 }
 
-void VirtualMemoryKVCacheBlockManager::free(int32_t block_id) {
-  free_blocks({block_id});
-}
+void VmmKVBlockManager::free(int32_t block_id) { free_blocks({block_id}); }
 
-std::vector<Block> VirtualMemoryKVCacheBlockManager::allocate_shared(
+std::vector<Block> VmmKVBlockManager::allocate_shared(
     const Slice<int32_t>& /*token_ids*/,
     const Slice<Block>& /*existed_shared_blocks*/,
     const MMData& /*mm_data*/,
@@ -291,55 +278,56 @@ std::vector<Block> VirtualMemoryKVCacheBlockManager::allocate_shared(
   return {};
 }
 
-void VirtualMemoryKVCacheBlockManager::cache(
-    const Slice<int32_t>& /*token_ids*/,
-    std::vector<Block>& /*blocks*/,
-    size_t /*existed_shared_blocks_num*/,
-    const MMData& /*mm_data*/,
-    const Slice<XXH3Key>& /*block_hashes*/) {
+void VmmKVBlockManager::cache(const Slice<int32_t>& /*token_ids*/,
+                              std::vector<Block>& /*blocks*/,
+                              size_t /*existed_shared_blocks_num*/,
+                              const MMData& /*mm_data*/,
+                              const Slice<XXH3Key>& /*block_hashes*/) {
   // Prefix cache not supported
   VLOG(1) << "cache called but prefix cache is not supported";
   return;
 }
 
-void VirtualMemoryKVCacheBlockManager::cache(
-    const std::vector<Block>& /*blocks*/) {
+void VmmKVBlockManager::cache(const std::vector<Block>& /*blocks*/) {
   // Prefix cache not supported
   VLOG(1) << "cache called but prefix cache is not supported";
   return;
 }
 
-size_t VirtualMemoryKVCacheBlockManager::num_free_blocks() const {
-  return available_size();
-}
+size_t VmmKVBlockManager::num_free_blocks() const { return available_size(); }
 
-size_t VirtualMemoryKVCacheBlockManager::num_used_blocks() const {
+size_t VmmKVBlockManager::num_used_blocks() const {
   std::lock_guard<std::mutex> lock(mtx_);
   return get_num_allocated_blocks();
 }
 
-double VirtualMemoryKVCacheBlockManager::kv_cache_utilization() const {
+double VmmKVBlockManager::kv_cache_utilization() const {
   std::lock_guard<std::mutex> lock(mtx_);
   size_t total = num_total_blocks();
   if (total == 0) return 0.0;
   return static_cast<double>(get_num_allocated_blocks()) / total;
 }
 
-size_t VirtualMemoryKVCacheBlockManager::num_total_blocks() const {
+size_t VmmKVBlockManager::num_total_blocks() const {
   return options_.num_blocks();
 }
 
-size_t VirtualMemoryKVCacheBlockManager::available_size_internal() const {
+size_t VmmKVBlockManager::admission_capacity() const {
+  std::lock_guard<std::mutex> lock(mtx_);
+  return std::min(static_cast<size_t>(options_.num_blocks()),
+                  get_num_allocated_blocks() + available_size_internal());
+}
+
+size_t VmmKVBlockManager::available_size_internal() const {
   // Note: Caller must hold mtx_
   size_t avail_blocks = num_avail_blocks_.load() + reserved_blocks_.size();
 
-  // Conservative approach: only count reserved pages (already mapped to
-  // physical memory). free_page_list_ pages are not counted because they
-  // require physical memory mapping which may fail if GPU memory is
-  // insufficient.
+  // An empty elastic pool can grow within its live execution budget. The
+  // snapshot is advisory: alloc_internal commits mappings and rolls back the
+  // complete block batch if the actual reservation fails.
   auto& page_allocator = page_allocator_;
   size_t reserved_pages =
-      page_allocator.get_num_reserved_virt_pages(model_id_, dp_rank_);
+      page_allocator.get_num_available_virt_pages(model_id_, dp_rank_);
   size_t blocks_from_reserved_pages =
       reserved_pages *
       VirtualKVCachePageState::get_num_blocks(page_size_, block_mem_size_);
@@ -347,12 +335,12 @@ size_t VirtualMemoryKVCacheBlockManager::available_size_internal() const {
   return avail_blocks + blocks_from_reserved_pages;
 }
 
-size_t VirtualMemoryKVCacheBlockManager::available_size() const {
+size_t VmmKVBlockManager::available_size() const {
   std::lock_guard<std::mutex> lock(mtx_);
   return available_size_internal();
 }
 
-bool VirtualMemoryKVCacheBlockManager::try_to_reserve(size_t need_size) {
+bool VmmKVBlockManager::try_to_reserve(size_t need_size) {
   // Check available size first (consistent with Python version)
   if (available_size() < need_size) {
     return false;
@@ -360,7 +348,10 @@ bool VirtualMemoryKVCacheBlockManager::try_to_reserve(size_t need_size) {
 
   // alloc_internal will acquire mtx_ internally
   auto reserved = alloc_internal(need_size);
-  if (reserved.empty()) {
+  if (reserved.size() != need_size) {
+    // The live device budget can shrink after the advisory capacity check.
+    // A failed reservation must not retain a partially allocated block batch.
+    free_blocks(reserved);
     LOG(WARNING) << "Failed to reserve blocks.";
     return false;
   }
@@ -371,7 +362,7 @@ bool VirtualMemoryKVCacheBlockManager::try_to_reserve(size_t need_size) {
   return true;
 }
 
-void VirtualMemoryKVCacheBlockManager::free_reserved() {
+void VmmKVBlockManager::free_reserved() {
   std::vector<int32_t> blocks_to_free;
   {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -385,12 +376,12 @@ void VirtualMemoryKVCacheBlockManager::free_reserved() {
   free_blocks(blocks_to_free);
 }
 
-void VirtualMemoryKVCacheBlockManager::trim() {
+void VmmKVBlockManager::trim() {
   std::lock_guard<std::mutex> lock(mtx_);
   page_allocator_.trim_kv_cache(model_id_, dp_rank_);
 }
 
-size_t VirtualMemoryKVCacheBlockManager::get_mapped_memory_size() const {
+size_t VmmKVBlockManager::get_mapped_memory_size() const {
   auto& page_allocator = page_allocator_;
   // Each virtual page uses phy_pages_per_virt_page physical pages
   // Each physical page is phy_page_size bytes
@@ -399,7 +390,7 @@ size_t VirtualMemoryKVCacheBlockManager::get_mapped_memory_size() const {
          page_allocator.page_size();
 }
 
-size_t VirtualMemoryKVCacheBlockManager::get_num_allocated_blocks() const {
+size_t VmmKVBlockManager::get_num_allocated_blocks() const {
   // Blocks from fully allocated pages
   size_t blocks_per_page =
       VirtualKVCachePageState::get_num_blocks(page_size_, block_mem_size_);
@@ -412,11 +403,10 @@ size_t VirtualMemoryKVCacheBlockManager::get_num_allocated_blocks() const {
   size_t blocks_from_avail_pages =
       avail_pages_.size() * blocks_per_page - num_avail_blocks_.load();
 
-  // Blocks from reserved blocks
-  size_t blocks_from_reserved = reserved_blocks_.size();
-
-  return blocks_from_full_pages + blocks_from_avail_pages +
-         blocks_from_reserved;
+  // Page state has already marked reserved blocks occupied, but they remain
+  // available to the next allocation. Count them only in available_size().
+  return blocks_from_full_pages + blocks_from_avail_pages -
+         reserved_blocks_.size();
 }
 
 }  // namespace xllm

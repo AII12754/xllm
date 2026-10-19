@@ -30,7 +30,7 @@ limitations under the License.
 #include "core/framework/allocator/virtual_memory/physical_page_pool.h"
 #include "core/framework/allocator/virtual_memory/shared_physical_page_mapping.h"
 #include "core/kv_cache/storage/kv_cache.h"
-#include "core/kv_cache/storage/virtual_kv_cache_tensor_allocator.h"
+#include "core/kv_cache/storage/vmm_kv_tensor_allocator.h"
 #include "core/platform/vmm_api.h"
 #include "tests/npu_test_environment.h"
 
@@ -243,6 +243,44 @@ class VirtualIndexedKVCacheMemoryRegistryTest
 };
 
 TEST_F(VirtualKVCacheMemoryRegistryTest,
+       PrepareRejectsDuplicateAndInvalidOffsetsWithoutAllocation) {
+  create_model("model", /*num_layers=*/1);
+  const size_t available = PhysicalPagePool::get_instance().num_available();
+  EXPECT_TRUE(registry_.can_prepare_mapping("model", {0}));
+  EXPECT_FALSE(registry_.can_prepare_mapping("missing", {0}));
+  EXPECT_FALSE(registry_.can_prepare_mapping("model", {0, 0}));
+  EXPECT_FALSE(registry_.can_prepare_mapping("model", {-1}));
+  EXPECT_FALSE(registry_.can_prepare_mapping("model", {1}));
+  EXPECT_FALSE(registry_.can_prepare_mapping(
+      "model", {static_cast<offset_t>(page_size_)}));
+  EXPECT_EQ(PhysicalPagePool::get_instance().num_available(), available);
+  EXPECT_EQ(registry_.get_global_offsets_for_block(
+                "model", /*layer_id=*/0, /*block_id=*/0, page_size_),
+            std::make_pair(UINT64_MAX, UINT64_MAX));
+}
+
+TEST_F(VirtualKVCacheMemoryRegistryTest,
+       PrepareRejectsExistingMappingsWithoutChangingOwnership) {
+  const std::vector<int64_t> dims{static_cast<int64_t>(2 * page_size_)};
+  registry_.create_k_tensors("model", dims, torch::kUInt8, /*num_layers=*/1);
+  registry_.create_v_tensors("model", dims, torch::kUInt8, /*num_layers=*/1);
+  ASSERT_TRUE(registry_.map("model", {0}));
+  const auto existing = registry_.get_global_offsets_for_block(
+      "model", /*layer_id=*/0, /*block_id=*/0, page_size_);
+  EXPECT_FALSE(registry_.can_prepare_mapping("model", {0}));
+  EXPECT_FALSE(registry_.can_prepare_mapping(
+      "model", {0, static_cast<offset_t>(page_size_)}));
+  EXPECT_TRUE(registry_.can_prepare_mapping(
+      "model", {static_cast<offset_t>(page_size_)}));
+  EXPECT_EQ(registry_.get_global_offsets_for_block(
+                "model", /*layer_id=*/0, /*block_id=*/0, page_size_),
+            existing);
+  EXPECT_EQ(PhysicalPagePool::get_instance().num_available(), kPoolPages - 2);
+  ASSERT_TRUE(registry_.unmap("model", {0}));
+  EXPECT_TRUE(registry_.can_prepare_mapping("model", {0}));
+}
+
+TEST_F(VirtualKVCacheMemoryRegistryTest,
        ModelsKeepIndependentMappingsAndMetadata) {
   create_model("first", /*num_layers=*/1);
   create_model("second", /*num_layers=*/1);
@@ -301,8 +339,8 @@ TEST_F(VirtualKVCacheMemoryRegistryTest,
 
 TEST_F(VirtualKVCacheMemoryRegistryTest,
        TensorAllocatorUsesItsInjectedRegistry) {
-  auto allocator = create_virtual_kv_cache_tensor_allocator(
-      registry_, "model", /*num_layers=*/2);
+  auto allocator =
+      create_vmm_kv_tensor_allocator(registry_, "model", /*num_layers=*/2);
   const std::vector<int64_t> shape{static_cast<int64_t>(page_size_ / 2)};
   const torch::Tensor first_key = allocator->allocate(
       KVCacheTensorRole::KEY, shape, torch::kBFloat16, device_);
@@ -658,7 +696,7 @@ TEST_F(VirtualIndexedKVCacheMemoryRegistryTest,
 TEST_F(VirtualIndexedKVCacheMemoryRegistryTest,
        TensorAllocatorSkipsSharedIndexLayers) {
   const std::vector<bool> index_layer_owned{false, true, false, true};
-  auto allocator = create_virtual_kv_cache_tensor_allocator(
+  auto allocator = create_vmm_kv_tensor_allocator(
       registry_, "indexed", /*num_layers=*/4, index_layer_owned);
   const std::vector<int64_t> key_shape{
       blocks_per_page(), kBlockSize, 1, kLatentSize};
@@ -692,8 +730,8 @@ TEST_F(VirtualIndexedKVCacheMemoryRegistryTest,
 
 TEST_F(VirtualIndexedKVCacheMemoryRegistryTest,
        DefaultIndexOwnershipMapsAllLayersAndRejectsTransfer) {
-  auto allocator = create_virtual_kv_cache_tensor_allocator(
-      registry_, "indexed", /*num_layers=*/2);
+  auto allocator =
+      create_vmm_kv_tensor_allocator(registry_, "indexed", /*num_layers=*/2);
   const std::vector<int64_t> shape{blocks_per_page(), kBlockSize, 1, kRopeSize};
   std::vector<torch::Tensor> indices;
   for (size_t layer = 0; layer < 2; ++layer) {
@@ -778,7 +816,7 @@ TEST_F(VirtualIndexedKVCacheMemoryRegistryTest,
       shape.index_cache_shape(),
       (std::vector<int64_t>{2 * blocks_per_group, kBlockSize, 1, kIndexSize}));
 
-  auto virtual_allocator = create_virtual_kv_cache_tensor_allocator(
+  auto virtual_allocator = create_vmm_kv_tensor_allocator(
       registry_, "indexed", /*num_layers=*/3, index_layer_owned);
   auto allocator = std::make_shared<RecordingForwardingKVCacheTensorAllocator>(
       std::move(virtual_allocator));

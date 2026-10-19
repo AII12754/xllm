@@ -5,6 +5,16 @@ include(cc_test)
 
 cc_test(
   NAME
+    vmm_memory_budget_test
+  NO_NPU_RUNTIME
+  SRCS
+    vmm_memory_budget_test.cpp
+  DEPS
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     worker_physical_page_budget_test
   NO_NPU_RUNTIME
   SRCS
@@ -28,6 +38,20 @@ cc_test(
 )
 
 if(USE_NPU)
+  # Injected growth boundaries exercise pool transactions without a device or
+  # Python/NPU initialization; real mapping coverage stays in virtual_memory_test.
+  cc_test(
+    NAME
+      physical_page_pool_test
+    NO_NPU_RUNTIME
+    SRCS
+      physical_page_pool_test.cpp
+    DEPS
+      :virtual_memory
+      GTest::gtest_main
+      glog::glog
+  )
+
   cc_test(
     NAME
       virtual_memory_test

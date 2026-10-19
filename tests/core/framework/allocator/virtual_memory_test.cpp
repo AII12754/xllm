@@ -309,6 +309,95 @@ TEST_F(VirtualMemoryTest, SharedMappingLeasePreventsReset) {
   EXPECT_FALSE(global_tensor.is_initialized());
 }
 
+TEST_F(VirtualMemoryTest, LazyBackingGrowsAndTrimsWithoutMovingLiveAliases) {
+  auto& pool = PhysicalPagePool::get_instance();
+  ASSERT_TRUE(pool.reset());
+  pool.init(device_, kPoolPages, page_size_, /*lazy=*/true);
+  auto& global = GlobalVirtualMemoryRegion::get_instance();
+  global.init(device_);
+  void* const base = global.base_vaddr();
+  EXPECT_EQ(pool.num_committed(), 0);
+  EXPECT_EQ(global.try_acquire_contiguous_mapping_lease(), nullptr);
+  MappedVirtualMemoryRegion region(2 * page_size_, device_, page_size_);
+  ASSERT_TRUE(region.map_all());
+  ASSERT_EQ(pool.num_committed(), 2);
+  const page_id_t first_id = region.get_phy_page_id(/*offset=*/0);
+  const offset_t second_offset = static_cast<offset_t>(page_size_);
+  const page_id_t live_id = region.get_phy_page_id(second_offset);
+  void* const live_alias = global.get_vaddr_by_page_id(live_id);
+  ASSERT_NE(live_alias, nullptr);
+  const std::vector<uint8_t> expected(128, 0x2a);
+  ASSERT_EQ(aclrtMemcpy(live_alias,
+                        expected.size(),
+                        expected.data(),
+                        expected.size(),
+                        ACL_MEMCPY_HOST_TO_DEVICE),
+            ACL_SUCCESS);
+  ASSERT_TRUE(region.unmap(/*offset=*/0));
+  EXPECT_EQ(pool.trim_idle(/*keep_pages=*/0), 1);
+  EXPECT_EQ(pool.num_committed(), 1);
+  EXPECT_EQ(global.base_vaddr(), base);
+  EXPECT_EQ(global.get_vaddr_by_page_id(first_id), nullptr);
+  EXPECT_EQ(global.get_vaddr_by_page_id(live_id), live_alias);
+  std::vector<uint8_t> observed(expected.size());
+  ASSERT_EQ(aclrtMemcpy(observed.data(),
+                        observed.size(),
+                        live_alias,
+                        observed.size(),
+                        ACL_MEMCPY_DEVICE_TO_HOST),
+            ACL_SUCCESS);
+  EXPECT_EQ(observed, expected);
+  ASSERT_TRUE(region.map(/*offset=*/0));
+  EXPECT_EQ(region.get_phy_page_id(/*offset=*/0), first_id);
+  EXPECT_EQ(global.base_vaddr(), base);
+  EXPECT_NE(global.get_vaddr_by_page_id(first_id), nullptr);
+}
+
+TEST_F(VirtualMemoryTest,
+       ElasticPoolRejectsContiguousLeaseEvenWhenFullyResident) {
+  auto& pool = PhysicalPagePool::get_instance();
+  ASSERT_TRUE(pool.reset());
+  pool.init(device_, kPoolPages, page_size_, /*lazy=*/true);
+  auto& global = GlobalVirtualMemoryRegion::get_instance();
+  global.init(device_);
+  MappedVirtualMemoryRegion region(
+      kPoolPages * page_size_, device_, page_size_);
+  ASSERT_TRUE(region.map_all());
+  ASSERT_TRUE(region.unmap_all());
+  EXPECT_EQ(global.try_acquire_contiguous_mapping_lease(), nullptr);
+  EXPECT_EQ(pool.trim_idle(/*keep_pages=*/0), kPoolPages);
+  EXPECT_EQ(pool.num_committed(), 0);
+  EXPECT_EQ(global.try_acquire_contiguous_mapping_lease(), nullptr);
+}
+
+TEST_F(VirtualMemoryTest, FixedPoolContiguousLeasePinsResidentBacking) {
+  auto& pool = PhysicalPagePool::get_instance();
+  ASSERT_TRUE(pool.reset());
+  pool.init(device_, kPoolPages, page_size_, /*lazy=*/false);
+  auto& global = GlobalVirtualMemoryRegion::get_instance();
+  global.init(device_);
+  auto lease = global.try_acquire_contiguous_mapping_lease();
+  ASSERT_NE(lease, nullptr);
+  EXPECT_EQ(pool.trim_idle(/*keep_pages=*/0), 0);
+  EXPECT_EQ(pool.num_committed(), kPoolPages);
+  lease.reset();
+  EXPECT_EQ(pool.trim_idle(/*keep_pages=*/0), 0);
+  EXPECT_EQ(pool.num_committed(), kPoolPages);
+}
+
+TEST_F(VirtualMemoryTest, LazyGrowthHeadroomFailureMapsNoKvPages) {
+  auto& pool = PhysicalPagePool::get_instance();
+  ASSERT_TRUE(pool.reset());
+  pool.init(device_, kPoolPages, page_size_, /*lazy=*/true);
+  pool.set_allocation_headroom(std::numeric_limits<size_t>::max());
+  MappedVirtualMemoryRegion region(2 * page_size_, device_, page_size_);
+  EXPECT_FALSE(region.map_all());
+  EXPECT_EQ(region.get_phy_page_id(/*offset=*/0), -1);
+  EXPECT_EQ(region.get_phy_page_id(static_cast<offset_t>(page_size_)), -1);
+  EXPECT_EQ(pool.num_available(), kPoolPages);
+  EXPECT_EQ(pool.num_committed(), 0);
+}
+
 TEST_F(VirtualMemoryTest, VirtualSizeOverflowIsRejectedBeforeReservation) {
   EXPECT_DEATH(MappedVirtualMemoryRegion(
                    std::numeric_limits<size_t>::max(), device_, page_size_),

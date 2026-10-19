@@ -21,6 +21,7 @@ limitations under the License.
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <unordered_set>
 #include <utility>
 
 #include "core/framework/allocator/torch/mapped_virtual_memory_tensor_view.h"
@@ -260,6 +261,22 @@ bool VirtualKVCacheMemoryRegions::collect_page_targets(
     }
   }
   return true;
+}
+
+bool VirtualKVCacheMemoryRegions::can_prepare_mapping(
+    const std::vector<offset_t>& offsets) const {
+  const std::unordered_set<offset_t> unique_offsets(offsets.begin(),
+                                                    offsets.end());
+  if (unique_offsets.size() != offsets.size()) {
+    return false;
+  }
+  std::vector<std::pair<MappedVirtualMemoryRegion*, offset_t>> targets;
+  if (!collect_page_targets(offsets, targets)) {
+    return false;
+  }
+  return std::all_of(targets.begin(), targets.end(), [](const auto& target) {
+    return target.first->get_phy_page_id(target.second) < 0;
+  });
 }
 
 bool VirtualKVCacheMemoryRegions::map(const std::vector<offset_t>& offsets) {

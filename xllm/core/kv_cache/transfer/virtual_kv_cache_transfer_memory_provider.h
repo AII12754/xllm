@@ -32,6 +32,10 @@ struct VirtualKVCacheTransferMemoryRegion {
   size_t size_bytes = 0;
   std::shared_ptr<void> lifetime;
   size_t page_size_bytes = 0;
+  // Mooncake's buffer-0 protocol registers one fully backed virtual range. A
+  // reserved arena with unmapped slots cannot be passed to the transport. The
+  // provider must acquire a lease atomically with the residency check.
+  bool fully_resident = false;
 };
 
 // The runtime supplies shared mappings and physical byte offsets for virtual

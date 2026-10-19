@@ -54,6 +54,8 @@ class KVCacheConfig final {
          "max_linear_state_cache_slots",
          "xxh3_128bits_seed",
          "enable_virtual_memory",
+         "vmm_elastic",
+         "vmm_memory_reserve_bytes",
          "phy_page_granularity_size"}};
     return kOptionCategory;
   }
@@ -78,6 +80,11 @@ class KVCacheConfig final {
   PROPERTY(uint32_t, xxh3_128bits_seed) = 1024;
 
   PROPERTY(bool, enable_virtual_memory) = false;
+
+  // Fixed arenas remain explicit for transports requiring dense registration.
+  PROPERTY(bool, vmm_elastic) = true;
+
+  PROPERTY(int64_t, vmm_memory_reserve_bytes) = 0;
 
   PROPERTY(int64_t, phy_page_granularity_size) = 2 * 1024 * 1024;
 };

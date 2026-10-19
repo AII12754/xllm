@@ -66,8 +66,8 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | Parameter | Type | Default | Description |
 |:----------|:-----|:--------|:------------|
 | `block_size` | `int32` | `128` | Number of slots per KV Cache block. |
-| `max_cache_size` | `int64` | `0` | Maximum GPU memory size for KV Cache. `0` means calculated from available memory. |
-| `max_memory_utilization` | `double` | `0.8` | Fraction of GPU memory used for model inference, including model weights and KV Cache. |
+| `max_cache_size` | `int64` | `0` | Maximum KV Cache size in bytes. With virtual memory, caps the shared KV/weight pool. `0` leaves the explicit byte ceiling unset and derives capacity from available memory. |
+| `max_memory_utilization` | `double` | `0.8` | Fraction of device memory used for model inference, including model weights and KV Cache. Must be in `(0, 1]`; elastic virtual memory additionally accepts `0` to disable this capacity ceiling. |
 | `kv_cache_dtype` | `string` | `"auto"` | KV Cache dtype for quantization. `auto` aligns with model dtype and disables quantization. `int8` enables INT8 quantization and is only supported on the MLU backend. |
 | `indexer_cache_dtype` | `string` | `"auto"` | Indexer cache dtype for models with an indexer cache. Supported values are `auto` and `int8`. `auto` aligns with model dtype and disables indexer cache quantization. `int8` enables INT8 indexer cache quantization. |
 | `enable_prefix_cache` | `bool` | `true` | Whether to enable prefix cache in the block manager. See [Prefix Cache](/en/features/prefix_cache/). |
@@ -75,8 +75,26 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | `enable_in_batch_prefix_cache` | `bool` | `false` | Whether to cache admitted prefill full blocks into the prefix cache so that later requests in the same batch can share them. |
 | `max_linear_state_cache_slots` | `int64` | `0` | Maximum number of active linear-attention state cache slots. `0` derives an automatic capacity from the available KV Cache budget. |
 | `xxh3_128bits_seed` | `uint32` | `1024` | Default XXH3 128-bit hash seed. |
-| `enable_virtual_memory` | `bool` | `false` | Enable virtual memory for model weights and KV Cache with the physical page pool. |
+| `enable_virtual_memory` | `bool` | `false` | Enable a shared virtual memory pool for model weights and KV Cache. `false` uses the original physical KV Cache implementation. |
+| `vmm_elastic` | `bool` | `true` | When virtual memory is enabled, allocate physical pages on demand and release idle backing. `false` allocates the fixed pool at startup. |
+| `vmm_memory_reserve_bytes` | `int64` | `0` | Additional device memory to keep free when elastic virtual memory grows, in bytes. Supplements runtime execution headroom; must be nonnegative. |
 | `phy_page_granularity_size` | `int64` | `2097152` | Granularity size of one physical page in bytes, default 2 MiB, for continuous KV Cache. |
+
+### Virtual KV Cache
+
+With `enable_virtual_memory=true` and `vmm_elastic=true`, physical backing grows as pages are mapped. Idle KV backing is released after the last block on a page is returned. The shared KV/weight pool's address capacity is established at startup from available device memory and the `max_memory_utilization` / `max_cache_size` ceilings. Elastic mode does not preallocate all of that capacity; a small nonzero utilization ratio still limits it. Growth and request admission use current worker memory budgets while preserving execution headroom.
+
+Append the following flags to an existing launch command to disable both explicit capacity ceilings and keep an additional 1 GiB free for execution:
+
+```bash
+--enable_virtual_memory=true \
+--vmm_elastic=true \
+--max_memory_utilization=0 \
+--max_cache_size=0 \
+--vmm_memory_reserve_bytes=1073741824
+```
+
+Tune the additional reserve from device measurements. `vmm_memory_reserve_bytes=0` still preserves runtime execution headroom. When using graphs with elastic virtual memory, startup warmup is required (`disable_graph_warmup=false`). PD KV transfer and remote weight transfer using Mooncake require a fully resident pool: use `vmm_elastic=false` and a positive `max_memory_utilization`. See [Elastic virtual KV](/en/dev_guide/code_arch/#elastic-virtual-kv) for details.
 
 ### kv_events_config
 

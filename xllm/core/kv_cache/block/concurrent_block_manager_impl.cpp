@@ -162,6 +162,11 @@ size_t ConcurrentBlockManagerImpl::num_total_blocks() const {
   return inner_->num_total_blocks();
 }
 
+size_t ConcurrentBlockManagerImpl::admission_capacity() const {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  return inner_->admission_capacity();
+}
+
 double ConcurrentBlockManagerImpl::kv_cache_utilization() const {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   return inner_->kv_cache_utilization();

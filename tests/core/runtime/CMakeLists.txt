@@ -75,6 +75,17 @@ if(USE_NPU)
   # Isolate runtime initialization and the device-0 page pool from other cases.
   set_tests_properties(
     WorkerMemoryResourcesTest.KvShortageLeavesEveryLayerUnmapped
+    WorkerMemoryResourcesTest.CommittedMappingRemainsReversibleUntilRetired
+    WorkerMemoryResourcesTest.AbortBeforePrepareBlocksDelayedRpc
+    WorkerMemoryResourcesTest.ExistingMappingsAreNeverOwnedByRollback
+    WorkerMemoryResourcesTest.LateAbortCannotTouchNewerMappings
+    WorkerMemoryResourcesTest.FailedPrepareDoesNotRetainPhysicalPages
+    WorkerMemoryResourcesTest.LateAbortPreservesNormallyRemappedKvPages
+    WorkerMemoryResourcesTest.LateAbortPreservesReusedWeightModelName
+    WorkerMemoryResourcesTest.ExecutionHeadroomNeverShrinksAcrossProfiles
+    WorkerMemoryResourcesTest.WeightPrepareRollbackReleasesOnlyFreshPages
+    WorkerMemoryResourcesTest.WeightAbortPreventsDelayedAllocation
+    WorkerMemoryResourcesTest.WeightShortageIsAnAtomicRejection
     PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE
   )
 

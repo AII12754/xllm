@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/types.h>
 
 #include <cstddef>
+#include <mutex>
 #include <vector>
 
 #include "core/framework/allocator/virtual_memory/physical_page.h"
@@ -25,8 +26,9 @@ limitations under the License.
 namespace xllm {
 
 // Maps physical pages into one shared virtual address range. Page ownership
-// remains with the caller, which must keep every page alive until reset().
-// Input pages must be in physical page_id order: pages[i]->page_id() == i.
+// remains with the caller until that slot is unmapped or reset(). Null input
+// slots reserve addresses without committing backing; resident pages follow
+// physical page_id order: pages[i]->page_id() == i.
 // Address lookup uses this pool order without changing page ownership.
 class SharedPhysicalPageMapping final {
  public:
@@ -42,6 +44,11 @@ class SharedPhysicalPageMapping final {
             size_t page_size);
   void reset();
 
+  // Add/remove backing without changing the reserved address range. Batch map
+  // failure removes only aliases added by that operation.
+  bool map_pages(const std::vector<PhysicalPage*>& pages);
+  void unmap_pages(const std::vector<page_id_t>& page_ids);
+
   bool is_initialized() const { return initialized_; }
   void* get_vaddr_by_page_id(page_id_t page_id) const;
   void* base_vaddr() const { return vir_ptr_to_void_ptr(vaddr_); }
@@ -50,14 +57,17 @@ class SharedPhysicalPageMapping final {
   size_t page_size() const { return page_size_; }
 
  private:
-  bool map_page(PhysicalPage* page, size_t offset);
-  bool map_all_pages(const std::vector<PhysicalPage*>& pages);
+  bool map_pages_locked(const std::vector<PhysicalPage*>& pages);
+  void unmap_pages_locked(const std::vector<page_id_t>& page_ids);
 
   bool initialized_ = false;
   VirPtr vaddr_ = {};
   size_t total_size_ = 0;
   size_t page_size_ = 0;
   size_t num_total_pages_ = 0;
+  torch::Device device_{torch::kCPU};
+  std::vector<PhysicalPage*> mapped_pages_;
+  mutable std::mutex mutex_;
 };
 
 }  // namespace xllm

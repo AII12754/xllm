@@ -51,6 +51,8 @@ class VirtualKVCacheMemoryRegistry final {
       int64_t num_layers,
       const std::vector<bool>& layer_owned = {});
 
+  bool can_prepare_mapping(const std::string& model_id,
+                           const std::vector<offset_t>& offsets) const;
   bool map(const std::string& model_id, const std::vector<offset_t>& offsets);
   bool unmap(const std::string& model_id, const std::vector<offset_t>& offsets);
   std::optional<int64_t> num_layers(const std::string& model_id) const;

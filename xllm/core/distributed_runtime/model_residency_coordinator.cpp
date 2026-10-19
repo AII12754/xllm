@@ -27,7 +27,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/model_loader/model_loader.h"
-#include "core/kv_cache/storage/virtual_kv_cache_page_allocator_impl.h"
+#include "core/kv_cache/storage/vmm_kv_page_allocator_impl.h"
 #include "core/runtime/worker_memory_resources.h"
 
 namespace xllm {
@@ -246,6 +246,14 @@ bool ModelResidencyCoordinator::wakeup(const WakeupOptions& options) {
     LOG(WARNING) << "wakeup requires --enable_virtual_memory=true";
     return false;
   }
+  if (KVCacheConfig::get_instance().enable_virtual_memory() &&
+      KVCacheConfig::get_instance().vmm_elastic() &&
+      !options.remote_addrs.empty()) {
+    // The current transport requires a dense, fully resident shared arena.
+    // Reject this capability before reserving or restoring model resources.
+    LOG(ERROR) << "Remote weight wakeup requires --vmm_elastic=false";
+    return false;
+  }
   if (distributed_worker_manager_ == nullptr ||
       distributed_worker_manager_->get_worker_clients().empty()) {
     LOG(ERROR) << "No worker clients available to wakeup.";
@@ -259,7 +267,7 @@ bool ModelResidencyCoordinator::wakeup(const WakeupOptions& options) {
 
   // Restore weight and KV cache pages before workers load or transfer weights.
   auto& coordinator = DistributedVirtualMemoryCoordinator::get_instance();
-  auto& pages = coordinator.virtual_kv_cache_page_allocator();
+  auto& pages = coordinator.vmm_kv_page_allocator();
   const auto plan = pages.begin_resume(options_.model_id);
   if (!plan.has_value()) {
     return false;
@@ -270,8 +278,23 @@ bool ModelResidencyCoordinator::wakeup(const WakeupOptions& options) {
                << options_.model_id;
     return false;
   }
-  pages.map_pages(options_.model_id, *plan);
-  coordinator.restore_weight_pages(options_.model_id);
+  if (!pages.map_pages(options_.model_id, *plan)) {
+    coordinator.release_model_memory_budget(options_.model_id, *plan);
+    pages.finish_resume(options_.model_id, /*success=*/false);
+    LOG(ERROR) << "Insufficient physical memory to restore KV pages for model "
+               << options_.model_id;
+    return false;
+  }
+  if (!coordinator.restore_weight_pages(options_.model_id)) {
+    // The weight transaction has already confirmed its rollback on every
+    // worker. Release restored KV before returning the combined reservation.
+    pages.unmap_pages(options_.model_id, *plan);
+    coordinator.release_model_memory_budget(options_.model_id, *plan);
+    pages.finish_resume(options_.model_id, /*success=*/false);
+    LOG(ERROR) << "Insufficient physical memory to restore weights for model "
+               << options_.model_id;
+    return false;
+  }
   pages.finish_resume(options_.model_id, /*success=*/true);
 
   LOG(INFO) << "Waking up model " << options_.model_id
@@ -311,7 +334,7 @@ bool ModelResidencyCoordinator::wakeup(const WakeupOptions& options) {
 
 bool ModelResidencyCoordinator::suspend_memory(bool skip_weight_release) {
   auto& coordinator = DistributedVirtualMemoryCoordinator::get_instance();
-  auto& pages = coordinator.virtual_kv_cache_page_allocator();
+  auto& pages = coordinator.vmm_kv_page_allocator();
   const auto plan = pages.begin_suspend(options_.model_id);
   if (!plan.has_value()) {
     return false;

@@ -2879,12 +2879,20 @@ bool packed_proto_to_forward_input_impl(
     return false;
   }
 
+  bool use_pinned_memory = false;
+#if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MUSA) || \
+    defined(USE_MLU)
+  use_pinned_memory =
+      ExecutionConfig::get_instance().use_contiguous_input_buffer();
+#endif
   forward_input.runtime.input_host_buffer =
       torch::empty({static_cast<int64_t>(payload.size())},
                    torch::TensorOptions()
                        .dtype(torch::kUInt8)
                        .device(torch::kCPU)
-                       .pinned_memory(true));
+                       // Contiguous device preparation reuses an owned pinned
+                       // payload; ordinary host decoding stays pageable.
+                       .pinned_memory(use_pinned_memory));
   std::memcpy(forward_input.runtime.input_host_buffer.data_ptr(),
               payload.data(),
               payload.size());

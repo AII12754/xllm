@@ -24,6 +24,7 @@ limitations under the License.
 #include "core/distributed_runtime/engine.h"
 #include "core/framework/block/block_manager_pool.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/request/incremental_decoder.h"
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/stopping_checker.h"
@@ -59,6 +60,22 @@ class ScopedDecodeGraphConfigSnapshot final {
   bool enable_graph_;
   bool enable_no_padding_;
   int32_t decode_batch_limit_;
+};
+
+class ScopedVmmConfigSnapshot final {
+ public:
+  ScopedVmmConfigSnapshot()
+      : enabled_(KVCacheConfig::get_instance().enable_virtual_memory()),
+        elastic_(KVCacheConfig::get_instance().vmm_elastic()) {}
+
+  ~ScopedVmmConfigSnapshot() {
+    KVCacheConfig::get_instance().enable_virtual_memory(enabled_).vmm_elastic(
+        elastic_);
+  }
+
+ private:
+  bool enabled_;
+  bool elastic_;
 };
 
 TEST(DecodeGraphExecutionShapeTest, DefaultProfileUsesCompatibilityShape) {
@@ -204,15 +221,33 @@ runtime::DecodeGraphExecutionShape make_decode_graph_execution_shape(
   return execution_shape;
 }
 
+class StaleCapacityBlockManagerPool final : public BlockManagerPool {
+ public:
+  using BlockManagerPool::BlockManagerPool;
+
+  std::vector<size_t> num_free_blocks() const override {
+    // A capacity sample can still report exhaustion after live KV is freed.
+    return std::vector<size_t>(num_used_blocks().size(), 0);
+  }
+};
+
 class RecordingProfileEngine final : public Engine {
  public:
-  explicit RecordingProfileEngine(bool overlap = false) : overlap_(overlap) {
+  explicit RecordingProfileEngine(bool overlap = false,
+                                  int32_t dp_size = 1,
+                                  bool stale_capacity_snapshot = false)
+      : overlap_(overlap) {
     BlockManagerPool::Options options;
     options.num_blocks(/*num_blocks=*/64)
         .block_size(/*block_size=*/4)
         .enable_prefix_cache(/*enable_prefix_cache=*/false)
         .max_seqs_per_batch(/*max_seqs_per_batch=*/8);
-    block_manager_ = std::make_unique<BlockManagerPool>(options, /*dp_size=*/1);
+    if (stale_capacity_snapshot) {
+      block_manager_ =
+          std::make_unique<StaleCapacityBlockManagerPool>(options, dp_size);
+    } else {
+      block_manager_ = std::make_unique<BlockManagerPool>(options, dp_size);
+    }
     observed_batches_.reserve(options.max_seqs_per_batch());
     observed_kv_capacities_.reserve(options.max_seqs_per_batch());
     observed_bootstrap_embeddings_.reserve(options.max_seqs_per_batch());
@@ -225,9 +260,11 @@ class RecordingProfileEngine final : public Engine {
   ForwardOutput step(BatchGroup& batches) {
     EXPECT_EQ(pending_steps_, 0);
     int32_t sequence_count = 0;
+    std::vector<int32_t> dp_ranks;
     for (Batch& batch : batches) {
       for (Sequence* sequence : batch.get_sequences()) {
         ++sequence_count;
+        dp_ranks.emplace_back(sequence->dp_rank());
         all_requests_marked_ =
             all_requests_marked_ && sequence->is_graph_warmup();
         observed_kv_capacities_.emplace_back(
@@ -237,14 +274,19 @@ class RecordingProfileEngine final : public Engine {
       }
     }
     observed_batches_.emplace_back(sequence_count);
+    observed_dp_ranks_.emplace_back(std::move(dp_ranks));
     pending_steps_ += overlap_ ? 1 : 0;
     return ForwardOutput();
   }
 
   void update_last_step_result(BatchGroup& batches) {
-    (void)batches;
     EXPECT_EQ(pending_steps_, 1);
-    EXPECT_GT(block_manager_->num_used_blocks().front(), 0);
+    const std::vector<size_t> used_blocks = block_manager_->num_used_blocks();
+    for (const Batch& batch : batches) {
+      for (const Sequence* sequence : batch.get_sequences()) {
+        EXPECT_GT(used_blocks[sequence->dp_rank()], 0);
+      }
+    }
     --pending_steps_;
   }
 
@@ -267,6 +309,9 @@ class RecordingProfileEngine final : public Engine {
   const std::vector<bool>& observed_bootstrap_embeddings() const {
     return observed_bootstrap_embeddings_;
   }
+  const std::vector<std::vector<int32_t>>& observed_dp_ranks() const {
+    return observed_dp_ranks_;
+  }
 
  private:
   std::unique_ptr<BlockManagerPool> block_manager_;
@@ -277,6 +322,7 @@ class RecordingProfileEngine final : public Engine {
   std::vector<int32_t> observed_batches_;
   std::vector<size_t> observed_kv_capacities_;
   std::vector<bool> observed_bootstrap_embeddings_;
+  std::vector<std::vector<int32_t>> observed_dp_ranks_;
 };
 
 TEST(GraphWarmupTest, BuildsCanonicalBuckets) {
@@ -738,6 +784,120 @@ TEST(GraphWarmupTest, OrdinaryStepsWarmBucketsAndDrainBeforeReleasingKv) {
   config.acl_graph_decode_batch_size_limit(previous_limit);
 #else
   GTEST_SKIP() << "Startup graph warmup is disabled on this platform.";
+#endif
+}
+
+TEST(GraphWarmupTest, ElasticEagerWarmupExercisesEveryDpAndDrainsOverlap) {
+#if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MLU)
+  ScopedDecodeGraphConfigSnapshot execution_snapshot;
+  ScopedVmmConfigSnapshot cache_snapshot;
+  ExecutionConfig::get_instance().enable_graph(false);
+  KVCacheConfig::get_instance().enable_virtual_memory(true).vmm_elastic(true);
+  RecordingProfileEngine engine(/*overlap=*/true, /*dp_size=*/2);
+  const auto used_blocks = engine.block_manager_pool()->num_used_blocks();
+  ProfileManager::Options options;
+  options.max_tokens_per_batch(20)
+      .max_seqs_per_batch(4)
+      .dp_size(2)
+      .enable_schedule_overlap(true)
+      .enable_profile_step_time(false)
+      .instance_role(InstanceRole::DEFAULT);
+
+  ProfileManager profile_manager(&engine, options);
+
+  EXPECT_EQ(engine.observed_batches(),
+            (std::vector<int32_t>{2, 4, 4, 2, 4, 4}));
+  EXPECT_EQ(engine.observed_dp_ranks(),
+            (std::vector<std::vector<int32_t>>{{0, 0},
+                                               {0, 0, 0, 0},
+                                               {0, 0, 0, 0},
+                                               {1, 1},
+                                               {1, 1, 1, 1},
+                                               {1, 1, 1, 1}}));
+  EXPECT_EQ(engine.pending_steps(), 0);
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks(), used_blocks);
+  EXPECT_TRUE(engine.all_requests_marked());
+#else
+  GTEST_SKIP() << "Startup warmup requires a device execution platform.";
+#endif
+}
+
+TEST(GraphWarmupTest, ElasticDecodeOnlyEagerWarmupIsNotSkipped) {
+#if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MLU)
+  ScopedDecodeGraphConfigSnapshot execution_snapshot;
+  ScopedVmmConfigSnapshot cache_snapshot;
+  ExecutionConfig::get_instance().enable_graph(false);
+  KVCacheConfig::get_instance().enable_virtual_memory(true).vmm_elastic(true);
+  RecordingProfileEngine engine;
+  ProfileManager::Options options;
+  options.max_tokens_per_batch(20).max_seqs_per_batch(4).instance_role(
+      InstanceRole::DECODE);
+
+  ProfileManager profile_manager(&engine, options);
+
+  EXPECT_EQ(engine.observed_batches(), (std::vector<int32_t>{4}));
+  EXPECT_TRUE(engine.all_requests_marked());
+#else
+  GTEST_SKIP() << "Startup warmup requires a device execution platform.";
+#endif
+}
+
+TEST(GraphWarmupTest, ElasticWarmupAllocatesDespiteStaleCapacitySnapshot) {
+#if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MLU)
+  ScopedDecodeGraphConfigSnapshot execution_snapshot;
+  ScopedVmmConfigSnapshot cache_snapshot;
+  ExecutionConfig::get_instance().enable_graph(false);
+  KVCacheConfig::get_instance().enable_virtual_memory(true).vmm_elastic(true);
+  for (bool overlap : {false, true}) {
+    RecordingProfileEngine engine(overlap,
+                                  /*dp_size=*/2,
+                                  /*stale_capacity_snapshot=*/true);
+    const std::vector<size_t> used_before =
+        engine.block_manager_pool()->num_used_blocks();
+    ASSERT_EQ(engine.block_manager_pool()->num_free_blocks(),
+              (std::vector<size_t>{0, 0}));
+    ProfileManager::Options options;
+    options.max_tokens_per_batch(20)
+        .max_seqs_per_batch(4)
+        .dp_size(2)
+        .enable_schedule_overlap(overlap)
+        .enable_profile_step_time(false)
+        .instance_role(InstanceRole::DEFAULT);
+
+    ProfileManager profile_manager(&engine, options);
+
+    EXPECT_EQ(engine.observed_batches(),
+              (std::vector<int32_t>{2, 4, 4, 2, 4, 4}));
+    EXPECT_EQ(engine.pending_steps(), 0);
+    EXPECT_EQ(engine.block_manager_pool()->num_used_blocks(), used_before);
+    EXPECT_EQ(engine.block_manager_pool()->num_free_blocks(),
+              (std::vector<size_t>{0, 0}));
+    EXPECT_TRUE(engine.all_requests_marked());
+  }
+#else
+  GTEST_SKIP() << "Startup warmup requires a device execution platform.";
+#endif
+}
+
+TEST(GraphWarmupTest, ElasticGraphWarmupCannotBeDeferredToServing) {
+#if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MLU)
+  ScopedDecodeGraphConfigSnapshot execution_snapshot;
+  ScopedVmmConfigSnapshot cache_snapshot;
+  auto& config = ExecutionConfig::get_instance();
+  const bool previous_disabled = config.disable_graph_warmup();
+  config.enable_graph(true).disable_graph_warmup(true);
+  KVCacheConfig::get_instance().enable_virtual_memory(true).vmm_elastic(true);
+  EXPECT_DEATH(
+      {
+        RecordingProfileEngine engine;
+        ProfileManager::Options options;
+        options.max_tokens_per_batch(4).max_seqs_per_batch(4);
+        ProfileManager profile_manager(&engine, options);
+      },
+      "Elastic VMM requires startup graph warmup");
+  config.disable_graph_warmup(previous_disabled);
+#else
+  GTEST_SKIP() << "Startup warmup requires a device execution platform.";
 #endif
 }
 

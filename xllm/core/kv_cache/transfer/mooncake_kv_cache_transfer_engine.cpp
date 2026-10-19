@@ -146,6 +146,13 @@ bool valid_virtual_offset(const CacheTensorManifest& tensor,
 Status validate_virtual_region(
     const WorkerCacheLayoutManifest& manifest,
     const VirtualKVCacheTransferMemoryRegion& region) {
+  if (!region.fully_resident) {
+    return Status(
+        StatusCode::UNAVAILABLE,
+        "Mooncake virtual offsets require a fully resident global arena; "
+        "sparse elastic arenas need an extent-aware transfer protocol; use "
+        "--vmm_elastic=false for legacy dense VMM transfer");
+  }
   if (region.base_address == nullptr || region.size_bytes == 0 ||
       region.page_size_bytes == 0) {
     return Status(StatusCode::INVALID_ARGUMENT,

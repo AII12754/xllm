@@ -18,24 +18,21 @@ limitations under the License.
 #include <torch/types.h>
 
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
 
 #include "core/framework/allocator/virtual_memory/physical_page.h"
+#include "core/framework/allocator/vmm_memory_budget.h"
 
 namespace xllm {
 
-/**
- * PhysicalPagePool manages a pool of pre-allocated physical pages.
- *
- * This is a singleton class that:
- * - Pre-allocates physical pages during initialization
- * - Each page has a unique page_id for tracking
- * - Provides get/put interface for MappedVirtualMemoryRegion to acquire/release
- * physical pages
- * - Avoids runtime allocation overhead during map operations
- */
+class SharedPhysicalPageMapping;
+
+// Owns stable logical page slots and their optional physical backing. Eager
+// initialization preserves fixed-pool callers; lazy initialization commits
+// backing atomically when KV pages or weight reservations need it.
 class PhysicalPagePool final {
  public:
   // Get the global singleton instance
@@ -46,8 +43,13 @@ class PhysicalPagePool final {
 
   // Initialize the pool with specified number of pages
   // device: the device to allocate physical pages on
-  // num_pages: number of physical pages to pre-allocate
-  void init(const torch::Device& device, size_t num_pages, size_t page_size);
+  // num_pages: stable logical capacity, independent of physical residency
+  // lazy reserves stable logical slots without allocating device memory.
+  // The default preserves eager allocation for existing callers.
+  void init(const torch::Device& device,
+            size_t num_pages,
+            size_t page_size,
+            bool lazy = false);
 
   // Release all pages and make the singleton reusable. Returns false when a
   // caller still owns pages from this pool.
@@ -86,11 +88,27 @@ class PhysicalPagePool final {
   // Put multiple physical pages back to the pool in one lock
   void batch_put(std::vector<std::unique_ptr<PhysicalPage>>& pages);
 
-  // Get number of available pages in the pool
+  // Number of unoccupied logical slots, including uncommitted backing
   size_t num_available() const;
 
-  // Get total number of pages (available + in use)
+  // Stable logical capacity; growth and reclamation never renumber these slots
   size_t num_total() const { return num_total_pages_; }
+  size_t num_committed() const;
+  // Snapshot of idle backing plus growth allowed by current device memory.
+  size_t num_allocatable() const;
+
+  // Leave this many currently free device bytes outside new pool allocations.
+  // Existing resident pages are not counted again against the free snapshot.
+  void set_allocation_headroom(size_t bytes);
+
+  // Observe after execution has allocated its workspace. Pool residency is
+  // removed from the sample so later growth does not inflate execution reserve.
+  void observe_execution_memory();
+
+  // Release idle backing while retaining keep_pages resident idle pages.
+  // Callers must return pages only after their device/transfer users finish.
+  // Active shared-mapping leases pin the backing and make trimming a no-op.
+  size_t trim_idle(size_t keep_pages = 0);
   size_t page_size() const { return page_size_; }
 
   // Get the device
@@ -99,27 +117,45 @@ class PhysicalPagePool final {
   // ============== Shared Mapping Support ==============
 
   // Get non-owning page pointers in page_id order for shared mapping.
-  // Pointers remain stable when ownership moves to a caller; every page
-  // must stay alive while any mapping references it.
-  const std::vector<PhysicalPage*>& get_all_pages() const;
+  // Uncommitted slots are null. Hold the corresponding KV ownership or weight
+  // reservation while dereferencing a snapshot; idle backing can be reclaimed.
+  std::vector<PhysicalPage*> get_all_pages() const;
+
+  // Serialize alias publication and leases with physical growth/reclamation.
+  // The mapping reserves all logical slots but maps only resident pages.
+  void attach_shared_mapping(
+      const std::shared_ptr<SharedPhysicalPageMapping>& mapping);
+  bool detach_shared_mapping(const SharedPhysicalPageMapping* mapping);
+  std::shared_ptr<void> acquire_shared_mapping_lease(
+      bool require_contiguous = false);
 
  private:
+  friend class PhysicalPagePoolTestPeer;
+
+  bool materialize_pages_locked(const std::vector<page_id_t>& page_ids);
+  void reserve_pages_locked(const std::vector<page_id_t>& page_ids);
+
   PhysicalPagePool() = default;
   ~PhysicalPagePool() = default;
   PhysicalPagePool(const PhysicalPagePool&) = delete;
   PhysicalPagePool& operator=(const PhysicalPagePool&) = delete;
 
   bool initialized_ = false;
+  bool lazy_ = false;
   torch::Device device_{torch::kCPU};
   size_t num_total_pages_ = 0;
   size_t page_size_ = 0;
+  size_t num_committed_pages_ = 0;
+  size_t allocation_headroom_bytes_ = 0;
+  VmmMemoryBudget execution_memory_budget_;
 
   mutable std::mutex mtx_;
   // Pages owned by the pool, indexed by page_id.
   // This owns the pages and provides O(1) lookup by page_id
   std::vector<std::unique_ptr<PhysicalPage>> all_pages_;
 
-  // Stable non-owning page pointers, filled once at init.
+  // Stable logical slots. A null pointer denotes uncommitted backing; live
+  // page IDs and addresses never move when other slots grow or shrink.
   std::vector<PhysicalPage*> all_page_ptrs_;
 
   // Free page indices (page_ids of pages available for allocation)
@@ -128,6 +164,12 @@ class PhysicalPagePool final {
 
   // Track which pages are allocated (for segment management)
   std::vector<bool> page_allocated_;
+  std::weak_ptr<SharedPhysicalPageMapping> shared_mapping_;
+
+  // Only the slow physical-growth path uses these boundaries. Tests can inject
+  // deterministic memory snapshots and partial allocation failures.
+  std::function<int64_t()> free_memory_query_;
+  std::function<std::unique_ptr<PhysicalPage>(page_id_t)> page_factory_;
 };
 
 }  // namespace xllm

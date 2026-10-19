@@ -884,6 +884,10 @@ void MooncakeVirtualKVCacheTransfer::register_kv_cache(
 void MooncakeVirtualKVCacheTransfer::register_kv_cache_impl() {
   const VirtualKVCacheTransferMemoryRegion memory_region =
       memory_provider_->memory_region();
+  CHECK(memory_region.fully_resident)
+      << "Mooncake KV transfer requires a fully resident global arena; "
+         "sparse elastic arenas need an extent-aware transfer protocol; use "
+         "--vmm_elastic=false for legacy dense VMM transfer";
   CHECK(memory_region.base_address != nullptr);
   CHECK_GT(memory_region.size_bytes, 0);
 

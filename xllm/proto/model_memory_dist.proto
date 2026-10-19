@@ -33,11 +33,33 @@ message KvTensorRequest {
 message MemoryInfoResponse {
   int64 available_memory = 1;  // Available memory in bytes
   int64 total_memory = 2;      // Total memory in bytes
+  bool pool_initialized = 3;
+  uint64 pool_capacity_pages = 4;
+  uint64 pool_committed_pages = 5;
+  uint64 pool_allocatable_pages = 6;
+  uint64 execution_memory_reserve_bytes = 7;
 }
 
 // Request for initializing PhysicalPagePool
 message InitPhysicalPagePoolRequest {
-  int64 num_pages = 1;  // Number of physical pages to allocate
+  int64 num_pages = 1;  // Stable virtual-address capacity in pages.
+  bool lazy = 2;  // Reserve address slots without allocating physical pages.
+}
+
+message PrepareKvMappingRequest {
+  uint64 transaction_id = 1;
+  string model_id = 2;
+  repeated uint64 offsets = 3;
+}
+
+message KvMappingTransactionRequest {
+  uint64 transaction_id = 1;
+}
+
+message PrepareWeightPagesRequest {
+  uint64 transaction_id = 1;
+  string model_id = 2;
+  uint64 num_pages = 3;
 }
 
 // Request for allocating weight pages from GlobalVirtualMemoryRegion
@@ -90,6 +112,12 @@ service ModelMemoryDist {
   // Size = PhysicalPagePool::num_total() * page_size
   rpc MapToKvTensors (KvTensorRequest) returns (Status);
   rpc UnmapFromKvTensors (KvTensorRequest) returns (Status);
+  rpc PrepareKvMapping (PrepareKvMappingRequest) returns (Status);
+  rpc CommitKvMapping (KvMappingTransactionRequest) returns (Status);
+  rpc AbortKvMapping (KvMappingTransactionRequest) returns (Status);
+  rpc PrepareWeightPages (PrepareWeightPagesRequest) returns (Status);
+  rpc CommitWeightPages (KvMappingTransactionRequest) returns (Status);
+  rpc AbortWeightPages (KvMappingTransactionRequest) returns (Status);
   
   // Weight pages allocation from GlobalVirtualMemoryRegion
   rpc AllocWeightPages (AllocWeightPagesRequest) returns (Status);

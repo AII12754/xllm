@@ -31,7 +31,7 @@ limitations under the License.
 #include "core/kv_cache/layout/kv_cache_estimation.h"
 #include "core/kv_cache/layout/virtual_kv_cache_page_layout.h"
 #include "core/kv_cache/storage/kv_cache_utils.h"
-#include "core/kv_cache/storage/virtual_kv_cache_page_allocator_impl.h"
+#include "core/kv_cache/storage/vmm_kv_page_allocator_impl.h"
 #include "core/runtime/options.h"
 #include "core/runtime/worker_client.h"
 #include "models/model_registry.h"
@@ -139,7 +139,7 @@ KVCacheManagerFactoryResult KVCacheManagerFactory::create(
     }
   }
 
-  VirtualKVCachePageAllocator* page_allocator = nullptr;
+  VmmKVPageAllocator* page_allocator = nullptr;
   if (options.enable_virtual_memory()) {
     CHECK(shape.has_value_cache_shape());
     CHECK_EQ(kv_cache_capacity.scale_slot_size(), 0)
@@ -184,7 +184,7 @@ KVCacheManagerFactoryResult KVCacheManagerFactory::create(
       }
     }
     auto& allocator = DistributedVirtualMemoryCoordinator::get_instance()
-                          .virtual_kv_cache_page_allocator();
+                          .vmm_kv_page_allocator();
     if (options.enable_disagg_pd()) {
       for (size_t bytes : block_bytes) {
         CHECK_LE(bytes, allocator.page_size())

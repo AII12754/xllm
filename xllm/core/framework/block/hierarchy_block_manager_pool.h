@@ -48,7 +48,7 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
       const BlockManagerPool::Options& options,
       std::shared_ptr<KVCacheTransferCoordinatorBase> transfer_coordinator,
       int32_t dp_size = 1,
-      VirtualKVCachePageAllocator* page_allocator = nullptr);
+      VmmKVPageAllocator* page_allocator = nullptr);
   ~HierarchyBlockManagerPool() override;
 
   bool allocate(Sequence* sequence, size_t num_tokens) override;

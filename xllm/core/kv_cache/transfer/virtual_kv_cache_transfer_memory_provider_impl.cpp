@@ -35,11 +35,13 @@ class VirtualKVCacheTransferMemoryProviderImpl final
       : registry_(registry), region_(region) {}
 
   VirtualKVCacheTransferMemoryRegion memory_region() const override {
-    auto lifetime = region_.acquire_mapping_lease();
+    auto lifetime = region_.try_acquire_contiguous_mapping_lease();
+    const bool fully_resident = lifetime != nullptr;
     return {region_.base_vaddr(),
             region_.total_size(),
             std::move(lifetime),
-            region_.page_size()};
+            region_.page_size(),
+            fully_resident};
   }
 
   std::optional<VirtualKVCacheBlockGlobalOffsets> get_global_offsets_for_block(

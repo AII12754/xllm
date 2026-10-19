@@ -28,7 +28,7 @@ limitations under the License.
 
 namespace xllm {
 
-class VirtualKVCachePageAllocator;
+class VmmKVPageAllocator;
 
 class BlockManagerPool : public KVCacheManager {
  public:
@@ -87,16 +87,19 @@ class BlockManagerPool : public KVCacheManager {
     PROPERTY(bool, instance_is_decode) = false;
   };
 
-  explicit BlockManagerPool(
-      const Options& options,
-      int32_t dp_size = 1,
-      VirtualKVCachePageAllocator* page_allocator = nullptr);
+  explicit BlockManagerPool(const Options& options,
+                            int32_t dp_size = 1,
+                            VmmKVPageAllocator* page_allocator = nullptr);
 
   ~BlockManagerPool() = default;
 
   bool allocate(Sequence* sequence) override;
   bool allocate(std::vector<Sequence*>& sequences) override;
   bool allocate(Sequence* sequence, size_t num_tokens) override;
+  bool exceeds_total_capacity(Sequence* sequence,
+                              size_t num_tokens) const override;
+  bool exceeds_total_capacity(
+      const std::vector<KVCacheReservation>& reservations) const override;
   // Try to allocate blocks with num_tokens,
   // return {} if not enough blocks
   std::vector<Block> allocate(size_t num_tokens, int32_t& dp_rank) override;
@@ -119,6 +122,7 @@ class BlockManagerPool : public KVCacheManager {
   virtual float get_gpu_cache_usage_perc() const;
 
   uint32_t num_blocks() const override;
+  size_t admission_capacity(int32_t dp_rank) const override;
   int32_t block_size() const override;
   std::vector<size_t> num_blocks_in_prefix_cache() const override;
   std::vector<size_t> num_free_blocks() const override;
@@ -148,7 +152,7 @@ class BlockManagerPool : public KVCacheManager {
 
   // Non-owning optional dependency, required for virtual-memory cache leaves.
   // The runtime retains it until this pool and its blocks have been destroyed.
-  VirtualKVCachePageAllocator* page_allocator_;
+  VmmKVPageAllocator* page_allocator_;
   mutable std::atomic<size_t> dp_selection_cursor_{0};
   std::vector<std::vector<BlockTransferInfo>> swap_block_transfer_infos_;
 

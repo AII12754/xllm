@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/kv_cache/storage/virtual_kv_cache_page_allocator_impl.h"
+#include "core/kv_cache/storage/vmm_kv_page_allocator_impl.h"
 
 #include <gtest/gtest.h>
 
@@ -52,6 +52,7 @@ class FakeKVCachePageBackend final : public KVCachePageBackend {
     std::lock_guard<std::mutex> lock(mtx_);
     EXPECT_LE(physical_pages, total_pages_ - free_pages_[dp_rank]);
     free_pages_[dp_rank] += physical_pages;
+    cond_.notify_all();
   }
 
   size_t available_pages(const std::string& /*model_id*/,
@@ -68,16 +69,18 @@ class FakeKVCachePageBackend final : public KVCachePageBackend {
     map_dp_ranks_.emplace_back(dp_rank);
     mapped_offsets_.insert(
         mapped_offsets_.end(), byte_offsets.begin(), byte_offsets.end());
+    const bool success = map_dp_ranks_.size() != failed_map_call_;
     map_started_ = true;
     cond_.notify_all();
     cond_.wait(lock, [this] { return !block_maps_; });
-    return true;
+    return success;
   }
 
   bool unmap_pages(const std::string& /*model_id*/,
-                   int32_t /*dp_rank*/,
+                   int32_t dp_rank,
                    const std::vector<int64_t>& byte_offsets) override {
     std::lock_guard<std::mutex> lock(mtx_);
+    unmap_dp_ranks_.emplace_back(dp_rank);
     unmapped_offsets_.insert(
         unmapped_offsets_.end(), byte_offsets.begin(), byte_offsets.end());
     return true;
@@ -101,6 +104,19 @@ class FakeKVCachePageBackend final : public KVCachePageBackend {
     cond_.notify_all();
   }
 
+  void fail_map_call(size_t call) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    failed_map_call_ = call;
+  }
+
+  bool wait_until_available_pages(int32_t dp_rank, size_t physical_pages) {
+    std::unique_lock<std::mutex> lock(mtx_);
+    return cond_.wait_for(
+        lock, std::chrono::seconds(2), [this, dp_rank, physical_pages] {
+          return free_pages_[dp_rank] == physical_pages;
+        });
+  }
+
   std::vector<int64_t> mapped_offsets() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return mapped_offsets_;
@@ -109,6 +125,16 @@ class FakeKVCachePageBackend final : public KVCachePageBackend {
   std::vector<int32_t> map_dp_ranks() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return map_dp_ranks_;
+  }
+
+  std::vector<int64_t> unmapped_offsets() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return unmapped_offsets_;
+  }
+
+  std::vector<int32_t> unmap_dp_ranks() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return unmap_dp_ranks_;
   }
 
   std::vector<std::string> mapped_model_ids() const {
@@ -123,14 +149,16 @@ class FakeKVCachePageBackend final : public KVCachePageBackend {
   std::condition_variable cond_;
   bool block_maps_ = false;
   bool map_started_ = false;
+  size_t failed_map_call_ = 0;
   std::vector<int64_t> mapped_offsets_;
   std::vector<int64_t> unmapped_offsets_;
   std::vector<int32_t> map_dp_ranks_;
+  std::vector<int32_t> unmap_dp_ranks_;
   std::vector<std::string> mapped_model_ids_;
 };
 
 // Emulate the residency coordinator's completed lifecycle budget transaction.
-void complete_suspend(VirtualKVCachePageAllocatorImpl& allocator,
+void complete_suspend(VmmKVPageAllocatorImpl& allocator,
                       FakeKVCachePageBackend& backend,
                       const std::string& model_id,
                       const KVCacheMappingPlan& plan) {
@@ -144,7 +172,7 @@ void complete_suspend(VirtualKVCachePageAllocatorImpl& allocator,
   allocator.finish_suspend(model_id);
 }
 
-bool wait_until_suspended(const VirtualKVCachePageAllocatorImpl& allocator,
+bool wait_until_suspended(const VmmKVPageAllocatorImpl& allocator,
                           const std::string& model_id) {
   auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (std::chrono::steady_clock::now() < deadline) {
@@ -156,10 +184,10 @@ bool wait_until_suspended(const VirtualKVCachePageAllocatorImpl& allocator,
   return false;
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
+TEST(VmmKVPageAllocatorImplTest,
      VirtualPageExhaustionReturnsNullWithoutChangingCounts) {
   FakeKVCachePageBackend backend(/*total_pages=*/8, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/8,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -185,10 +213,176 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(backend.mapped_offsets(), std::vector<int64_t>({0, 64}));
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
+TEST(VmmKVPageAllocatorImplTest,
+     FailedMappingRestoresVirtualIdAndPhysicalBudgetForRetry) {
+  FakeKVCachePageBackend backend(/*total_pages=*/8, /*dp_size=*/1);
+  VmmKVPageAllocatorImpl allocator(backend);
+  allocator.init(/*total_pages=*/8,
+                 /*page_size=*/64,
+                 /*dp_size=*/1,
+                 /*enable_prealloc=*/false);
+  ASSERT_TRUE(allocator.register_model("model", /*num_layers=*/2));
+  backend.fail_map_call(1);
+
+  EXPECT_EQ(allocator.alloc_kv_cache_page("model", /*dp_rank=*/0), nullptr);
+  EXPECT_EQ(allocator.get_num_free_virt_pages("model", /*dp_rank=*/0), 2);
+  EXPECT_EQ(allocator.get_num_inuse_virt_pages("model", /*dp_rank=*/0), 0);
+  EXPECT_EQ(allocator.get_num_reserved_virt_pages("model", /*dp_rank=*/0), 0);
+  EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 8);
+
+  auto retry = allocator.alloc_kv_cache_page("model", /*dp_rank=*/0);
+  ASSERT_NE(retry, nullptr);
+  EXPECT_EQ(retry->page_id(), 0);
+  EXPECT_EQ(backend.mapped_offsets(), std::vector<int64_t>({0, 0}));
+  EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 4);
+  EXPECT_EQ(allocator.get_num_inuse_virt_pages("model", /*dp_rank=*/0), 1);
+}
+
+TEST(VmmKVPageAllocatorImplTest,
+     FailedPreallocationRestoresBudgetWithoutPublishingReservedPages) {
+  FakeKVCachePageBackend backend(/*total_pages=*/16, /*dp_size=*/1);
+  VmmKVPageAllocatorImpl allocator(backend);
+  allocator.init(/*total_pages=*/16,
+                 /*page_size=*/64,
+                 /*dp_size=*/1,
+                 /*enable_prealloc=*/true);
+  ASSERT_TRUE(allocator.register_model("model", /*num_layers=*/1));
+  backend.fail_map_call(1);
+  backend.block_maps();
+  allocator.start_prealloc_thread("model");
+  EXPECT_TRUE(backend.wait_until_map_started());
+  EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 0);
+  backend.release_maps();
+  EXPECT_TRUE(backend.wait_until_available_pages(/*dp_rank=*/0, 16));
+
+  // Suspend drains the failed batch and prevents another background attempt
+  // from hiding a leaked reservation or virtual ID.
+  auto plan = allocator.begin_suspend("model");
+  ASSERT_TRUE(plan.has_value());
+  EXPECT_TRUE(plan->dp_group_page_ids[0].empty());
+  EXPECT_EQ(allocator.get_num_free_virt_pages("model", /*dp_rank=*/0), 8);
+  EXPECT_EQ(allocator.get_num_inuse_virt_pages("model", /*dp_rank=*/0), 0);
+  EXPECT_EQ(allocator.get_num_reserved_virt_pages("model", /*dp_rank=*/0), 0);
+  EXPECT_EQ(backend.map_dp_ranks(), std::vector<int32_t>({0}));
+  EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 16);
+  complete_suspend(allocator, backend, "model", *plan);
+}
+
+TEST(VmmKVPageAllocatorImplTest,
+     FailedResumeMappingRollsBackEarlierDpGroupsBeforeBudgetRelease) {
+  FakeKVCachePageBackend backend(/*total_pages=*/8, /*dp_size=*/3);
+  VmmKVPageAllocatorImpl allocator(backend);
+  allocator.init(/*total_pages=*/8,
+                 /*page_size=*/64,
+                 /*dp_size=*/3,
+                 /*enable_prealloc=*/false);
+  ASSERT_TRUE(allocator.register_model("model", /*num_layers=*/2));
+  for (int32_t dp_rank = 0; dp_rank < 3; ++dp_rank) {
+    ASSERT_NE(allocator.alloc_kv_cache_page("model", dp_rank), nullptr);
+  }
+  auto suspend_plan = allocator.begin_suspend("model");
+  ASSERT_TRUE(suspend_plan.has_value());
+  complete_suspend(allocator, backend, "model", *suspend_plan);
+  auto resume_plan = allocator.begin_resume("model");
+  ASSERT_TRUE(resume_plan.has_value());
+  for (int32_t dp_rank = 0; dp_rank < 3; ++dp_rank) {
+    ASSERT_TRUE(backend.try_reserve_pages("model", dp_rank, 4));
+  }
+
+  // The first three maps allocated the original pages; fail the second
+  // resume group and require the first group to be unmapped again.
+  backend.fail_map_call(5);
+  EXPECT_FALSE(allocator.map_pages("model", *resume_plan));
+  EXPECT_EQ(backend.map_dp_ranks(), std::vector<int32_t>({0, 1, 2, 0, 1}));
+  EXPECT_EQ(backend.unmap_dp_ranks(), std::vector<int32_t>({0, 1, 2, 0}));
+  EXPECT_EQ(backend.unmapped_offsets(), std::vector<int64_t>({0, 0, 0, 0}));
+  for (int32_t dp_rank = 0; dp_rank < 3; ++dp_rank) {
+    EXPECT_EQ(backend.available_pages("model", dp_rank), 4);
+    backend.release_pages("model", dp_rank, 4);
+  }
+  allocator.finish_resume("model", /*success=*/false);
+  EXPECT_TRUE(allocator.is_suspended("model"));
+
+  auto retry = allocator.begin_resume("model");
+  ASSERT_TRUE(retry.has_value());
+  EXPECT_EQ(retry->dp_group_page_ids, resume_plan->dp_group_page_ids);
+  for (int32_t dp_rank = 0; dp_rank < 3; ++dp_rank) {
+    ASSERT_TRUE(backend.try_reserve_pages("model", dp_rank, 4));
+  }
+  ASSERT_TRUE(allocator.map_pages("model", *retry));
+  allocator.finish_resume("model", /*success=*/true);
+  EXPECT_FALSE(allocator.is_suspended("model"));
+  for (int32_t dp_rank = 0; dp_rank < 3; ++dp_rank) {
+    EXPECT_EQ(backend.available_pages("model", dp_rank), 4);
+    EXPECT_EQ(allocator.get_num_inuse_virt_pages("model", dp_rank), 1);
+  }
+}
+
+TEST(VmmKVPageAllocatorImplTest,
+     AvailablePagesFollowLiveBudgetAndResidentReserve) {
+  FakeKVCachePageBackend backend(/*total_pages=*/12, /*dp_size=*/1);
+  VmmKVPageAllocatorImpl allocator(backend);
+  allocator.init(/*total_pages=*/12,
+                 /*page_size=*/64,
+                 /*dp_size=*/1,
+                 /*enable_prealloc=*/false);
+  ASSERT_TRUE(allocator.register_model("model", /*num_layers=*/2));
+  EXPECT_EQ(allocator.get_num_available_virt_pages("model", /*dp_rank=*/0), 3);
+  ASSERT_TRUE(backend.try_reserve_pages("weights", /*dp_rank=*/0, 5));
+  EXPECT_EQ(allocator.get_num_available_virt_pages("model", /*dp_rank=*/0), 1);
+  EXPECT_EQ(allocator.get_num_free_virt_pages("model", /*dp_rank=*/0), 3);
+  backend.release_pages("weights", /*dp_rank=*/0, 5);
+  EXPECT_EQ(allocator.get_num_available_virt_pages("model", /*dp_rank=*/0), 3);
+
+  auto page = allocator.alloc_kv_cache_page("model", /*dp_rank=*/0);
+  ASSERT_NE(page, nullptr);
+  allocator.free_kv_cache_pages("model", /*dp_rank=*/0, {page->page_id()});
+  ASSERT_TRUE(backend.try_reserve_pages("weights", /*dp_rank=*/0, 8));
+  EXPECT_EQ(allocator.get_num_available_virt_pages("model", /*dp_rank=*/0), 1);
+  auto resident = allocator.alloc_kv_cache_page("model", /*dp_rank=*/0);
+  ASSERT_NE(resident, nullptr);
+  EXPECT_EQ(resident->page_id(), page->page_id());
+  EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 0);
+  EXPECT_EQ(allocator.get_num_available_virt_pages("model", /*dp_rank=*/0), 0);
+  backend.release_pages("weights", /*dp_rank=*/0, 8);
+  EXPECT_EQ(allocator.get_num_available_virt_pages("model", /*dp_rank=*/0), 2);
+
+  auto plan = allocator.begin_suspend("model");
+  ASSERT_TRUE(plan.has_value());
+  EXPECT_EQ(allocator.get_num_available_virt_pages("model", /*dp_rank=*/0), 0);
+  complete_suspend(allocator, backend, "model", *plan);
+  EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 12);
+  EXPECT_EQ(allocator.get_num_available_virt_pages("model", /*dp_rank=*/0), 0);
+}
+
+TEST(VmmKVPageAllocatorImplTest, ZeroReserveUnmapsAndReleasesEveryFreedPage) {
+  FakeKVCachePageBackend backend(/*total_pages=*/4, /*dp_size=*/1);
+  VmmKVPageAllocatorImpl allocator(backend);
+  allocator.init(/*total_pages=*/4,
+                 /*page_size=*/64,
+                 /*dp_size=*/1,
+                 /*enable_prealloc=*/true,
+                 /*max_reserved_pages=*/0);
+  ASSERT_TRUE(allocator.register_model("model", /*num_layers=*/2));
+  allocator.start_prealloc_thread("model");
+  auto page = allocator.alloc_kv_cache_page("model", /*dp_rank=*/0);
+  ASSERT_NE(page, nullptr);
+  EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 0);
+  allocator.free_kv_cache_pages("model", /*dp_rank=*/0, {page->page_id()});
+  EXPECT_EQ(backend.unmapped_offsets(), std::vector<int64_t>({0}));
+  EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 4);
+  EXPECT_EQ(allocator.get_num_reserved_virt_pages("model", /*dp_rank=*/0), 0);
+  EXPECT_EQ(allocator.get_num_free_virt_pages("model", /*dp_rank=*/0), 1);
+  auto retry = allocator.alloc_kv_cache_page("model", /*dp_rank=*/0);
+  ASSERT_NE(retry, nullptr);
+  EXPECT_EQ(retry->page_id(), page->page_id());
+  EXPECT_EQ(backend.mapped_offsets(), std::vector<int64_t>({0, 0}));
+}
+
+TEST(VmmKVPageAllocatorImplTest,
      PhysicalPageExhaustionPreservesFreeVirtualPages) {
   FakeKVCachePageBackend backend(/*total_pages=*/8, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/8,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -203,10 +397,9 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(backend.available_pages("first", /*dp_rank=*/0), 0);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
-     DpGroupsReserveIndependentBackendCapacity) {
+TEST(VmmKVPageAllocatorImplTest, DpGroupsReserveIndependentBackendCapacity) {
   FakeKVCachePageBackend backend(/*total_pages=*/8, /*dp_size=*/2);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/8,
                  /*page_size=*/64,
                  /*dp_size=*/2,
@@ -225,10 +418,10 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(allocator.get_num_inuse_virt_pages("model", /*dp_rank=*/1), 0);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
+TEST(VmmKVPageAllocatorImplTest,
      ExcessFreedPagesReleaseBackendCapacityAfterUnmapping) {
   FakeKVCachePageBackend backend(/*total_pages=*/80, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/80,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -251,10 +444,10 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 80);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
+TEST(VmmKVPageAllocatorImplTest,
      FreeSuspendedPageDoesNotReleaseAnotherModelsPages) {
   FakeKVCachePageBackend backend(/*total_pages=*/8, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/8,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -282,10 +475,9 @@ TEST(VirtualKVCachePageAllocatorImplTest,
             0);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
-     ResumeWaitsForSuspendToDrainPendingMappings) {
+TEST(VmmKVPageAllocatorImplTest, ResumeWaitsForSuspendToDrainPendingMappings) {
   FakeKVCachePageBackend backend(/*total_pages=*/8, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/8,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -331,10 +523,9 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 4);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
-     FreeWaitsForResumeBeforeRecyclingMappedPage) {
+TEST(VmmKVPageAllocatorImplTest, FreeWaitsForResumeBeforeRecyclingMappedPage) {
   FakeKVCachePageBackend backend(/*total_pages=*/8, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/8,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -372,10 +563,9 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(reused->page_id(), page->page_id());
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
-     TrimWaitsForSuspendBeforeReleasingVirtualIds) {
+TEST(VmmKVPageAllocatorImplTest, TrimWaitsForSuspendBeforeReleasingVirtualIds) {
   FakeKVCachePageBackend backend(/*total_pages=*/8, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/8,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -402,10 +592,9 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(allocator.get_num_free_virt_pages("model", /*dp_rank=*/0), 2);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
-     FailedResumeKeepsPageIdsSuspendedForRetry) {
+TEST(VmmKVPageAllocatorImplTest, FailedResumeKeepsPageIdsSuspendedForRetry) {
   FakeKVCachePageBackend backend(/*total_pages=*/8, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/8,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -431,10 +620,10 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 8);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
+TEST(VmmKVPageAllocatorImplTest,
      SuspendDrainsReservedPreallocationBatchesBeforeReturningPlan) {
   FakeKVCachePageBackend backend(/*total_pages=*/16, /*dp_size=*/2);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/16,
                  /*page_size=*/64,
                  /*dp_size=*/2,
@@ -462,9 +651,9 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(backend.available_pages("model", /*dp_rank=*/0), 16);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest, UsesInjectedPageGeometry) {
+TEST(VmmKVPageAllocatorImplTest, UsesInjectedPageGeometry) {
   FakeKVCachePageBackend backend(/*total_pages=*/24, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/24,
                  /*page_size=*/128,
                  /*dp_size=*/1,
@@ -478,10 +667,9 @@ TEST(VirtualKVCachePageAllocatorImplTest, UsesInjectedPageGeometry) {
   EXPECT_EQ(allocator.get_offset(/*virtual_page_id=*/3), 384);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
-     PreallocationWaitsForEachModelsWorkerRegions) {
+TEST(VmmKVPageAllocatorImplTest, PreallocationWaitsForEachModelsWorkerRegions) {
   FakeKVCachePageBackend backend(/*total_pages=*/64, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/64,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -515,9 +703,9 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(backend.available_pages("second", /*dp_rank=*/0), 64);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest, MlaBudgetSurvivesTrimAndSleepWakeup) {
+TEST(VmmKVPageAllocatorImplTest, MlaBudgetSurvivesTrimAndSleepWakeup) {
   FakeKVCachePageBackend backend(/*total_pages=*/36, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/36,
                  /*page_size=*/2 * 1024 * 1024,
                  /*dp_size=*/1,
@@ -555,9 +743,9 @@ TEST(VirtualKVCachePageAllocatorImplTest, MlaBudgetSurvivesTrimAndSleepWakeup) {
   EXPECT_EQ(backend.available_pages("mla", /*dp_rank=*/0), 36);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest, MlaShortagePreservesPhysicalBudget) {
+TEST(VmmKVPageAllocatorImplTest, MlaShortagePreservesPhysicalBudget) {
   FakeKVCachePageBackend backend(/*total_pages=*/36, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/36,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -574,10 +762,10 @@ TEST(VirtualKVCachePageAllocatorImplTest, MlaShortagePreservesPhysicalBudget) {
   EXPECT_EQ(backend.available_pages("mla", /*dp_rank=*/0), 0);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest, TensorCapacityLimitsVirtualPageIds) {
+TEST(VmmKVPageAllocatorImplTest, TensorCapacityLimitsVirtualPageIds) {
   for (size_t blocks : {size_t{128}, size_t{129}, size_t{200}, size_t{256}}) {
     FakeKVCachePageBackend backend(/*total_pages=*/360, /*dp_size=*/1);
-    VirtualKVCachePageAllocatorImpl allocator(backend);
+    VmmKVPageAllocatorImpl allocator(backend);
     allocator.init(/*total_pages=*/360,
                    /*page_size=*/2 * 1024 * 1024,
                    /*dp_size=*/1,
@@ -598,10 +786,9 @@ TEST(VirtualKVCachePageAllocatorImplTest, TensorCapacityLimitsVirtualPageIds) {
   }
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
-     MlaPreallocationKeepsPhysicalPageBudget) {
+TEST(VmmKVPageAllocatorImplTest, MlaPreallocationKeepsPhysicalPageBudget) {
   FakeKVCachePageBackend backend(/*total_pages=*/180, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/180,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -619,10 +806,9 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(backend.available_pages("mla", /*dp_rank=*/0), 180);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
-     MlaRetainedPagesKeepPhysicalPageBudget) {
+TEST(VmmKVPageAllocatorImplTest, MlaRetainedPagesKeepPhysicalPageBudget) {
   FakeKVCachePageBackend backend(/*total_pages=*/180, /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/180,
                  /*page_size=*/64,
                  /*dp_size=*/1,
@@ -644,14 +830,14 @@ TEST(VirtualKVCachePageAllocatorImplTest,
   EXPECT_EQ(backend.available_pages("mla", /*dp_rank=*/0), 180);
 }
 
-TEST(VirtualKVCachePageAllocatorImplTest,
+TEST(VmmKVPageAllocatorImplTest,
      Glm53IndexerBudgetSurvivesShortageAndSleepWakeup) {
   const VirtualKVCachePageLayout layout({128 * 1024, 16 * 1024, 32 * 1024},
                                         /*page_size=*/2 * 1024 * 1024);
   const size_t physical_pages = layout.physical_pages({78, 78, 21});
   FakeKVCachePageBackend backend(/*total_pages=*/2 * physical_pages,
                                  /*dp_size=*/1);
-  VirtualKVCachePageAllocatorImpl allocator(backend);
+  VmmKVPageAllocatorImpl allocator(backend);
   allocator.init(/*total_pages=*/2 * physical_pages,
                  /*page_size=*/2 * 1024 * 1024,
                  /*dp_size=*/1,

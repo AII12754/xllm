@@ -65,6 +65,9 @@ class VirtualKVCacheMemoryRegions final {
       size_t page_size,
       const std::vector<bool>& layer_owned = {});
 
+  // Prepare may own only new mappings; abort must never remove another
+  // owner's pages. Validate the entire batch before changing residency.
+  bool can_prepare_mapping(const std::vector<offset_t>& offsets) const;
   bool map(const std::vector<offset_t>& offsets);
   bool unmap(const std::vector<offset_t>& offsets);
 

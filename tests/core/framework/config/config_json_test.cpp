@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <string_view>
@@ -403,6 +404,128 @@ TEST(SchedulerConfigTest, LinearStateOutOfPlaceIsEnabledByDefault) {
   const SchedulerConfig scheduler_config;
 
   EXPECT_TRUE(scheduler_config.enable_linear_state_out_of_place());
+}
+
+TEST(KVCacheConfigTest, ElasticDefaultsRemainImplicitInSerializedConfig) {
+  KVCacheConfig config;
+  EXPECT_TRUE(config.vmm_elastic());
+  EXPECT_EQ(config.vmm_memory_reserve_bytes(), 0);
+  nlohmann::ordered_json serialized = nlohmann::ordered_json::object();
+  config.append_config_json(serialized);
+  EXPECT_FALSE(serialized.contains("vmm_elastic"));
+  EXPECT_FALSE(serialized.contains("vmm_memory_reserve_bytes"));
+  const auto& option_names = KVCacheConfig::option_category().option_names;
+  EXPECT_NE(std::find(option_names.begin(), option_names.end(), "vmm_elastic"),
+            option_names.end());
+  EXPECT_NE(
+      std::find(
+          option_names.begin(), option_names.end(), "vmm_memory_reserve_bytes"),
+      option_names.end());
+}
+
+TEST(KVCacheConfigTest, ReadsAndExportsElasticMemoryOptionsFromJson) {
+  google::FlagSaver flag_saver;
+  const JsonReader json = config::parse_json_string(
+      R"json({"vmm_elastic":false,"vmm_memory_reserve_bytes":67108864})json");
+  KVCacheConfig config;
+  config.from_json(json);
+  config.validate();
+  EXPECT_FALSE(config.vmm_elastic());
+  EXPECT_EQ(config.vmm_memory_reserve_bytes(), 67108864);
+  nlohmann::ordered_json serialized = nlohmann::ordered_json::object();
+  config.append_config_json(serialized);
+  EXPECT_EQ(serialized.at("vmm_elastic"), false);
+  EXPECT_EQ(serialized.at("vmm_memory_reserve_bytes"), 67108864);
+}
+
+TEST(KVCacheConfigTest, ElasticCommandLineOptionsOverrideJson) {
+  google::FlagSaver flag_saver;
+  google::SetCommandLineOption("vmm_elastic", "false");
+  google::SetCommandLineOption("vmm_memory_reserve_bytes", "2048");
+  KVCacheConfig config;
+  config.from_flags();
+  const JsonReader json = config::parse_json_string(
+      R"json({"vmm_elastic":true,"vmm_memory_reserve_bytes":4096})json");
+  config.from_json(json);
+  EXPECT_FALSE(config.vmm_elastic());
+  EXPECT_EQ(config.vmm_memory_reserve_bytes(), 2048);
+}
+
+TEST(KVCacheConfigValidationTest, ElasticVmmAllowsUnsetUtilizationCeiling) {
+  KVCacheConfig config;
+  config.enable_virtual_memory(true)
+      .vmm_elastic(true)
+      .max_memory_utilization(0.0)
+      .vmm_memory_reserve_bytes(0)
+      .max_cache_size(0);
+  config.validate();
+  config.max_memory_utilization(1.0);
+  config.validate();
+}
+
+TEST(KVCacheConfigValidationTest, RejectsUnsetCeilingOutsideElasticVmm) {
+  EXPECT_DEATH(
+      {
+        KVCacheConfig config;
+        config.enable_virtual_memory(false).max_memory_utilization(0.0);
+        config.validate();
+      },
+      "Only elastic VMM");
+  EXPECT_DEATH(
+      {
+        KVCacheConfig config;
+        config.enable_virtual_memory(true)
+            .vmm_elastic(false)
+            .max_memory_utilization(0.0);
+        config.validate();
+      },
+      "Only elastic VMM");
+}
+
+TEST(KVCacheConfigValidationTest, RejectsInvalidUtilizationCeilings) {
+  const std::vector<double> invalid_ratios = {
+      -0.01,
+      1.01,
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity()};
+  for (double ratio : invalid_ratios) {
+    EXPECT_DEATH(
+        {
+          KVCacheConfig config;
+          config.enable_virtual_memory(true)
+              .vmm_elastic(true)
+              .max_memory_utilization(ratio);
+          config.validate();
+        },
+        "max_memory_utilization");
+  }
+}
+
+TEST(KVCacheConfigValidationTest, RejectsNegativeMemoryReserveAndCacheLimits) {
+  EXPECT_DEATH(
+      {
+        KVCacheConfig config;
+        config.vmm_memory_reserve_bytes(-1);
+        config.validate();
+      },
+      "vmm_memory_reserve_bytes");
+  EXPECT_DEATH(
+      {
+        KVCacheConfig config;
+        config.max_cache_size(-1);
+        config.validate();
+      },
+      "max_cache_size");
+  for (int64_t page_size : {int64_t{0}, int64_t{-1}}) {
+    EXPECT_DEATH(
+        {
+          KVCacheConfig config;
+          config.phy_page_granularity_size(page_size);
+          config.validate();
+        },
+        "phy_page_granularity_size");
+  }
 }
 
 TEST(KVCacheConfigValidationTest, AcceptsSupportedIndexerCacheDtypes) {

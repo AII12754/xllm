@@ -24,6 +24,7 @@ limitations under the License.
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <vector>
 
@@ -106,9 +107,9 @@ class FixedStepsScheduler : public Scheduler {
     virtual ~SchedulerPipeline() = default;
     virtual BatchInputType input_type() const = 0;
     virtual bool requires_kv_cache() const = 0;
-    // Allocate KV cache for sequence, implemented by each pipeline
-    virtual bool allocate_kv_cache(KVCacheManager* kv_cache_manager,
-                                   Sequence* sequence) = 0;
+    // Describe the reservation before the scheduler checks and allocates it.
+    virtual std::optional<KVCacheManager::KVCacheReservation>
+    kv_cache_reservation(Sequence* sequence) const = 0;
   };
 
   class LlmRecSchedulerPipeline final : public SchedulerPipeline {
@@ -117,8 +118,8 @@ class FixedStepsScheduler : public Scheduler {
       return BatchInputType::SEQUENCE;
     }
     bool requires_kv_cache() const override { return true; }
-    bool allocate_kv_cache(KVCacheManager* kv_cache_manager,
-                           Sequence* sequence) override;
+    std::optional<KVCacheManager::KVCacheReservation> kv_cache_reservation(
+        Sequence* sequence) const override;
   };
 
   class OneRecSchedulerPipeline final : public SchedulerPipeline {
@@ -127,9 +128,9 @@ class FixedStepsScheduler : public Scheduler {
       return BatchInputType::ONEREC;
     }
     bool requires_kv_cache() const override { return false; }
-    bool allocate_kv_cache(KVCacheManager* /*kv_cache_manager*/,
-                           Sequence* /*sequence*/) override {
-      return true;
+    std::optional<KVCacheManager::KVCacheReservation> kv_cache_reservation(
+        Sequence* /*sequence*/) const override {
+      return std::nullopt;
     }
   };
 
@@ -139,8 +140,8 @@ class FixedStepsScheduler : public Scheduler {
       return BatchInputType::ONEREC_XATTENTION;
     }
     bool requires_kv_cache() const override { return true; }
-    bool allocate_kv_cache(KVCacheManager* kv_cache_manager,
-                           Sequence* sequence) override;
+    std::optional<KVCacheManager::KVCacheReservation> kv_cache_reservation(
+        Sequence* sequence) const override;
   };
 
   class RecMultiRoundSchedulerPipeline final : public SchedulerPipeline {
@@ -149,9 +150,9 @@ class FixedStepsScheduler : public Scheduler {
       return BatchInputType::REC_MULTI_ROUND;
     }
     bool requires_kv_cache() const override { return false; }
-    bool allocate_kv_cache(KVCacheManager* /*kv_cache_manager*/,
-                           Sequence* /*sequence*/) override {
-      return true;  // RecMultiRound mode does not need KV cache allocation
+    std::optional<KVCacheManager::KVCacheReservation> kv_cache_reservation(
+        Sequence* /*sequence*/) const override {
+      return std::nullopt;
     }
   };
 
@@ -160,9 +161,14 @@ class FixedStepsScheduler : public Scheduler {
       RecType rec_type,
       bool is_rec_multi_round);
 
+  static std::optional<KVCacheManager::KVCacheReservation>
+  make_kv_cache_reservation(Sequence* sequence, size_t max_generated_tokens);
+
   ScheduleResult schedule_request(const absl::Duration& timeout);
 
-  void handle_prefill_requests(
+  // Returns true when an oversized request was rejected and more local work
+  // remains to be scheduled in this pass.
+  bool handle_prefill_requests(
       size_t& remaining_token_budget,
       size_t& remaining_seq_budget,
       std::vector<std::shared_ptr<Request>>& finished_requests);

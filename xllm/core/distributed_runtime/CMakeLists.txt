@@ -208,7 +208,7 @@ cc_library(
     :worker_memory_rpc
     :worker_memory_resources
     :worker_physical_page_budget
-    :virtual_kv_cache_page_allocator_impl
+    :vmm_kv_page_allocator_impl
     :kv_cache_memory_interfaces
     :common
     :config

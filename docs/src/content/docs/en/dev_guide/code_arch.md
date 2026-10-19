@@ -133,7 +133,7 @@ flowchart TB
 
   subgraph cache["core/kv_cache"]
     policy["layout, block and prefix<br/>KV policy and state"]
-    pages["storage / VirtualKVCachePageAllocatorImpl<br/>page queues, preallocation and block-to-page conversion"]
+    pages["storage / VmmKVPageAllocatorImpl<br/>page queues, preallocation and block-to-page conversion"]
     backend["storage / KVCachePageBackend<br/>capacity reservation and mapping interface"]
     ports["storage and transfer interfaces<br/>page allocator, tensor allocator, memory provider"]
     storage["storage / VirtualKVCacheMemoryRegistry<br/>local KV mappings and paged tensor allocation"]
@@ -193,7 +193,7 @@ leases. Transport registration and its retained mapping lease belong to
 
 `core/kv_cache/storage` owns `VirtualKVCacheMemoryRegions` and
 `VirtualKVCacheMemoryRegistry`, including model-local cache mappings and physical
-offset lookup. `VirtualKVCacheTensorAllocator` uses an injected registry to
+offset lookup. `VmmKVTensorAllocator` uses an injected registry to
 implement `KVCacheTensorAllocator`. In `core/kv_cache/transfer`,
 `VirtualKVCacheTransferMemoryProviderImpl` uses that registry and an injected
 `GlobalVirtualMemoryRegion` to implement `VirtualKVCacheTransferMemoryProvider`.
@@ -216,14 +216,14 @@ depend on the `runtime` aggregate, RPC or distributed-runtime targets.
 `WorkerMemoryRpcServer` handle requests between workers. The service invokes
 local resources without calling back into distributed coordination.
 
-`core/kv_cache/storage/VirtualKVCachePageAllocatorImpl` owns KV page queues,
+`core/kv_cache/storage/VmmKVPageAllocatorImpl` owns KV page queues,
 preallocation and block-to-virtual-page conversion, implementing
-`VirtualKVCachePageAllocator`. An injected `KVCachePageBackend` supplies capacity
+`VmmKVPageAllocator`. An injected `KVCachePageBackend` supplies capacity
 reservation and map/unmap operations; the allocator has no weight policy or
 RPC code. Map/unmap receive byte offsets within each layer's K/V region,
 computed by the allocator as virtual page ID times page size.
 `KVCacheManagerFactory` injects the page allocator interface through
-pools and composite managers into `VirtualMemoryKVCacheBlockManager`, whose block
+pools and composite managers into `VmmKVBlockManager`, whose block
 adapter does not access a distributed singleton.
 
 `DistributedVirtualMemoryCoordinator` implements that backend, owns the paged
@@ -262,6 +262,48 @@ Each worker registers its endpoint there, and rank 0 connects to those endpoints
 to dispatch memory operations. This registration service is separate from the
 execution worker registration service configured by `master_node_addr`.
 Explicit CLI settings override JSON configuration.
+
+### Elastic virtual KV
+
+`enable_virtual_memory=false` keeps the original physical-cache implementation.
+When virtual memory is enabled, `vmm_elastic=true` selects demand-backed physical
+pages. The pool reserves stable page IDs and virtual addresses at startup, but
+commits physical handles only for active KV mappings and weight reservations.
+Idle KV pages are unmapped and their backing is released after their last block
+is returned; live pages, the padding block, weights, and transfer leases remain
+pinned. `vmm_elastic=false` retains the fixed, eagerly resident VMM arena.
+
+`max_memory_utilization` and `max_cache_size` remain optional startup capacity
+ceilings, shared by KV and weight pages. In elastic mode, explicitly setting
+`max_memory_utilization=0` disables the ratio ceiling; `max_cache_size=0` leaves
+the byte ceiling unset. Neither setting preallocates the elastic capacity. A
+small nonzero ratio still deliberately limits virtual capacity. Fixed VMM and
+the original physical cache require a positive ratio.
+
+Before serving, elastic VMM warms long and wide prefill shapes and configured
+decode concurrency on every DP rank. Graph startup warmup cannot be disabled in
+this mode. The rounded KV footprint of these shapes must fit the configured
+capacity; otherwise startup fails with a capacity diagnostic. Worker execution
+samples track the minimum of driver-free bytes plus committed pool bytes. This
+keeps KV growth out of the execution watermark and avoids charging resident
+allocator caches twice. If those caches release memory, the pool preserves room
+to recover the observed footprint. `vmm_memory_reserve_bytes` adds explicit free
+headroom, including during bootstrap. Samples after a step cannot measure every
+transient SDK buffer or every workload-specific execution shape; configure the
+extra reserve from device measurements for those cases.
+
+Admission and DP selection use the minimum live capacity of the target workers,
+bounded by the shared reservation ledger. Mapping performs an authoritative
+device-budget check. KV and weight prepare/commit/abort operations compensate
+every participant before a failed allocation returns its ledger reservation.
+An unacknowledged rollback is fatal because page ownership is uncertain.
+
+The current Mooncake protocol registers one dense shared arena and cannot
+register sparse elastic extents. KV and weight registration explicitly require
+fully resident backing and hold a lease until registration is retired. Use
+`--vmm_elastic=false` for PD KV transfer and remote weight transfer. Master and
+workers must be upgraded together for the new memory-capacity and mapping
+transaction RPCs.
 
 Splitting the local resource, distributed coordinator and RPC C++ classes
 preserves protobuf field numbers. `proto/model_memory_dist.proto` uses the

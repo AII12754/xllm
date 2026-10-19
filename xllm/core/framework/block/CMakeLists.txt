@@ -9,13 +9,13 @@ cc_library(
     block_manager_pool.h
     hierarchy_block_manager_pool.h
     composite_block_manager.h
-    virtual_memory_kv_cache_block_manager.h
+    vmm_kv_block_manager.h
   SRCS
     embedding_block_manager.cpp
     block_manager_pool.cpp
     hierarchy_block_manager_pool.cpp
     composite_block_manager.cpp
-    virtual_memory_kv_cache_block_manager.cpp
+    vmm_kv_block_manager.cpp
   DEPS
     :kv_cache_block
     :kv_transfer_completion

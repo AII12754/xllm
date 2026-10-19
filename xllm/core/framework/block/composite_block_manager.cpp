@@ -21,7 +21,7 @@ limitations under the License.
 #include <utility>
 
 #include "core/framework/block/embedding_block_manager.h"
-#include "core/framework/block/virtual_memory_kv_cache_block_manager.h"
+#include "core/framework/block/vmm_kv_block_manager.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/request/sequence.h"
 #include "core/kv_cache/block/block_manager_impl.h"
@@ -121,10 +121,9 @@ std::unique_ptr<BlockManager> maybe_concurrent(
 
 // Choose the paged virtual memory manager or the flat free-list manager.
 // The paged manager does not support prefix caching.
-std::unique_ptr<BlockManager> make_kv_leaf(
-    const BlockManager::Options& kv_opts,
-    int32_t dp_rank,
-    VirtualKVCachePageAllocator* page_allocator) {
+std::unique_ptr<BlockManager> make_kv_leaf(const BlockManager::Options& kv_opts,
+                                           int32_t dp_rank,
+                                           VmmKVPageAllocator* page_allocator) {
   if (!kv_opts.enable_virtual_memory()) {
     return std::make_unique<BlockManagerImpl>(kv_opts);
   }
@@ -139,14 +138,13 @@ std::unique_ptr<BlockManager> make_kv_leaf(
   const size_t block_mem_size = kv_opts.virtual_block_bytes();
   CHECK_GT(block_mem_size, 0);
   CHECK_EQ(page_size % block_mem_size, 0);
-  return std::make_unique<VirtualMemoryKVCacheBlockManager>(
-      kv_opts,
-      *page_allocator,
-      kv_opts.num_layers(),
-      block_mem_size,
-      page_size,
-      dp_rank,
-      kv_opts.model_id());
+  return std::make_unique<VmmKVBlockManager>(kv_opts,
+                                             *page_allocator,
+                                             kv_opts.num_layers(),
+                                             block_mem_size,
+                                             page_size,
+                                             dp_rank,
+                                             kv_opts.model_id());
 }
 
 using ProbeResult = CompositeBlockManager::ProbeResult;
@@ -316,7 +314,7 @@ TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
 CompositeBlockManager::LeafMap build_composite_leaves(
     const BlockManager::Options& options,
     int32_t dp_rank,
-    VirtualKVCachePageAllocator* page_allocator) {
+    VmmKVPageAllocator* page_allocator) {
   CompositeBlockManager::LeafMap leaves;
 
   const bool prefix_cache_on = options.enable_prefix_cache();
@@ -990,6 +988,11 @@ void CompositeBlockManager::free(int32_t /*block_id*/) {
 Block CompositeBlockManager::allocate() {
   LOG(FATAL) << "CompositeBlockManager::allocate should not be called";
   return Block();
+}
+
+size_t CompositeBlockManager::admission_capacity() const {
+  const auto* leaf = capacity_leaf();
+  return leaf == nullptr ? 0 : leaf->leaf->admission_capacity();
 }
 
 size_t CompositeBlockManager::num_total_blocks() const {

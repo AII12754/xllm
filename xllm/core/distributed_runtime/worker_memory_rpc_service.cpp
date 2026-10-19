@@ -19,6 +19,7 @@ limitations under the License.
 #include <brpc/controller.h>
 #include <glog/logging.h>
 
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -34,7 +35,11 @@ WorkerMemoryRpcService::WorkerMemoryRpcService(int32_t global_rank,
     : initialized_(false),
       global_rank_(global_rank),
       world_size_(world_size),
-      device_(device) {}
+      device_(device),
+      threadpool_(/*num_threads=*/4,
+                  [device]() { Device(device).set_device(); },
+                  /*cpu_binding=*/false,
+                  /*pool_name=*/"WorkerMemoryRpcService.rpc") {}
 
 void WorkerMemoryRpcService::Hello(
     ::google::protobuf::RpcController* controller,
@@ -61,22 +66,31 @@ void WorkerMemoryRpcService::GetMemoryInfo(
     Device device(device_);
     device.set_device();
 
-    // Empty torch cache to get accurate memory info
-    int32_t device_id = device_.index();
+    const int32_t device_id = device_.index();
 
-    const int64_t available_memory = device.free_memory();
-    const int64_t total_memory = device.total_memory();
+    const WorkerMemoryCapacity capacity =
+        WorkerMemoryResources::get_instance().memory_capacity_snapshot();
+    const int64_t available_memory = capacity.available_memory;
+    const int64_t total_memory = capacity.total_memory;
 
     // Update device monitor
     DeviceMonitor::get_instance().set_total_memory(device_id, total_memory);
 
-    LOG(INFO) << "GetMemoryInfo: global_rank=" << global_rank_
-              << ", available_memory=" << available_memory
-              << ", total_memory=" << total_memory;
+    // Live admission queries this on the serving path; keep snapshots out of
+    // the default per-request logs.
+    VLOG(1) << "GetMemoryInfo: global_rank=" << global_rank_
+            << ", available_memory=" << available_memory
+            << ", total_memory=" << total_memory;
 
     // Returns 0 for both fields on failure (handled by caller)
     response->set_available_memory(available_memory);
     response->set_total_memory(total_memory);
+    response->set_pool_initialized(capacity.pool_initialized);
+    response->set_pool_capacity_pages(capacity.pool_capacity_pages);
+    response->set_pool_committed_pages(capacity.pool_committed_pages);
+    response->set_pool_allocatable_pages(capacity.pool_allocatable_pages);
+    response->set_execution_memory_reserve_bytes(
+        capacity.execution_memory_reserve_bytes);
   });
 }
 
@@ -88,22 +102,104 @@ void WorkerMemoryRpcService::InitPhysicalPagePool(
   threadpool_.schedule([this, request, response, done]() mutable {
     brpc::ClosureGuard done_guard(done);
 
-    int64_t num_pages = request->num_pages();
+    const int64_t num_pages = request->num_pages();
     LOG(INFO) << "InitPhysicalPagePool: global_rank=" << global_rank_
               << ", num_pages=" << num_pages;
 
-    try {
-      WorkerMemoryResources::get_instance().init_physical_page_pool(num_pages);
-      LOG(INFO) << "GlobalVirtualMemoryRegion initialized on worker "
-                << global_rank_;
+    WorkerMemoryResources::get_instance().init_physical_page_pool(
+        num_pages, request->lazy());
+    LOG(INFO) << "GlobalVirtualMemoryRegion initialized on worker "
+              << global_rank_;
 
-      response->set_ok(true);
-    } catch (const std::exception& e) {
-      LOG(ERROR)
-          << "Failed to init PhysicalPagePool/GlobalVirtualMemoryRegion: "
-          << e.what();
-      response->set_ok(false);
+    response->set_ok(true);
+  });
+}
+
+void WorkerMemoryRpcService::PrepareKvMapping(
+    ::google::protobuf::RpcController* /*controller*/,
+    const proto::PrepareKvMappingRequest* request,
+    proto::Status* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_.schedule([request, response, done]() {
+    brpc::ClosureGuard done_guard(done);
+    std::vector<offset_t> offsets;
+    offsets.reserve(request->offsets_size());
+    for (uint64_t offset : request->offsets()) {
+      if (offset >
+          static_cast<uint64_t>(std::numeric_limits<offset_t>::max())) {
+        response->set_ok(false);
+        return;
+      }
+      offsets.emplace_back(static_cast<offset_t>(offset));
     }
+    response->set_ok(WorkerMemoryResources::get_instance().prepare_kv_mapping(
+        request->transaction_id(), request->model_id(), offsets));
+  });
+}
+
+void WorkerMemoryRpcService::CommitKvMapping(
+    ::google::protobuf::RpcController* /*controller*/,
+    const proto::KvMappingTransactionRequest* request,
+    proto::Status* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_.schedule([request, response, done]() {
+    brpc::ClosureGuard done_guard(done);
+    response->set_ok(WorkerMemoryResources::get_instance().commit_kv_mapping(
+        request->transaction_id()));
+  });
+}
+
+void WorkerMemoryRpcService::AbortKvMapping(
+    ::google::protobuf::RpcController* /*controller*/,
+    const proto::KvMappingTransactionRequest* request,
+    proto::Status* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_.schedule([request, response, done]() {
+    brpc::ClosureGuard done_guard(done);
+    response->set_ok(WorkerMemoryResources::get_instance().abort_kv_mapping(
+        request->transaction_id()));
+  });
+}
+
+void WorkerMemoryRpcService::PrepareWeightPages(
+    ::google::protobuf::RpcController* /*controller*/,
+    const proto::PrepareWeightPagesRequest* request,
+    proto::Status* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_.schedule([request, response, done]() {
+    brpc::ClosureGuard done_guard(done);
+    if (request->num_pages() > std::numeric_limits<size_t>::max()) {
+      response->set_ok(false);
+      return;
+    }
+    response->set_ok(WorkerMemoryResources::get_instance().prepare_weight_pages(
+        request->transaction_id(),
+        request->model_id(),
+        static_cast<size_t>(request->num_pages())));
+  });
+}
+
+void WorkerMemoryRpcService::CommitWeightPages(
+    ::google::protobuf::RpcController* /*controller*/,
+    const proto::KvMappingTransactionRequest* request,
+    proto::Status* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_.schedule([request, response, done]() {
+    brpc::ClosureGuard done_guard(done);
+    response->set_ok(WorkerMemoryResources::get_instance().commit_weight_pages(
+        request->transaction_id()));
+  });
+}
+
+void WorkerMemoryRpcService::AbortWeightPages(
+    ::google::protobuf::RpcController* /*controller*/,
+    const proto::KvMappingTransactionRequest* request,
+    proto::Status* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_.schedule([request, response, done]() {
+    brpc::ClosureGuard done_guard(done);
+    response->set_ok(WorkerMemoryResources::get_instance().abort_weight_pages(
+        request->transaction_id()));
   });
 }
 
@@ -188,7 +284,8 @@ void WorkerMemoryRpcService::FreeWeightPages(
     auto& resources = WorkerMemoryResources::get_instance();
     size_t num_freed = resources.free_weight(model_id);
 
-    response->set_ok(num_freed > 0);
+    // Free is idempotent: a successful earlier RPC may have lost its reply.
+    response->set_ok(true);
 
     LOG(INFO) << "FreeWeightPages: freed " << num_freed << " pages for model "
               << model_id;

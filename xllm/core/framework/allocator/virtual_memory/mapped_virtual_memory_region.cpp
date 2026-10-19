@@ -215,7 +215,23 @@ bool MappedVirtualMemoryRegion::map_pages(
     auto [region, offset] = missing[i];
     VirPtr addr = add_vir_ptr_offset(region->vaddr_, offset);
     PhyMemHandle handle = pages[i]->get_phy_handle();
-    vmm::map(addr, handle, region->page_size_, region->dev_.index());
+    if (!vmm::try_map(addr, handle, region->page_size_, region->dev_.index())) {
+      // No page ownership has been published to a region yet. Undo only this
+      // batch's new aliases; preexisting mappings remain untouched.
+      for (size_t mapped = 0; mapped < i; ++mapped) {
+        auto [mapped_region, mapped_offset] = missing[mapped];
+        VirPtr mapped_address =
+            add_vir_ptr_offset(mapped_region->vaddr_, mapped_offset);
+        vmm::unmap(mapped_address,
+                   mapped_region->page_size_,
+                   mapped_region->page_size_);
+      }
+      pool.batch_put(pages);
+      return false;
+    }
+  }
+  for (size_t i = 0; i < missing.size(); ++i) {
+    auto [region, offset] = missing[i];
     region->mapping_.emplace(offset / region->page_size_, std::move(pages[i]));
   }
   return true;
@@ -301,7 +317,14 @@ bool MappedVirtualMemoryRegion::map_with_page_ids(
   for (size_t i = 0; i < page_ids.size(); ++i) {
     VirPtr addr = add_vir_ptr_offset(vaddr_, i * page_size_);
     PhyMemHandle handle = all_pages[page_ids[i]]->get_phy_handle();
-    vmm::map(addr, handle, page_size_, dev_.index());
+    if (!vmm::try_map(addr, handle, page_size_, dev_.index())) {
+      for (size_t mapped = 0; mapped < mapped_preallocated_pages_; ++mapped) {
+        VirPtr mapped_address = add_vir_ptr_offset(vaddr_, mapped * page_size_);
+        vmm::unmap(mapped_address, page_size_, page_size_);
+      }
+      mapped_preallocated_pages_ = 0;
+      return false;
+    }
     ++mapped_preallocated_pages_;
   }
   return true;

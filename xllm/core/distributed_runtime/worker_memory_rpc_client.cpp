@@ -25,11 +25,25 @@ limitations under the License.
 #include "core/framework/config/service_config.h"
 
 namespace xllm {
+namespace {
+
+constexpr int32_t kDefaultTransactionTimeoutMs = 30000;
+
+int32_t get_transaction_timeout_ms() {
+  const int32_t timeout_ms =
+      ServiceConfig::get_instance().rpc_channel_timeout_ms();
+  // Ownership transactions need a deadline even when other RPCs are unbounded.
+  return timeout_ms > 0 ? timeout_ms : kDefaultTransactionTimeoutMs;
+}
+
+}  // namespace
 
 WorkerMemoryRpcClient::WorkerMemoryRpcClient(int32_t global_rank,
                                              const std::string& server_address,
                                              const torch::Device& device)
-    : global_rank_(global_rank), device_(device) {
+    : global_rank_(global_rank),
+      device_(device),
+      transaction_timeout_ms_(get_transaction_timeout_ms()) {
   options_.connection_type = "pooled";
   options_.timeout_ms = -1;
   options_.connect_timeout_ms = -1;
@@ -72,33 +86,45 @@ bool WorkerMemoryRpcClient::wait_for_server_ready(
   return true;
 }
 
-folly::SemiFuture<MemoryInfo> WorkerMemoryRpcClient::get_memory_info_async() {
+folly::SemiFuture<MemoryInfo> WorkerMemoryRpcClient::get_memory_info_async(
+    int32_t timeout_ms) {
   folly::Promise<MemoryInfo> promise;
   auto future = promise.getSemiFuture();
-  threadpool_.schedule([this, promise = std::move(promise)]() mutable {
-    proto::Status req;
-    proto::MemoryInfoResponse resp;
-    brpc::Controller cntl;
-    stub_->GetMemoryInfo(&cntl, &req, &resp, nullptr);
-    if (cntl.Failed()) {
-      LOG(ERROR) << "GetMemoryInfo failed: " << cntl.ErrorText();
-      promise.setValue(MemoryInfo{0, 0});
-      return;
-    }
-    // Returns 0 for both fields on failure
-    promise.setValue(MemoryInfo{resp.available_memory(), resp.total_memory()});
-  });
+  capacity_query_threadpool_.schedule(
+      [this, timeout_ms, promise = std::move(promise)]() mutable {
+        proto::Status req;
+        proto::MemoryInfoResponse resp;
+        brpc::Controller cntl;
+        cntl.set_timeout_ms(timeout_ms);
+        stub_->GetMemoryInfo(&cntl, &req, &resp, nullptr);
+        if (cntl.Failed()) {
+          LOG(ERROR) << "GetMemoryInfo failed: " << cntl.ErrorText();
+          promise.setValue(MemoryInfo{0, 0});
+          return;
+        }
+        // Returns 0 for both fields on failure
+        promise.setValue(MemoryInfo{
+            resp.available_memory(),
+            resp.total_memory(),
+            resp.pool_initialized(),
+            static_cast<size_t>(resp.pool_capacity_pages()),
+            static_cast<size_t>(resp.pool_committed_pages()),
+            static_cast<size_t>(resp.pool_allocatable_pages()),
+            static_cast<size_t>(resp.execution_memory_reserve_bytes())});
+      });
   return future;
 }
 
 folly::SemiFuture<bool> WorkerMemoryRpcClient::init_physical_page_pool_async(
-    int64_t num_pages) {
+    int64_t num_pages,
+    bool lazy) {
   folly::Promise<bool> promise;
   auto future = promise.getSemiFuture();
   threadpool_.schedule(
-      [this, num_pages, promise = std::move(promise)]() mutable {
+      [this, num_pages, lazy, promise = std::move(promise)]() mutable {
         proto::InitPhysicalPagePoolRequest req;
         req.set_num_pages(num_pages);
+        req.set_lazy(lazy);
         proto::Status resp;
         brpc::Controller cntl;
         stub_->InitPhysicalPagePool(&cntl, &req, &resp, nullptr);
@@ -109,6 +135,123 @@ folly::SemiFuture<bool> WorkerMemoryRpcClient::init_physical_page_pool_async(
         }
         promise.setValue(resp.ok());
       });
+  return future;
+}
+
+folly::SemiFuture<bool> WorkerMemoryRpcClient::prepare_kv_mapping_async(
+    uint64_t transaction_id,
+    const std::string& model_id,
+    const std::vector<offset_t>& offsets) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        transaction_id,
+                        model_id,
+                        offsets,
+                        promise = std::move(promise)]() mutable {
+    proto::PrepareKvMappingRequest req;
+    req.set_transaction_id(transaction_id);
+    req.set_model_id(model_id);
+    for (offset_t offset : offsets) {
+      if (offset < 0) {
+        promise.setValue(false);
+        return;
+      }
+      req.add_offsets(static_cast<uint64_t>(offset));
+    }
+    proto::Status resp;
+    brpc::Controller cntl;
+    cntl.set_timeout_ms(transaction_timeout_ms_);
+    stub_->PrepareKvMapping(&cntl, &req, &resp, nullptr);
+    if (cntl.Failed()) {
+      LOG(ERROR) << "PrepareKvMapping failed: " << cntl.ErrorText();
+    }
+    promise.setValue(!cntl.Failed() && resp.ok());
+  });
+  return future;
+}
+
+folly::SemiFuture<bool> WorkerMemoryRpcClient::commit_kv_mapping_async(
+    uint64_t transaction_id) {
+  return finish_mapping_async(
+      transaction_id, /*commit=*/true, /*weight=*/false);
+}
+
+folly::SemiFuture<bool> WorkerMemoryRpcClient::abort_kv_mapping_async(
+    uint64_t transaction_id) {
+  return finish_mapping_async(
+      transaction_id, /*commit=*/false, /*weight=*/false);
+}
+
+folly::SemiFuture<bool> WorkerMemoryRpcClient::prepare_weight_pages_async(
+    uint64_t transaction_id,
+    const std::string& model_id,
+    size_t num_pages) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        transaction_id,
+                        model_id,
+                        num_pages,
+                        promise = std::move(promise)]() mutable {
+    proto::PrepareWeightPagesRequest req;
+    req.set_transaction_id(transaction_id);
+    req.set_model_id(model_id);
+    req.set_num_pages(num_pages);
+    proto::Status resp;
+    brpc::Controller cntl;
+    cntl.set_timeout_ms(transaction_timeout_ms_);
+    stub_->PrepareWeightPages(&cntl, &req, &resp, nullptr);
+    if (cntl.Failed()) {
+      LOG(ERROR) << "PrepareWeightPages failed: " << cntl.ErrorText();
+    }
+    promise.setValue(!cntl.Failed() && resp.ok());
+  });
+  return future;
+}
+
+folly::SemiFuture<bool> WorkerMemoryRpcClient::commit_weight_pages_async(
+    uint64_t transaction_id) {
+  return finish_mapping_async(transaction_id, /*commit=*/true, /*weight=*/true);
+}
+
+folly::SemiFuture<bool> WorkerMemoryRpcClient::abort_weight_pages_async(
+    uint64_t transaction_id) {
+  return finish_mapping_async(
+      transaction_id, /*commit=*/false, /*weight=*/true);
+}
+
+folly::SemiFuture<bool> WorkerMemoryRpcClient::finish_mapping_async(
+    uint64_t transaction_id,
+    bool commit,
+    bool weight) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        transaction_id,
+                        commit,
+                        weight,
+                        promise = std::move(promise)]() mutable {
+    proto::KvMappingTransactionRequest req;
+    req.set_transaction_id(transaction_id);
+    proto::Status resp;
+    brpc::Controller cntl;
+    cntl.set_timeout_ms(transaction_timeout_ms_);
+    if (weight && commit) {
+      stub_->CommitWeightPages(&cntl, &req, &resp, nullptr);
+    } else if (weight) {
+      stub_->AbortWeightPages(&cntl, &req, &resp, nullptr);
+    } else if (commit) {
+      stub_->CommitKvMapping(&cntl, &req, &resp, nullptr);
+    } else {
+      stub_->AbortKvMapping(&cntl, &req, &resp, nullptr);
+    }
+    if (cntl.Failed()) {
+      LOG(ERROR) << "KV mapping transaction completion failed: "
+                 << cntl.ErrorText();
+    }
+    promise.setValue(!cntl.Failed() && resp.ok());
+  });
   return future;
 }
 

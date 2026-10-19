@@ -19,7 +19,7 @@ limitations under the License.
 #include <limits>
 
 #include "core/framework/block/composite_block_manager.h"
-#include "core/framework/block/virtual_memory_kv_cache_block_manager.h"
+#include "core/framework/block/vmm_kv_block_manager.h"
 #include "core/kv_cache/block/block_manager_impl.h"
 #include "core/kv_cache/block/concurrent_block_manager_impl.h"
 #include "core/kv_cache/block/linear_state_block_manager.h"
@@ -28,9 +28,25 @@ limitations under the License.
 
 namespace xllm {
 
+namespace {
+
+size_t total_admission_blocks(const BlockManager& manager,
+                              BlockType type,
+                              bool enable_virtual_memory) {
+  size_t total_blocks = manager.num_total_blocks();
+  if (type == BlockType::KV && enable_virtual_memory && total_blocks > 0) {
+    // VMM includes the padding block in its configured total. Ordinary
+    // BlockManagerImpl leaves already exclude that block.
+    --total_blocks;
+  }
+  return total_blocks;
+}
+
+}  // namespace
+
 BlockManagerPool::BlockManagerPool(const Options& options,
                                    int32_t dp_size,
-                                   VirtualKVCachePageAllocator* page_allocator)
+                                   VmmKVPageAllocator* page_allocator)
     : page_allocator_(page_allocator), options_(options) {
   CHECK(dp_size > 0) << "dp_size must be greater than 0";
   block_managers_.reserve(dp_size);
@@ -84,7 +100,7 @@ BlockManagerPool::BlockManagerPool(const Options& options,
           .event_scope(KVCacheEventScope{options_.model_id(), i, "gpu"});
     }
     // The pool always holds a CompositeBlockManager. Its KV leaf is a flat
-    // BlockManagerImpl, or a VirtualMemoryKVCacheBlockManager when
+    // BlockManagerImpl, or a VmmKVBlockManager when
     // enable_virtual_memory (the builder picks); SWA / C4 / C128 come from
     // manager_types; the LINEAR leaf is added by the builder when
     // enable_linear_state. The per-sequence EMBEDDING resource leaf is appended
@@ -126,16 +142,18 @@ int32_t BlockManagerPool::get_manager_with_max_available_blocks() const {
   }
 
   // Prefix-cache entries consume physical free blocks but remain evictable.
-  // Rank by effective headroom instead of the raw free-list size so a DP group
-  // with an idle, full prefix cache is not mistaken for a busy group.
+  // Rank by admissible headroom so an idle prefix cache remains evictable and
+  // an empty virtual arena without live physical headroom is not preferred.
   size_t max_available = 0;
   std::vector<size_t> candidate_indices;
   candidate_indices.reserve(block_managers_.size());
   for (size_t i = 0; i < block_managers_.size(); ++i) {
-    const size_t total_blocks = block_managers_[i]->num_total_blocks();
+    const size_t total_blocks = block_managers_[i]->admission_capacity();
     const size_t used_blocks = block_managers_[i]->num_used_blocks();
-    CHECK_LE(used_blocks, total_blocks);
-    const size_t available_blocks = total_blocks - used_blocks;
+    // Capacity and usage are advisory snapshots from separate calls. A
+    // concurrent allocation can consume headroom between the two reads.
+    const size_t available_blocks =
+        total_blocks > used_blocks ? total_blocks - used_blocks : 0;
     if (candidate_indices.empty() || available_blocks > max_available) {
       max_available = available_blocks;
       candidate_indices.clear();
@@ -258,6 +276,133 @@ bool BlockManagerPool::allocate(Sequence* sequence, size_t num_tokens) {
   return true;
 }
 
+bool BlockManagerPool::exceeds_total_capacity(Sequence* sequence,
+                                              size_t num_tokens) const {
+  DCHECK(sequence != nullptr);
+  if (sequence == nullptr || block_managers_.empty()) {
+    return false;
+  }
+  const int32_t assigned_rank = sequence->dp_rank();
+  if (assigned_rank >= 0 &&
+      static_cast<size_t>(assigned_rank) >= block_managers_.size()) {
+    return false;
+  }
+  for (size_t dp_rank = 0; dp_rank < block_managers_.size(); ++dp_rank) {
+    if (assigned_rank >= 0 && dp_rank != static_cast<size_t>(assigned_rank)) {
+      continue;
+    }
+    const auto* composite = static_cast<const CompositeBlockManager*>(
+        block_managers_[dp_rank].get());
+    bool fits_rank = true;
+    for (const auto& [type, entry] : composite->leaf_entries()) {
+      if (!entry.participates_in_admission || entry.leaf->block_size() == 0) {
+        continue;
+      }
+      const size_t block_size = entry.leaf->block_size();
+      const size_t required_blocks =
+          num_tokens / block_size + (num_tokens % block_size != 0);
+      if (required_blocks >
+          total_admission_blocks(
+              *entry.leaf, type, options_.enable_virtual_memory())) {
+        fits_rank = false;
+        break;
+      }
+    }
+    if (fits_rank) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool BlockManagerPool::exceeds_total_capacity(
+    const std::vector<KVCacheReservation>& reservations) const {
+  if (reservations.empty() || block_managers_.empty()) {
+    return false;
+  }
+
+  bool can_aggregate = !options_.enable_prefix_cache();
+  for (const auto& [sequence, num_tokens] : reservations) {
+    DCHECK(sequence != nullptr);
+    if (sequence == nullptr) {
+      return false;
+    }
+    if (exceeds_total_capacity(sequence, num_tokens)) {
+      return true;
+    }
+    const int32_t assigned_rank = sequence->dp_rank();
+    if (assigned_rank >= 0 &&
+        static_cast<size_t>(assigned_rank) >= block_managers_.size()) {
+      return false;
+    }
+    // Prefix hits and beam/preempted states can share physical blocks. Their
+    // combined token footprint is not an exact physical reservation.
+    can_aggregate = can_aggregate && !sequence->check_beam_search() &&
+                    !sequence->has_any_blocks();
+  }
+  if (reservations.size() == 1 || !can_aggregate) {
+    return false;
+  }
+
+  const size_t num_tokens = reservations.front().second;
+  if (std::any_of(reservations.begin(),
+                  reservations.end(),
+                  [num_tokens](const auto& reservation) {
+                    return reservation.second != num_tokens;
+                  })) {
+    // Different footprints require an assignment strategy across DP ranks.
+    // Preserve those requests when only individual bounds are known.
+    return false;
+  }
+
+  // Fresh best_of sequences have identical, independent reservations. Count
+  // how many whole reservations fit each rank without binding their ranks or
+  // consulting transient usage by unrelated requests.
+  std::vector<size_t> remaining_slots(block_managers_.size(),
+                                      std::numeric_limits<size_t>::max());
+  for (size_t dp_rank = 0; dp_rank < block_managers_.size(); ++dp_rank) {
+    const auto* composite = static_cast<const CompositeBlockManager*>(
+        block_managers_[dp_rank].get());
+    for (const auto& [type, entry] : composite->leaf_entries()) {
+      if (!entry.participates_in_admission) {
+        continue;
+      }
+      const size_t block_size = entry.leaf->block_size();
+      if (block_size == 0) {
+        return false;
+      }
+      const size_t required_blocks =
+          num_tokens / block_size + (num_tokens % block_size != 0);
+      if (required_blocks == 0) {
+        continue;
+      }
+      const size_t capacity = total_admission_blocks(
+          *entry.leaf, type, options_.enable_virtual_memory());
+      remaining_slots[dp_rank] =
+          std::min(remaining_slots[dp_rank], capacity / required_blocks);
+    }
+  }
+
+  size_t unassigned_sequences = 0;
+  for (const auto& reservation : reservations) {
+    const Sequence* sequence = reservation.first;
+    const int32_t assigned_rank = sequence->dp_rank();
+    if (assigned_rank < 0) {
+      ++unassigned_sequences;
+      continue;
+    }
+    size_t& slots = remaining_slots[static_cast<size_t>(assigned_rank)];
+    if (slots == 0) {
+      return true;
+    }
+    --slots;
+  }
+  for (const size_t slots : remaining_slots) {
+    unassigned_sequences -= std::min(unassigned_sequences, slots);
+  }
+  return unassigned_sequences > 0;
+}
+
 std::vector<Block> BlockManagerPool::allocate(size_t num_tokens,
                                               int32_t& dp_rank) {
   dp_rank = get_manager_with_max_available_blocks();
@@ -375,6 +520,16 @@ float BlockManagerPool::get_gpu_cache_usage_perc() const {
 }
 
 uint32_t BlockManagerPool::num_blocks() const { return options_.num_blocks(); }
+
+size_t BlockManagerPool::admission_capacity(int32_t dp_rank) const {
+  CHECK_GE(dp_rank, 0);
+  CHECK_LT(static_cast<size_t>(dp_rank), block_managers_.size());
+  if (!options_.enable_virtual_memory()) {
+    // Preserve the original physical-cache scheduler's configured capacity.
+    return num_blocks();
+  }
+  return block_managers_[dp_rank]->admission_capacity();
+}
 
 int32_t BlockManagerPool::block_size() const { return options_.block_size(); }
 
