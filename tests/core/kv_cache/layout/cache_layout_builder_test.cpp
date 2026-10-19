@@ -20,13 +20,41 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
+#include "core/kv_cache/layout/flashinfer_cache_layout.h"
+#include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/layout/kv_shard_layout.h"
 #include "layers/common/kv_shard_batch_metadata.h"
 
 namespace xllm {
 
 namespace {
+
+TEST(CacheLayoutBuilderTest, FlashinferResolvesPhysicalWidthWithoutModelType) {
+  ModelArgs args;
+  args.head_dim() = 96;
+  configure_flashinfer_kv_cache_layout(args);
+  EXPECT_EQ(args.head_dim(), 96);
+  EXPECT_EQ(get_kv_cache_head_dim(args), 128);
+  configure_flashinfer_kv_cache_layout(args);
+  EXPECT_EQ(get_kv_cache_head_dim(args), 128);
+}
+
+TEST(CacheLayoutBuilderTest, FlashinferPreservesNativeAndMlaGeometry) {
+  for (const int64_t head_dim : {64, 128, 256}) {
+    ModelArgs args;
+    args.head_dim() = head_dim;
+    configure_flashinfer_kv_cache_layout(args);
+    EXPECT_EQ(args.kv_cache_head_dim(), 0);
+    EXPECT_EQ(get_kv_cache_head_dim(args), head_dim);
+  }
+  ModelArgs mla_args;
+  mla_args.head_dim() = 96;
+  mla_args.enable_mla() = true;
+  configure_flashinfer_kv_cache_layout(mla_args);
+  EXPECT_EQ(mla_args.kv_cache_head_dim(), 0);
+}
 
 TEST(CacheLayoutBuilderTest, DescribesTokenMajorGqaHeads) {
   CacheTensorLayoutContext context;
@@ -276,5 +304,30 @@ TEST(KVShardLayoutTest, MapsTokensAndSlots) {
 }
 
 }  // namespace
+
+TEST(CacheLayoutBuilderTest, PhysicalHeadWidthControlsBothCacheShapes) {
+  ModelArgs model_args;
+  model_args.head_dim(96).kv_cache_head_dim(128).n_heads(32).n_kv_heads(32);
+  KVCacheCapacity capacity;
+  capacity.n_blocks(8).block_size(16);
+
+  const KVCacheShape shape(capacity, model_args, /*world_size=*/2);
+  const std::vector<int64_t> expected = {8, 16, 16, 128};
+  EXPECT_EQ(shape.key_cache_shape(), expected);
+  EXPECT_EQ(shape.value_cache_shape(), expected);
+  EXPECT_EQ(model_args.head_dim(), 96);
+}
+
+TEST(CacheLayoutBuilderTest, DefaultCacheWidthRetainsLogicalHeadWidth) {
+  ModelArgs model_args;
+  model_args.head_dim(128).n_heads(32).n_kv_heads(32);
+  KVCacheCapacity capacity;
+  capacity.n_blocks(8).block_size(16);
+
+  const KVCacheShape shape(capacity, model_args, /*world_size=*/2);
+  const std::vector<int64_t> expected = {8, 16, 16, 128};
+  EXPECT_EQ(shape.key_cache_shape(), expected);
+  EXPECT_EQ(shape.value_cache_shape(), expected);
+}
 
 }  // namespace xllm

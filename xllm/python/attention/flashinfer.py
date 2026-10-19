@@ -68,10 +68,15 @@ class FlashInferBackend(AttentionBackend):
         sliding_window: int,
         device: torch.device,
         dtype: torch.dtype,
+        kv_cache_head_dim: int = 0,
     ) -> None:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self._kernel_head_dim = kv_cache_head_dim or head_dim
+        if self._kernel_head_dim < head_dim:
+            raise ValueError("kv_cache_head_dim must be at least the logical head_dim")
+        self._head_dim_padding = self._kernel_head_dim - head_dim
         self.scale = scale
         self.sliding_window = sliding_window
         self.dtype = dtype
@@ -102,6 +107,14 @@ class FlashInferBackend(AttentionBackend):
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         if not kv_caches:
             raise ValueError("FlashInferBackend requires at least one KV cache")
+        for layer_id, cache in enumerate(kv_caches):
+            for tensor in (cache.key, cache.value):
+                if (
+                    tensor is not None
+                    and tensor.numel()
+                    and tuple(tensor.shape[-2:]) != (self.num_kv_heads, self._kernel_head_dim)
+                ):
+                    raise ValueError(f"layer {layer_id}: KV cache must use physical head_dim={self._kernel_head_dim}")
         self._kv_caches = kv_caches
 
     @property
@@ -150,7 +163,7 @@ class FlashInferBackend(AttentionBackend):
                 metadata.kv_cu_seq_lens,
                 self.num_heads,
                 self.num_kv_heads,
-                self.head_dim,
+                self._kernel_head_dim,
                 causal=True,
                 sm_scale=self.scale,
                 window_left=window_left,
@@ -164,7 +177,7 @@ class FlashInferBackend(AttentionBackend):
                 metadata.paged_kv_last_page_len,
                 self.num_heads,
                 self.num_kv_heads,
-                self.head_dim,
+                self._kernel_head_dim,
                 self.page_size,
                 causal=True,
                 sm_scale=self.scale,
@@ -188,7 +201,7 @@ class FlashInferBackend(AttentionBackend):
                 metadata.paged_kv_last_page_len,
                 self.num_heads,
                 self.num_kv_heads,
-                self.head_dim,
+                self._kernel_head_dim,
                 self.page_size,
                 sm_scale=self.scale,
                 window_left=window_left,
@@ -211,7 +224,7 @@ class FlashInferBackend(AttentionBackend):
                 last_page_len_host,
                 self.num_heads,
                 self.num_kv_heads,
-                self.head_dim,
+                self._kernel_head_dim,
                 self.page_size,
                 sm_scale=self.scale,
                 window_left=window_left,
@@ -227,7 +240,7 @@ class FlashInferBackend(AttentionBackend):
             last_page_len_host,
             self.num_heads,
             self.num_kv_heads,
-            self.head_dim,
+            self._kernel_head_dim,
             self.page_size,
             sm_scale=self.scale,
             window_left=window_left,
@@ -279,9 +292,17 @@ class FlashInferBackend(AttentionBackend):
         if k_cache is None or v_cache is None:
             raise RuntimeError(f"full-attention KV cache is missing for layer {layer.layer_id}")
         q_3d = q.view(-1, layer.num_heads, layer.head_dim)
-        k_3d = _pack_head_axes(k.view(-1, layer.num_kv_heads, layer.head_dim))
-        v_3d = _pack_head_axes(v.view(-1, layer.num_kv_heads, layer.head_dim))
+        k_3d = k.view(-1, layer.num_kv_heads, layer.head_dim)
+        v_3d = v.view(-1, layer.num_kv_heads, layer.head_dim)
 
+        if self._head_dim_padding:
+            # Zero padding preserves Q.K and V; scale remains based on logical D.
+            q_3d = torch.nn.functional.pad(q_3d, (0, self._head_dim_padding))
+            k_3d = torch.nn.functional.pad(k_3d, (0, self._head_dim_padding))
+            v_3d = torch.nn.functional.pad(v_3d, (0, self._head_dim_padding))
+        else:
+            k_3d = _pack_head_axes(k_3d)
+            v_3d = _pack_head_axes(v_3d)
         kernels.reshape_paged_cache(metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache)
 
         if metadata.is_prefill:
@@ -291,4 +312,6 @@ class FlashInferBackend(AttentionBackend):
         else:
             output = self._active_decode_wrapper.run(q_3d, (k_cache, v_cache))
 
+        if self._head_dim_padding:
+            output = output[..., : self.head_dim].contiguous()
         return output.view(-1, layer.num_heads * layer.head_dim)

@@ -739,6 +739,105 @@ TEST(HFModelLoaderTest, Qwen35MtpModelArgsFromMoeConfig) {
 #endif
 
 #if defined(USE_CUDA)
+TEST(HFModelLoaderTest, Phi3Mini4KConfigPreservesLogicalDimensions) {
+  EXPECT_EQ(ModelRegistry::get_model_backend("phi3"), "llm");
+  ModelArgsLoader loader = ModelRegistry::get_model_args_loader("phi3");
+  ASSERT_NE(loader, nullptr);
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "model_type": "phi3",
+      "torch_dtype": "bfloat16",
+      "hidden_size": 3072,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 32,
+      "num_hidden_layers": 32,
+      "intermediate_size": 8192,
+      "vocab_size": 32064,
+      "max_position_embeddings": 4096,
+      "rms_norm_eps": 0.00001,
+      "rope_theta": 10000.0,
+      "rope_scaling": null,
+      "sliding_window": 2047,
+      "bos_token_id": 1,
+      "eos_token_id": 32000,
+      "pad_token_id": 32000
+    }
+  )json"));
+
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.model_type(), "phi3");
+  EXPECT_EQ(args.dtype(), "bfloat16");
+  EXPECT_EQ(args.hidden_size(), 3072);
+  EXPECT_EQ(args.n_heads(), 32);
+  EXPECT_EQ(args.n_kv_heads(), std::optional<int64_t>(32));
+  EXPECT_EQ(args.n_layers(), 32);
+  EXPECT_EQ(args.intermediate_size(), 8192);
+  EXPECT_EQ(args.vocab_size(), 32064);
+  EXPECT_EQ(args.head_dim(), 96);
+  EXPECT_EQ(args.kv_cache_head_dim(), 0);
+  EXPECT_EQ(get_kv_cache_head_dim(args), 96);
+  EXPECT_EQ(args.max_position_embeddings(), 4096);
+  EXPECT_FLOAT_EQ(args.rms_norm_eps(), 1e-5f);
+  EXPECT_FLOAT_EQ(args.rope_theta(), 10000.0f);
+  EXPECT_EQ(args.sliding_window(), 2047);
+  EXPECT_TRUE(args.use_sliding_window());
+  EXPECT_EQ(args.bos_token_id(), 1);
+  EXPECT_EQ(args.eos_token_id(), 32000);
+  EXPECT_EQ(args.pad_token_id(), 32000);
+  EXPECT_EQ(args.stop_token_ids(),
+            std::unordered_set<int32_t>({32000, 32001, 32007}));
+}
+
+TEST(HFModelLoaderTest, Phi3DerivesAbsentKvHeadsAndDisablesNullWindow) {
+  ModelArgsLoader loader = ModelRegistry::get_model_args_loader("phi3");
+  ASSERT_NE(loader, nullptr);
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "model_type": "phi3",
+      "hidden_size": 512,
+      "num_attention_heads": 8,
+      "num_key_value_heads": null,
+      "sliding_window": null
+    }
+  )json"));
+
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.n_kv_heads(), std::optional<int64_t>(8));
+  EXPECT_EQ(args.head_dim(), 64);
+  EXPECT_EQ(get_kv_cache_head_dim(args), 64);
+  EXPECT_EQ(args.sliding_window(), -1);
+  EXPECT_FALSE(args.use_sliding_window());
+}
+
+TEST(HFModelLoaderTest, Phi3RejectsInvalidDimensionsAndUnsupportedSemantics) {
+  ModelArgsLoader loader = ModelRegistry::get_model_args_loader("phi3");
+  ASSERT_NE(loader, nullptr);
+  for (const char* config : {
+           R"({"hidden_size":3073})",
+           R"({"num_attention_heads":0})",
+           R"({"num_key_value_heads":3})",
+           R"({"head_dim":128})",
+           R"({"hidden_act":"gelu"})",
+           R"({"attention_bias":true})",
+           R"({"tie_word_embeddings":true})",
+           R"({"rope_scaling":{"type":"longrope"}})",
+           R"({"sliding_window":0})",
+           R"({"sliding_window":-2})",
+           R"({"rms_norm_eps":0})",
+           R"({"rope_theta":0})",
+       }) {
+    SCOPED_TRACE(config);
+    JsonReader reader;
+    ASSERT_TRUE(reader.parse_text(config));
+    ModelArgs args;
+    EXPECT_FALSE(loader(reader, &args));
+  }
+}
+
 TEST(HFModelLoaderTest, MiMoMtpModelArgsFromExportedConfig) {
   // export_mtp.py sets num_hidden_layers = mtp_layer_count (1) in the exported
   // config, matching mtp_layers.0.* weight layout loaded by MiMoMtpModelImpl.

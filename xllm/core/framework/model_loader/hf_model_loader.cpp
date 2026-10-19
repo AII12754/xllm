@@ -46,6 +46,7 @@ limitations under the License.
 #include "core/framework/tokenizer/sentencepiece_tokenizer.h"
 #include "core/framework/tokenizer/tiktoken_tokenizer.h"
 #include "core/framework/tokenizer/tokenizer_factory.h"
+#include "core/kv_cache/layout/flashinfer_cache_layout.h"
 #include "core/platform/device.h"
 #include "core/util/blocking_counter.h"
 #include "core/util/json_reader.h"
@@ -508,6 +509,13 @@ bool HFModelLoader::load_args(const std::string& model_weights_path) {
     LOG(ERROR) << "Failed to load model args from " << model_weights_path;
     return false;
   }
+
+#if defined(USE_CUDA)
+  if (ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl())) {
+    configure_flashinfer_kv_cache_layout(args_);
+  }
+#endif
 
   if (!load_quant_args(model_weights_path)) {
     LOG(ERROR) << "Failed to load quant args from " << model_weights_path;

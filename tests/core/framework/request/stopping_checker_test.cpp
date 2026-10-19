@@ -24,6 +24,34 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+TEST(StoppingCheckerTest, PromptStopTokensDoNotFinishBeforeGeneration) {
+  StoppingChecker checker(/*max_generated_tokens=*/4,
+                          /*max_context_len=*/32,
+                          /*eos_token=*/2,
+                          /*ignore_eos=*/false,
+                          /*stop_tokens=*/{3},
+                          /*stop_sequences=*/{});
+  for (const int32_t stop_token : {2, 3}) {
+    SCOPED_TRACE(stop_token);
+    const std::vector<int32_t> prompt = {1, stop_token};
+    size_t matched_stop_token_count = 99;
+    StopReason stop_reason;
+    EXPECT_EQ(
+        checker.check(
+            prompt, prompt.size(), &matched_stop_token_count, &stop_reason),
+        FinishReason::NONE);
+    EXPECT_EQ(matched_stop_token_count, 0);
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(stop_reason));
+    const std::vector<int32_t> pending = {1, stop_token, -1};
+    EXPECT_EQ(checker.check(pending, prompt.size()), FinishReason::NONE);
+    const std::vector<int32_t> generated = {1, stop_token, stop_token, -1};
+    EXPECT_EQ(
+        checker.check(generated, prompt.size(), &matched_stop_token_count),
+        FinishReason::STOP);
+    EXPECT_EQ(matched_stop_token_count, 1);
+  }
+}
+
 TEST(StoppingCheckerTest, IgnoreEosSkipsOnlyEosToken) {
   StoppingChecker checker(
       /*max_generated_tokens=*/10,

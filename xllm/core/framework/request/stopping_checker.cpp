@@ -92,8 +92,10 @@ FinishReason StoppingChecker::check(const Slice<int32_t>& token_ids,
     return FinishReason::NONE;
   }
 
-  // check eos token
-  if (!ignore_eos_ && last_token_id == eos_token_) {
+  // Chat generation prefixes can themselves be model stop tokens. Token stop
+  // conditions apply to generated output, not the prompt or overlap padding.
+  const bool has_generated_tokens = total_tokens > num_prompt_tokens;
+  if (has_generated_tokens && !ignore_eos_ && last_token_id == eos_token_) {
     if (matched_stop_token_count != nullptr) {
       *matched_stop_token_count = 1;
     }
@@ -101,7 +103,7 @@ FinishReason StoppingChecker::check(const Slice<int32_t>& token_ids,
   }
 
   // Explicit stop tokens are independent of ignore_eos.
-  if (stop_tokens_.count(last_token_id) > 0) {
+  if (has_generated_tokens && stop_tokens_.count(last_token_id) > 0) {
     if (stop_reason != nullptr) {
       *stop_reason = static_cast<int32_t>(last_token_id);
     }

@@ -19,6 +19,7 @@ cc_library(
     :common
     :model
     :model_context
+    :kv_cache
     :models
     :quantization
     $<$<BOOL:${USE_NPU}>:npu_layers>

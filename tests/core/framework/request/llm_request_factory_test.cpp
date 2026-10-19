@@ -311,6 +311,26 @@ TEST_F(LLMRequestFactoryTest,
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
+TEST_F(LLMRequestFactoryTest, ModelStopTokenCanEndGenerationPrompt) {
+  auto factory = make_factory();
+  model_args_.stop_token_ids() = {kNonStopToken};
+  CallbackCapture capture;
+  RequestParams sp;
+  auto request = factory->create(
+      /*prompt=*/"",
+      /*prompt_tokens=*/std::vector<int32_t>{1, kNonStopToken},
+      sp,
+      /*call=*/std::nullopt,
+      make_capture_callback(&capture));
+
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(request->finished());
+  const StoppingChecker& checker = request->state().stopping_checker;
+  const std::vector<int32_t> generated = {1, kNonStopToken, kNonStopToken};
+  EXPECT_EQ(checker.check(generated, /*num_prompt_tokens=*/2),
+            FinishReason::STOP);
+}
+
 TEST_F(LLMRequestFactoryTest, FactoryAddsStopSequenceVariants) {
   options_.enable_schedule_overlap(true);
   auto factory = make_factory();

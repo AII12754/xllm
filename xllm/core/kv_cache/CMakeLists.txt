@@ -113,6 +113,7 @@ cc_library(
   HDRS
     layout/cache_layout_builder.h
     layout/cache_layout_types.h
+    layout/flashinfer_cache_layout.h
     linear_state_types.h
     storage/deepseek_v4_kv_cache_impl.h
     storage/indexed_kv_cache_impl.h

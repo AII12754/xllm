@@ -87,7 +87,7 @@ int64_t kv_slot_size(const ModelArgs& model_args,
            (model_args.kv_lora_rank() + model_args.qk_rope_head_dim());
   }
 
-  return 2 * cache_dtype_size * model_args.head_dim() *
+  return 2 * cache_dtype_size * get_kv_cache_head_dim(model_args) *
          options.n_local_kv_heads;
 }
 

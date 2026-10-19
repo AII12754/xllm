@@ -58,6 +58,8 @@ struct ModelArgs {
 
   // attn head dim
   PROPERTY(int64_t, head_dim) = 0;
+  // Physical full-attention K/V width; zero preserves the logical head_dim.
+  PROPERTY(int64_t, kv_cache_head_dim) = 0;
   PROPERTY(int64_t, decoder_head_dim) = 0;
 
   // attn head num
@@ -761,6 +763,7 @@ inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   os << ", n_layers: " << args.n_layers();
   os << ", n_encoder_layers: " << args.n_encoder_layers();
   os << ", head_dim: " << args.head_dim();
+  os << ", kv_cache_head_dim: " << args.kv_cache_head_dim();
   os << ", decoder_head_dim: " << args.decoder_head_dim();
   os << ", n_heads: " << args.n_heads();
   os << ", decoder_n_heads: " << args.decoder_n_heads();

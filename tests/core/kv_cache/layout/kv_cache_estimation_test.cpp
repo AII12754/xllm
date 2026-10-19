@@ -1005,4 +1005,22 @@ TEST(KVCacheEstimationTest,
   EXPECT_LT(capacity.n_blocks(), target_only_capacity.n_blocks());
 }
 
+TEST(KVCacheEstimationTest, PhysicalHeadWidthControlsCacheBudget) {
+  ModelArgs model_args = make_standard_args();
+  model_args.head_dim(96).kv_cache_head_dim(128).n_heads(8).n_kv_heads(4);
+  runtime::Options runtime_options;
+  runtime_options.block_size(16);
+  KVCacheEstimateContext context;
+  context.dtype = torch::kBFloat16;
+  context.world_size = 2;
+  context.virtual_memory_cache_size = 1024 * 1024;
+
+  const KVCacheCapacity capacity =
+      KVCacheEstimator(model_args).estimate(runtime_options, context);
+
+  // Two local KV heads, with physical padding in both K and V.
+  EXPECT_EQ(capacity.slot_size(), 2 * 2 * 128 * 2);
+  EXPECT_EQ(model_args.head_dim(), 96);
+}
+
 }  // namespace xllm

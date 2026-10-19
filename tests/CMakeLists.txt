@@ -2,8 +2,11 @@ if(NOT BUILD_TESTING)
   return()
 endif()
 
-if(USE_NPU)
+if(USE_NPU OR USE_CUDA)
   add_subdirectory(python)
+endif()
+
+if(USE_NPU)
   get_filename_component(_xllm_build_import_root
     "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}" DIRECTORY)
 
