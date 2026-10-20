@@ -25,6 +25,7 @@ import torch.nn as nn
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa_attention import DsaAttentionBackend
 from xllm.python.attention.dsa_metadata import DsaMetadataBuilder, build_cache_specs
+from xllm.python.attention.paged_kv_metadata import build_row_aligned_paged_kv_metadata
 from xllm.python.model_executor.runners.acl_graph import AclGraphEntry
 from xllm.python.model_executor.runners.block_draft_acl_graph import (
     BlockDraftAclGraphRunner,
@@ -46,8 +47,8 @@ def _runner(**kwargs) -> DecodeAclGraphRunner:
     )
 
 
-def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
-    rows = linear_state_indices.numel()
+def _metadata(linear_state_indices: torch.Tensor, rows: int | None = None) -> SimpleNamespace:
+    rows = rows or linear_state_indices.numel()
     lengths = torch.arange(1, rows + 1, dtype=torch.int32)
     pages = lengths * 10
     return SimpleNamespace(
@@ -224,7 +225,7 @@ def test_dspark_dp_graph_key_tracks_peer_page_capacity() -> None:
         first = runner._synchronize_dp_graph_key(local_key, input_ids)
         changed_peer = runner._synchronize_dp_graph_key(local_key, input_ids)
         restored = runner._synchronize_dp_graph_key(local_key, input_ids)
-    assert first[:-1] == local_key[:-1]
+    assert first[:-1] == local_key
     assert first != changed_peer
     assert first == restored
 
@@ -236,7 +237,7 @@ def test_dspark_dp_warmup_recaptures_when_any_rank_is_missing() -> None:
     metadata.dp_is_decode = (1, 1)
     input_ids = torch.arange(2, dtype=torch.int32)
     local_key = runner._graph_key(input_ids, metadata, 4, 2)
-    graph_key = (*local_key[:-1], (1, 1))
+    graph_key = (*local_key, (1, 1))
     runner._graphs[graph_key] = object()
     expected_eplb = Mock()
 
@@ -588,7 +589,7 @@ def test_taskless_metadata_fill_waits_only_when_stream_changes(same_stream: bool
     entry = SimpleNamespace(static_metadata=metadata, eplb=None)
     runner._graphs[key] = entry
 
-    def fill_entry(*args: object) -> None:
+    def fill_entry(*args: object, expanded: object = None) -> None:
         if same_stream:
             current.wait_stream.assert_not_called()
         else:
@@ -618,14 +619,22 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
     input_ids = torch.arange(4, dtype=torch.int32)
     positions = torch.arange(4, dtype=torch.int32)
     metadata = _metadata(torch.tensor([3, 7, 11, 15], dtype=torch.int32))
+    metadata.kpool_query_lens = [4]
     entry = runner._allocate_entry(
         padded_batch_size=8,
         input_ids=input_ids,
-        positions=positions,
         metadata=metadata,
     )
     static_indices = entry.static_metadata.linear_state_indices
     data_ptr = static_indices.data_ptr()
+    assert entry.static_metadata.kpool_query_lens == (4, 4)
+    assert entry.static_metadata.kpool_query_lens_device.tolist() == [4, 4]
+    assert DecodeAclGraphRunner._graph_key(
+        8,
+        True,
+        None,
+        kpool_query_lens=entry.static_metadata.kpool_query_lens,
+    ) != DecodeAclGraphRunner._graph_key(8, True, None, kpool_query_lens=(2, 2, 2, 2))
 
     with patch(
         "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
@@ -658,6 +667,18 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
     assert static_indices.tolist() == [4, 8, 12, 16, 0, 0, 0, 0]
 
 
+def test_untyped_verify_reuses_row_aligned_paging_metadata() -> None:
+    runner = _runner()
+    metadata = _metadata(torch.tensor([1, 2], dtype=torch.int32), rows=4)
+
+    expanded = runner._expanded_verify_view(metadata)
+
+    assert expanded is not None
+    assert expanded.paged_kv_indptr is metadata.paged_kv_indptr
+    assert expanded.paged_kv_indices is metadata.paged_kv_indices
+    assert expanded.paged_kv_last_page_len is metadata.paged_kv_last_page_len
+
+
 @pytest.mark.parametrize("dp_size", [1, 2])
 def test_fill_entry_refreshes_mega_moe_mask_in_place(dp_size: int) -> None:
     runner = _runner(dp_size=dp_size, enable_mega_moe_token_mask=True)
@@ -667,7 +688,6 @@ def test_fill_entry_refreshes_mega_moe_mask_in_place(dp_size: int) -> None:
     entry = runner._allocate_entry(
         padded_batch_size=8,
         input_ids=input_ids,
-        positions=positions,
         metadata=metadata,
     )
     mask = entry.static_metadata.mega_moe_token_mask
@@ -704,6 +724,22 @@ def test_dsa_graph_tables_use_compressed_block_counts() -> None:
 
     assert [tuple(table.shape) for table in tables] == [(4, 256), (4, 64), (4, 2)]
     assert all(torch.all(table == 0) for table in tables)
+
+    block_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+    indptr, indices, last_page_len = build_row_aligned_paged_kv_metadata(
+        block_table,
+        [129, 132],
+        attention_backend.page_size,
+    )
+    assert indptr.tolist() == [0, 2, 4]
+    assert indices.tolist() == [10, 11, 20, 21]
+    assert last_page_len.tolist() == [1, 4]
+
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    metadata.kv_seq_lens_host_values = None
+    metadata.paged_kv_indptr = torch.tensor([0, 1], dtype=torch.int32)
+    metadata.paged_kv_last_page_len = torch.tensor([1], dtype=torch.int32)
+    assert not runner.can_execute(torch.arange(4, dtype=torch.int32), metadata)
 
 
 def test_dsa_graph_refreshes_every_manager_and_clears_tails() -> None:
@@ -870,7 +906,7 @@ def test_dp_graph_variant_ids_distinguish_mtp_input_signatures() -> None:
             gather.return_value = torch.tensor(variants, dtype=torch.int32)
             local_key = runner._graph_key(2, False, None, indices)
             key = runner._synchronize_dp_graph_key(local_key, ids)
-            assert key == (*local_key[:-1], variants)
+            assert key == (*local_key, variants)
             keys.append(key)
         assert keys[0] != keys[2]
     assert [int(call.args[0].item()) for call in gather.call_args_list] == [1, 2, 1]
@@ -910,7 +946,7 @@ def test_mtp_topk_input_changes_without_reallocating_capture_buffer() -> None:
     positions = input_ids.clone()
     metadata = _metadata(input_ids)
     topk = torch.arange(24, dtype=torch.int32).reshape(4, 2, 3)
-    entry = runner._allocate_entry(8, input_ids, positions, metadata, topk)
+    entry = runner._allocate_entry(8, input_ids, metadata, topk)
     address = entry.static_mtp_topk_indices.data_ptr()
 
     with patch(
@@ -1060,7 +1096,7 @@ def test_fill_entry_uses_scheduler_slots_for_dsv4_decode() -> None:
     metadata.slot_mapping = torch.empty(0, dtype=torch.int32)
     metadata.multi_block_tables = (metadata.block_table,)
     metadata.new_cache_slots_host_values = [301, 302, 401, 402]
-    entry = runner._allocate_entry(8, input_ids, positions, metadata)
+    entry = runner._allocate_entry(8, input_ids, metadata)
 
     with patch(
         "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
@@ -1152,7 +1188,6 @@ def test_mla_speculative_decode_ignores_unused_linear_state_rows(speculative_tok
         max_model_len=32,
         dp_size=dp_size,
         num_decoding_tokens=rows,
-        decode_batch_size_limit=1,
     )
     runner.bind_layer_caches([LayerCache(torch.zeros(1), torch.zeros(1), index=torch.zeros(1))])
     metadata = _metadata(torch.arange(rows, dtype=torch.int32))

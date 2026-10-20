@@ -337,6 +337,14 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
       tensor_layout.index_block_capacity =
           kv_cache_shape.index_cache_shape().at(token_axis);
     }
+    if (!is_spec_draft && kv_cache_shape.has_kpool_tail_shape()) {
+      const auto& tail_shape = kv_cache_shape.kpool_tail_shape();
+      CHECK_GE(tail_shape.size(), 4U);
+      pending_registration_context_->fingerprint +=
+          "|compressed_kpool_tail:" + std::to_string(tail_shape.back()) + ":" +
+          std::to_string(tail_shape[2]) + ":" +
+          std::to_string(tensor_layout.block_token_capacity);
+    }
   }
 
   BufLayout layout;

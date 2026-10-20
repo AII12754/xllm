@@ -187,6 +187,9 @@ TEST(CacheLayoutBuilderTest, DescribesSequenceScopedSsmHeads) {
   CacheTensorLayoutContext context;
   context.tp_rank = 1;
   context.tp_size = 2;
+#if defined(USE_NPU)
+  context.enable_mla = true;
+#endif
   context.linear_value_head_count = 4;
   KVCacheTensor tensor{KVCacheTensorRole::SSM,
                        torch::zeros({2, 2, 3, 4}),
@@ -243,6 +246,9 @@ TEST_P(LinearCacheLayoutTest, DescribesCompositeConvState) {
   context.enable_mla = GetParam();
   context.tp_rank = 1;
   context.tp_size = 2;
+#if defined(USE_NPU)
+  context.enable_mla = true;
+#endif
   context.linear_key_head_count = 4;
   context.linear_value_head_count = 2;
   context.linear_key_head_dim = 3;

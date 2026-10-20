@@ -28,6 +28,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/model/mtp_topk_state.h"
 #include "core/framework/multimodal/mm_batch_data.h"
@@ -41,6 +42,7 @@ limitations under the License.
 #include "core/runtime/slot_buffer.h"
 #include "core/util/pybind_helper.h"
 #include "models/llm/py_causal_lm.h"
+#include "models/py_model_helper.h"
 #include "models/vlm/utils/multimodal_utils.h"
 
 #if defined(USE_NPU)
@@ -172,6 +174,17 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   executor_config["task_type"] = options_.task_type();
   executor_config["max_encoder_cache_size"] = options_.max_encoder_cache_size();
   executor_config["num_speculative_tokens"] = options_.num_speculative_tokens();
+  executor_config["engine_type"] = SpeculativeConfig::uses_ssm_engine(
+                                       options_.draft_model_path().value_or(""),
+                                       options_.speculative_algorithm(),
+                                       options_.num_speculative_tokens())
+                                       ? "SSM"
+                                       : "LLM";
+  executor_config["enable_chunked_prefill"] = options_.enable_chunked_prefill();
+  executor_config["enable_prefix_cache"] =
+      KVCacheConfig::get_instance().enable_prefix_cache();
+  executor_config["enable_schedule_overlap"] =
+      options_.enable_schedule_overlap();
   executor_config["enable_unified_mtp_graph"] =
       ExecutionConfig::get_instance().enable_unified_mtp_graph();
   executor_config["is_draft_engine"] = options_.is_draft_engine();
@@ -332,26 +345,7 @@ void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {
   // Lazy bind KV caches on first call.
   int64_t num_layers = static_cast<int64_t>(kv_caches.size());
   if (!kv_bound_) {
-    py::list kv_caches_py;
-    for (auto& kv : kv_caches) {
-      // Slot order must match ``LayerCache`` on the Python side.
-      // Keep this order synchronized with LayerCache/_LAYER_CACHE_SLOTS.
-      // Generic caches use the first five entries; DeepSeek-V4 uses the
-      // trailing six entries returned by KVCache's DSV4 getters.
-      kv_caches_py.append(
-          py::make_tuple(optional_tensor(kv.get_k_cache()),
-                         optional_tensor(kv.get_v_cache()),
-                         optional_tensor(kv.get_index_cache()),
-                         optional_tensor(kv.get_conv_cache()),
-                         optional_tensor(kv.get_ssm_cache()),
-                         optional_tensor(kv.get_swa_cache()),
-                         optional_tensor(kv.get_compress_kv_state()),
-                         optional_tensor(kv.get_compress_score_state()),
-                         optional_tensor(kv.get_compress_index_kv_state()),
-                         optional_tensor(kv.get_compress_index_score_state()),
-                         optional_tensor(kv.get_indexer_cache_scale())));
-    }
-    py_executor_.attr("bind_kv_caches")(kv_caches_py);
+    py_executor_.attr("bind_kv_caches")(build_python_kv_caches(kv_caches));
     kv_bound_ = true;
     kv_layer_count_ = num_layers;
     if (options_.enable_task_pipeline()) {

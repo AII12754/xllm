@@ -113,6 +113,10 @@ class DsaMetadata:
     c4_metadata: torch.Tensor | None = None
     c128_metadata: torch.Tensor | None = None
     qli_metadata: torch.Tensor | None = None
+    # Runtime window baked into c1/c4/c128 metadata. Native DSpark expands
+    # this window and supplies explicit SWA indices to the attention kernel.
+    sparse_metadata_ori_win_left: int = -1
+    explicit_swa_indices: torch.Tensor | None = None
     hadamard: torch.Tensor | None = None
 
     # Keep AICPU metadata-builder inputs alive until all asynchronously
@@ -242,10 +246,7 @@ class DsaMetadataBuilder:
     ) -> DsaMetadata:
         batch_size = len(kv_seq_lens)
         if q_seq_lens is None or len(q_seq_lens) != batch_size:
-            if is_prefill or is_chunked_prefill:
-                q_lens = list(kv_seq_lens)
-            else:
-                q_lens = [1] * batch_size
+            q_lens = list(kv_seq_lens) if is_prefill or is_chunked_prefill else [1] * batch_size
         else:
             q_lens = list(q_seq_lens)
 
