@@ -280,12 +280,15 @@ class TestNpuGraphBackendResolution:
 
 
 class TestCreateAttentionBackend:
+    """Test platform dispatch without executing device-specific backends."""
+
     @patch(
         "xllm.python.model_executor.executor.current_platform.is_npu",
         return_value=True,
     )
-    def test_deepseek_v4_creates_dsa_backend(self, _mock_is_npu):
+    def test_deepseek_v4_creates_dsa_backend(self, _mock_is_npu: MagicMock) -> None:
         attn = _make_attention_layer(head_dim=512)
+        device = torch.device("cpu")
         module = types.ModuleType("xllm.python.attention.dsa_attention")
         module.DsaAttentionBackend = StubAttentionBackend
         config = {
@@ -299,9 +302,10 @@ class TestCreateAttentionBackend:
             "qk_rope_head_dim": 64,
         }
         with patch.dict(sys.modules, {module.__name__: module}):
-            backend = _create_attention_backend(attn, torch.device("npu"), torch.bfloat16, config)
+            backend = _create_attention_backend(attn, device, torch.bfloat16, config)
 
         assert isinstance(backend, StubAttentionBackend)
+        assert backend.init_kwargs["device"] is device
         assert backend.init_kwargs["attn_head_dim"] == 512
         assert backend.init_kwargs["n_layers"] == 3
         assert backend.init_kwargs["compress_ratios"] == [1, 4, 128]
@@ -310,21 +314,25 @@ class TestCreateAttentionBackend:
         "xllm.python.model_executor.executor.current_platform.is_npu",
         return_value=True,
     )
-    @patch(
-        "xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend",
-        StubAttentionBackend,
-    )
     @pytest.mark.parametrize("num_decoding_tokens", [1, 4])
-    def test_npu_device_creates_npu_backend(self, _mock_is_npu: MagicMock, num_decoding_tokens: int) -> None:
+    def test_npu_platform_creates_npu_backend(self, _mock_is_npu: MagicMock, num_decoding_tokens: int) -> None:
         attn = _make_attention_layer(num_kv_heads=1, head_dim=256)
-        backend = _create_attention_backend(
-            attn,
-            torch.device("npu"),
-            torch.float16,
-            {"enable_mla": False},
-            num_decoding_tokens=num_decoding_tokens,
-        )
+        device = torch.device("cpu")
+        module = types.ModuleType("xllm.python.attention.npu_paged_attention")
+        module.NpuPagedAttentionBackend = StubAttentionBackend
+        with (
+            patch("xllm.python.model_executor.executor.distributed.dcp_group", return_value=None),
+            patch.dict(sys.modules, {module.__name__: module}),
+        ):
+            backend = _create_attention_backend(
+                attn,
+                device,
+                torch.float16,
+                {"enable_mla": False},
+                num_decoding_tokens=num_decoding_tokens,
+            )
         assert isinstance(backend, StubAttentionBackend)
+        assert backend.init_kwargs["device"] is device
         assert backend.init_kwargs["num_heads"] == 8
         assert backend.init_kwargs["num_kv_heads"] == 1
         assert backend.init_kwargs["head_dim"] == 256
@@ -335,15 +343,14 @@ class TestCreateAttentionBackend:
         "xllm.python.model_executor.executor.current_platform.is_npu",
         return_value=True,
     )
-    @patch(
-        "xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend",
-        StubAttentionBackend,
-    )
     @pytest.mark.parametrize("model_type", ["glm_moe_dsa", "glm_moe_dsa_mtp", "qwen3"])
     def test_prefill_cp_selects_model_backend(self, _mock_is_npu: MagicMock, model_type: str) -> None:
         attn = _make_attention_layer(num_kv_heads=1, head_dim=256)
+        device = torch.device("cpu")
         dcp_group = MagicMock()
         dcp_group.size.return_value = 2
+        npu_module = types.ModuleType("xllm.python.attention.npu_paged_attention")
+        npu_module.NpuPagedAttentionBackend = StubAttentionBackend
         sfa_module = types.ModuleType("xllm.python.attention.sfa_dcp_backend")
         sfa_module.SfaDcpAttentionBackend = MagicMock()
         sfa_module.dcp_layer_options = MagicMock(return_value=512)
@@ -353,21 +360,23 @@ class TestCreateAttentionBackend:
                 "xllm.python.model_executor.executor.distributed.dcp_group",
                 return_value=dcp_group,
             ),
-            patch.dict(sys.modules, {sfa_module.__name__: sfa_module}),
+            patch.dict(sys.modules, {sfa_module.__name__: sfa_module, npu_module.__name__: npu_module}),
         ):
             backend = _create_attention_backend(
                 attn,
-                torch.device("npu"),
+                device,
                 torch.float16,
                 {"cp_size": 4, "enable_mla": True, "model_type": model_type},
             )
 
         if model_type == "qwen3":
             assert isinstance(backend, StubAttentionBackend)
+            assert backend.init_kwargs["device"] is device
             sfa_module.SfaDcpAttentionBackend.assert_not_called()
         else:
             assert backend is sfa_module.SfaDcpAttentionBackend.return_value
             sfa_module.SfaDcpAttentionBackend.assert_called_once()
+            assert sfa_module.SfaDcpAttentionBackend.call_args.kwargs["device"] is device
 
     @patch(
         "xllm.python.model_executor.executor.current_platform.is_npu",
@@ -375,6 +384,7 @@ class TestCreateAttentionBackend:
     )
     def test_decode_cp1_uses_sfa_dcp_backend(self, _mock_is_npu: MagicMock) -> None:
         attn = _make_attention_layer(num_kv_heads=1, head_dim=256)
+        device = torch.device("cpu")
         dcp_group = MagicMock()
         dcp_group.size.return_value = 2
         sfa_module = types.ModuleType("xllm.python.attention.sfa_dcp_backend")
@@ -390,13 +400,14 @@ class TestCreateAttentionBackend:
         ):
             backend = _create_attention_backend(
                 attn,
-                torch.device("npu"),
+                device,
                 torch.float16,
                 {"cp_size": 1, "enable_mla": True},
                 max_num_reqs=3,
             )
 
         assert isinstance(backend, StubAttentionBackend)
+        assert backend.init_kwargs["device"] is device
         assert backend.init_kwargs["dcp_group"] is dcp_group
         assert backend.init_kwargs["index_topk"] == 512
         assert backend.init_kwargs["max_num_reqs"] == 3
