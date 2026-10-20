@@ -536,7 +536,7 @@ class TestModelExecutorConstruction:
             assert executor.decode_graph_runner is None
             assert executor.inductor_runner is None
 
-    @patch("xllm.python.model_executor.runners.decode_cuda_graph.DecodeCudaGraphRunner")
+    @patch("xllm.python.model_executor.executor.DecodeCudaGraphRunner")
     @patch("xllm.python.model_executor.executor._create_attention_backend")
     def test_data_parallel_cuda_graph_is_supported(self, mock_create, mock_graph_runner):
         mock_create.return_value = StubAttentionBackend()

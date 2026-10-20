@@ -27,7 +27,7 @@ from xllm.python.model_executor.forward_context import (
     LayerSynchronizer,
     forward_context,
 )
-from xllm.python.model_executor.runners.base import BaseRunner
+from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
 
 _CAPTURE_WARMUP_STEPS = 2
 
@@ -189,7 +189,7 @@ class DecodeCudaGraphRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
         eplb: EplbRuntimeState | None = None,
-    ) -> torch.Tensor:
+    ) -> ModelExecutionOutput:
         batch_size = input_ids.shape[0]
         graph_key = self._graph_key(input_ids, metadata)
         if graph_key is None:
@@ -216,10 +216,26 @@ class DecodeCudaGraphRunner(BaseRunner):
                 )
             ):
                 entry.graph.replay()
-                output = entry.static_output[:batch_size].clone()
+                output = self._slice_output(entry.static_output, batch_size)
 
         torch.cuda.current_stream().wait_stream(self._stream)
         return output
+
+    @staticmethod
+    def _slice_output(output: ModelExecutionOutput, batch_size: int) -> ModelExecutionOutput:
+        """Return owned active rows; replay overwrites every captured output tensor."""
+        if not isinstance(output, tuple):
+            return output[:batch_size].clone()
+        hidden, aux_hidden = output[:2]
+        hidden = hidden[:batch_size].clone()
+        if aux_hidden is not None:
+            aux_hidden = aux_hidden[:batch_size].clone()
+        if len(output) == 2:
+            return hidden, aux_hidden
+        topk = output[2]
+        if topk is not None:
+            topk = topk[:batch_size].clone()
+        return hidden, aux_hidden, topk
 
     def _graph_key(
         self,

@@ -31,8 +31,7 @@ pytest.importorskip("flashinfer")
 from tests.python.phi3_test_utils import StateDict as _StateDict
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.flashinfer import FlashInferBackend
-from xllm.python.model_executor.forward_context import ForwardContext, forward_context
-from xllm.python.model_executor.runners.decode_cuda_graph import DecodeCudaGraphRunner
+from xllm.python.model_executor.executor import ModelExecutor
 from xllm.python.models.phi3 import Phi3ForCausalLM
 
 _CONFIG = {
@@ -92,8 +91,9 @@ def _reference(tokens: torch.Tensor, weights: dict[str, torch.Tensor]) -> torch.
 
 
 class _PagedRunner:
-    def __init__(self, *, graph: bool = False) -> None:
+    def __init__(self, *, graph: bool = False, max_requests: int = 2) -> None:
         self.device = torch.device("cuda", torch.cuda.current_device())
+        self.max_requests = max_requests
         self.model = Phi3ForCausalLM(_CONFIG).eval()
         generator = torch.Generator().manual_seed(2026)
         self.weights = {
@@ -107,38 +107,62 @@ class _PagedRunner:
         self.model.load_weights([_StateDict(self.weights)], 0, 1)
         self.caches = [
             LayerCache(
-                torch.full((16, _BLOCK_SIZE, 4, 128), float("nan"), dtype=torch.bfloat16, device=self.device),
-                torch.full((16, _BLOCK_SIZE, 4, 128), float("nan"), dtype=torch.bfloat16, device=self.device),
+                torch.full(
+                    (max_requests * _BLOCKS_PER_REQUEST, _BLOCK_SIZE, 4, 128),
+                    float("nan"),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                ),
+                torch.full(
+                    (max_requests * _BLOCKS_PER_REQUEST, _BLOCK_SIZE, 4, 128),
+                    float("nan"),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                ),
             )
             for _ in range(2)
         ]
-        self.backend = FlashInferBackend(
-            4, 4, 96, 96**-0.5, _BLOCK_SIZE, self.device, torch.bfloat16, kv_cache_head_dim=128
-        )
-        self.backend.bind_kv_caches(self.caches)
-        self.decode_graph: DecodeCudaGraphRunner | None = None
-        if graph:
-            self.decode_graph = DecodeCudaGraphRunner(self.model.model, self.backend, self.device, 2, 128)
-            self.decode_graph.bind_layer_caches(self.caches)
-            self.decode_graph.warmup(self.device, torch.bfloat16)
+        config = {
+            **_CONFIG,
+            "kv_cache_head_dim": 128,
+            "python_graph_backend": "cudagraphs" if graph else "off",
+        }
+        self.executor = ModelExecutor(self.model, config, max_seqs_per_batch=max_requests)
+        self.executor.bind_kv_caches(self.caches)
+        self.decode_graph = self.executor.decode_graph_runner
         self.history: list[torch.Tensor] = []
+        self._histories: dict[int, torch.Tensor] = {}
+        self.last_hidden: torch.Tensor | None = None
+        self.last_metadata: SimpleNamespace | None = None
 
     def _integer(self, values: list[int]) -> torch.Tensor:
         return torch.tensor(values, dtype=torch.int32, device=self.device)
 
-    def run(self, additions: list[torch.Tensor], *, prefill: bool = False) -> list[torch.Tensor]:
-        previous = [0] * len(additions) if prefill else [tokens.numel() for tokens in self.history]
-        self.history = additions if prefill else [torch.cat((old, new)) for old, new in zip(self.history, additions)]
+    def run(
+        self,
+        additions: list[torch.Tensor],
+        *,
+        prefill: bool = False,
+        request_ids: list[int] | None = None,
+    ) -> list[torch.Tensor]:
+        request_ids = list(range(len(additions))) if request_ids is None else request_ids
+        previous = [0] * len(additions) if prefill else [self._histories[request].numel() for request in request_ids]
+        self.history = (
+            additions
+            if prefill
+            else [torch.cat((self._histories[request], new)) for request, new in zip(request_ids, additions)]
+        )
+        self._histories.update(zip(request_ids, self.history))
         query_lengths = [tokens.numel() for tokens in additions]
         totals = [tokens.numel() for tokens in self.history]
         assert max(totals) <= 128
         # Reverse physical block IDs so logical positions cannot double as cache slots.
         blocks = [
             [
-                2 * _BLOCKS_PER_REQUEST - 1 - request * _BLOCKS_PER_REQUEST - page
+                self.max_requests * _BLOCKS_PER_REQUEST - 1 - request * _BLOCKS_PER_REQUEST - page
                 for page in range((total + _BLOCK_SIZE - 1) // _BLOCK_SIZE)
             ]
-            for request, total in enumerate(totals)
+            for request, total in zip(request_ids, totals)
         ]
         slots = [
             blocks[request][position // _BLOCK_SIZE] * _BLOCK_SIZE + position % _BLOCK_SIZE
@@ -169,13 +193,101 @@ class _PagedRunner:
         input_ids = torch.cat(additions).to(torch.int32)
         if self.decode_graph is not None and not prefill and max(query_lengths) == 1:
             assert self.decode_graph.can_execute(input_ids, metadata)
-            hidden = self.decode_graph.execute(input_ids, positions, metadata)
-        else:
-            self.backend.prepare(metadata)
-            with forward_context(ForwardContext(self.backend, self.device, metadata, self.caches)):
-                hidden = self.model.model(input_ids, positions)
+        hidden = self.executor.execute(input_ids, positions, metadata)
+        self.last_hidden = hidden
+        self.last_metadata = metadata
         logits = self.model.compute_logits(hidden, None)
         return list(logits.split(query_lengths))
+
+
+@torch.inference_mode()
+def test_executor_captures_cuda_graphs_before_serving_decode() -> None:
+    runner = _PagedRunner()
+    config = {**_CONFIG, "kv_cache_head_dim": 128, "python_graph_backend": "cudagraphs"}
+    executor = ModelExecutor(runner.model, config, max_seqs_per_batch=2)
+    executor.bind_kv_caches(runner.caches)
+    metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False)
+    tokens = torch.tensor([7, 11], dtype=torch.int32, device=runner.device)
+    assert executor.decode_graph_runner.can_execute(tokens, metadata)
+
+
+@torch.inference_mode()
+def test_cuda_graph_capture_failure_prevents_executor_use(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _PagedRunner()
+    config = {**_CONFIG, "kv_cache_head_dim": 128, "python_graph_backend": "cudagraphs"}
+    executor = ModelExecutor(runner.model, config, max_seqs_per_batch=2)
+
+    def _fail_capture(_entry: object) -> None:
+        raise RuntimeError("injected CUDA capture failure")
+
+    monkeypatch.setattr(executor.decode_graph_runner, "_capture", _fail_capture)
+    with pytest.raises(RuntimeError, match="injected CUDA capture failure"):
+        executor.bind_kv_caches(runner.caches)
+    tokens = runner._integer([7])
+    with pytest.raises(RuntimeError, match="KV caches are not bound"):
+        executor.execute(tokens, tokens, SimpleNamespace())
+
+
+@torch.inference_mode()
+def test_cuda_graph_replay_tracks_request_changes_and_preserves_outputs() -> None:
+    runner = _PagedRunner(graph=True, max_requests=4)
+    runner.run(
+        [
+            (torch.arange(length, device=runner.device) * (request + 3) % 256).long()
+            for request, length in enumerate((15, 16, 31))
+        ],
+        prefill=True,
+    )
+    graphs = runner.decode_graph._graphs
+    pointers = {
+        key: (
+            entry.static_input_ids.data_ptr(),
+            entry.static_positions.data_ptr(),
+            entry.static_metadata.slot_mapping.data_ptr(),
+            entry.static_metadata.paged_kv_indptr.data_ptr(),
+            entry.static_metadata.paged_kv_indices.data_ptr(),
+        )
+        for key, entry in graphs.items()
+    }
+    saved_outputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for step, request_ids in enumerate(([0, 1, 2], [0], [2, 0], [1, 2, 0], [2], [0, 1, 2])):
+        additions = [torch.tensor([7 + step * 11 + request], device=runner.device) for request in request_ids]
+        outputs = runner.run(additions, request_ids=list(request_ids))
+        for output, history in zip(outputs, runner.history):
+            reference = _reference(history, runner.weights)[-1:]
+            assert torch.isfinite(output).all()
+            relative_l2 = torch.linalg.vector_norm(output.float() - reference.float()) / torch.linalg.vector_norm(
+                reference.float()
+            )
+            assert relative_l2 < 0.02
+        for saved, expected in saved_outputs:
+            torch.testing.assert_close(saved, expected, rtol=0, atol=0)
+        assert runner.last_hidden is not None
+        saved_outputs.append((runner.last_hidden, runner.last_hidden.clone()))
+
+        batch_size = len(request_ids)
+        bucket = 4 if batch_size == 3 else batch_size
+        entry = graphs[(bucket, (bucket,))]
+        metadata = entry.static_metadata
+        assert pointers[(bucket, (bucket,))] == (
+            entry.static_input_ids.data_ptr(),
+            entry.static_positions.data_ptr(),
+            metadata.slot_mapping.data_ptr(),
+            metadata.paged_kv_indptr.data_ptr(),
+            metadata.paged_kv_indices.data_ptr(),
+        )
+        torch.testing.assert_close(entry.static_input_ids[:batch_size], torch.cat(additions).to(torch.int32))
+        expected_positions = runner._integer([tokens.numel() - 1 for tokens in runner.history])
+        torch.testing.assert_close(entry.static_positions[:batch_size], expected_positions)
+        assert runner.last_metadata is not None
+        torch.testing.assert_close(metadata.slot_mapping[:batch_size], runner.last_metadata.slot_mapping)
+        indices = runner.last_metadata.paged_kv_indices
+        torch.testing.assert_close(metadata.paged_kv_indices[: indices.numel()], indices)
+        if bucket > batch_size:
+            assert metadata.slot_mapping[batch_size:].tolist() == [-1]
+            assert metadata.paged_kv_indptr[-1].item() == metadata.paged_kv_indptr[-2].item()
+            assert metadata.paged_kv_indptr_host[-1].item() == metadata.paged_kv_indptr_host[-2].item()
+            assert metadata.paged_kv_last_page_len_host[-1].item() == 1
 
 
 @pytest.mark.parametrize("lengths", [(15, 16), (17, 31), (63, 111)])

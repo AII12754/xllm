@@ -33,9 +33,6 @@ Load the generated JSON file: custom_output.json
 
 ## Phi-3 checkpoint contract checker
 
-For the complete CUDA model launch, pinned reference, numerical protocol and
-known limitations, see [Phi-3 integration validation](phi3_validation.md).
-
 `check_phi3_checkpoint.py` validates local config and tensor shape manifest
 JSON files for the already fused QKV and gate-up matrices in Phi-3 checkpoints.
 The reference is `microsoft/Phi-3-mini-4k-instruct` at revision
