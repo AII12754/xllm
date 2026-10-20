@@ -17,11 +17,7 @@
 from __future__ import annotations
 
 import copy
-import json
 import re
-import subprocess
-import sys
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -292,45 +288,6 @@ def test_sharder_rejects_unknown_key() -> None:
     name = "model.layers.0.self_attn.q_proj.weight"
     with pytest.raises(ValueError, match=re.escape(name) + ": unknown"):
         shard_phi3_fused_weight(torch.zeros(24, 8), name=name, config=parse_phi3_config(_CONFIG), tp_rank=0, tp_size=1)
-
-
-def test_cli_success_and_failure(tmp_path: Path, checkpoint_fixture: dict[str, Any]) -> None:
-    config = tmp_path / "config.json"
-    manifest = tmp_path / "manifest.json"
-    config.write_text(json.dumps(checkpoint_fixture["config"]), encoding="utf-8")
-    manifest.write_text(json.dumps(checkpoint_fixture["manifest"]), encoding="utf-8")
-    root = Path(__file__).resolve().parents[2]
-    command = [
-        sys.executable,
-        str(root / "tools" / "check_phi3_checkpoint.py"),
-        "--config",
-        str(config),
-        "--manifest",
-        str(manifest),
-        "--tp-size",
-        "2",
-    ]
-    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, check=False)
-    assert result.returncode == 0, result.stderr
-    report = json.loads(result.stdout)
-    assert report["head_dim"] == 96
-    assert report["checked_weights"] == 64
-    assert report["tp_size"] == 2
-    command[-1] = "3"
-    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, check=False)
-    assert result.returncode == 1
-    assert not result.stdout
-    assert _QKV in result.stderr
-    assert "tp_size=3" in result.stderr
-    command[-1] = "2"
-    manifest.write_text("{", encoding="utf-8")
-    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, check=False)
-    assert result.returncode == 1
-    assert "validation failed" in result.stderr
-    manifest.unlink()
-    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, check=False)
-    assert result.returncode == 1
-    assert "manifest.json" in result.stderr
 
 
 @pytest.mark.parametrize("name", [_QKV, _GATE_UP])

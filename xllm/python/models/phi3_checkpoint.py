@@ -15,7 +15,7 @@
 """Shape and TP contracts for Phi-3's already fused checkpoint weights.
 
 Source matrices use [output, input] order: Q then K then V, or gate then up.
-The production Phi-3 loader and offline checker share this contract. It does
+The production Phi-3 loader and checkpoint tests share this contract. It does
 not validate attention semantics or support KV head replication. Unrelated
 manifest entries are allowed and are not checked.
 """
