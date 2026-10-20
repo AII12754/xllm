@@ -27,8 +27,8 @@ inline void configure_flashinfer_kv_cache_layout(ModelArgs& model_args) {
   // attention scale retain the logical width. MLA owns a different geometry;
   // already supported widths do not require additional storage.
   if (!model_args.enable_mla() && model_args.head_dim() == 96 &&
-      model_args.kv_cache_head_dim() == 0) {
-    model_args.kv_cache_head_dim() = 128;
+      model_args.kv_cache_storage_head_dim() == 0) {
+    model_args.kv_cache_storage_head_dim() = 128;
   }
 }
 

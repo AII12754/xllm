@@ -124,7 +124,7 @@ class _PagedRunner:
         ]
         config = {
             **_CONFIG,
-            "kv_cache_head_dim": 128,
+            "kv_cache_storage_head_dim": 128,
             "python_graph_backend": "cudagraphs" if graph else "off",
         }
         self.executor = ModelExecutor(self.model, config, max_seqs_per_batch=max_requests)
@@ -203,7 +203,7 @@ class _PagedRunner:
 @torch.inference_mode()
 def test_executor_captures_cuda_graphs_before_serving_decode() -> None:
     runner = _PagedRunner()
-    config = {**_CONFIG, "kv_cache_head_dim": 128, "python_graph_backend": "cudagraphs"}
+    config = {**_CONFIG, "kv_cache_storage_head_dim": 128, "python_graph_backend": "cudagraphs"}
     executor = ModelExecutor(runner.model, config, max_seqs_per_batch=2)
     executor.bind_kv_caches(runner.caches)
     metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False)
@@ -214,7 +214,7 @@ def test_executor_captures_cuda_graphs_before_serving_decode() -> None:
 @torch.inference_mode()
 def test_cuda_graph_capture_failure_prevents_executor_use(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = _PagedRunner()
-    config = {**_CONFIG, "kv_cache_head_dim": 128, "python_graph_backend": "cudagraphs"}
+    config = {**_CONFIG, "kv_cache_storage_head_dim": 128, "python_graph_backend": "cudagraphs"}
     executor = ModelExecutor(runner.model, config, max_seqs_per_batch=2)
 
     def _fail_capture(_entry: object) -> None:
@@ -325,7 +325,9 @@ def test_prefill_mixed_append_and_decode_match_independent_full_history(lengths:
 
 @torch.inference_mode()
 def test_padding_geometry_is_checked_before_cache_execution() -> None:
-    backend = FlashInferBackend(4, 4, 96, 96**-0.5, 16, torch.device("cuda"), torch.bfloat16, kv_cache_head_dim=128)
+    backend = FlashInferBackend(
+        4, 4, 96, 96**-0.5, 16, torch.device("cuda"), torch.bfloat16, kv_cache_storage_head_dim=128
+    )
     malformed = torch.empty(2, 16, 4, 96, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="physical head_dim=128"):
         backend.bind_kv_caches([LayerCache(malformed, malformed)])
@@ -343,7 +345,7 @@ def test_window_boundary_excludes_an_attention_sink(window: int) -> None:
         torch.zeros(shape, device=device, dtype=torch.bfloat16),
         torch.zeros(shape, device=device, dtype=torch.bfloat16),
     )
-    backend = FlashInferBackend(4, 4, 96, 96**-0.5, window, device, torch.bfloat16, kv_cache_head_dim=128)
+    backend = FlashInferBackend(4, 4, 96, 96**-0.5, window, device, torch.bfloat16, kv_cache_storage_head_dim=128)
     backend.bind_kv_caches([cache])
     layer = SimpleNamespace(layer_id=0, num_heads=4, num_kv_heads=4, head_dim=96)
 

@@ -875,8 +875,8 @@ TEST(HFModelLoaderTest, Phi3Mini4KConfigPreservesLogicalDimensions) {
   EXPECT_EQ(args.intermediate_size(), 8192);
   EXPECT_EQ(args.vocab_size(), 32064);
   EXPECT_EQ(args.head_dim(), 96);
-  EXPECT_EQ(args.kv_cache_head_dim(), 0);
-  EXPECT_EQ(get_kv_cache_head_dim(args), 96);
+  EXPECT_EQ(args.kv_cache_storage_head_dim(), 0);
+  EXPECT_EQ(get_kv_cache_storage_head_dim(args), 96);
   EXPECT_EQ(args.max_position_embeddings(), 4096);
   EXPECT_FLOAT_EQ(args.rms_norm_eps(), 1e-5f);
   EXPECT_FLOAT_EQ(args.rope_theta(), 10000.0f);
@@ -907,7 +907,7 @@ TEST(HFModelLoaderTest, Phi3DerivesAbsentKvHeadsAndDisablesNullWindow) {
   ASSERT_TRUE(loader(reader, &args));
   EXPECT_EQ(args.n_kv_heads(), std::optional<int64_t>(8));
   EXPECT_EQ(args.head_dim(), 64);
-  EXPECT_EQ(get_kv_cache_head_dim(args), 64);
+  EXPECT_EQ(get_kv_cache_storage_head_dim(args), 64);
   EXPECT_EQ(args.sliding_window(), -1);
   EXPECT_FALSE(args.use_sliding_window());
 }

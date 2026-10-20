@@ -192,7 +192,7 @@ def _create_attention_backend(
             sliding_window=first_attention.sliding_window,
             device=device,
             dtype=dtype,
-            kv_cache_head_dim=int(config.get("kv_cache_head_dim", 0)),
+            kv_cache_storage_head_dim=int(config.get("kv_cache_storage_head_dim", 0)),
         )
     raise NotImplementedError(f"No attention backend available for device type '{device.type}'")
 

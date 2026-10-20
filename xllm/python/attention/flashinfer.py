@@ -68,14 +68,14 @@ class FlashInferBackend(AttentionBackend):
         sliding_window: int,
         device: torch.device,
         dtype: torch.dtype,
-        kv_cache_head_dim: int = 0,
+        kv_cache_storage_head_dim: int = 0,
     ) -> None:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self._kernel_head_dim = kv_cache_head_dim or head_dim
+        self._kernel_head_dim = kv_cache_storage_head_dim or head_dim
         if self._kernel_head_dim < head_dim:
-            raise ValueError("kv_cache_head_dim must be at least the logical head_dim")
+            raise ValueError("kv_cache_storage_head_dim must be at least the logical head_dim")
         self._head_dim_padding = self._kernel_head_dim - head_dim
         self.scale = scale
         self.sliding_window = sliding_window

@@ -1047,7 +1047,8 @@ TEST(KVCacheEstimationTest,
 
 TEST(KVCacheEstimationTest, PhysicalHeadWidthControlsCacheBudget) {
   ModelArgs model_args = make_standard_args();
-  model_args.head_dim(96).kv_cache_head_dim(128).n_heads(8).n_kv_heads(4);
+  model_args.head_dim(96).kv_cache_storage_head_dim(128).n_heads(8).n_kv_heads(
+      4);
   runtime::Options runtime_options;
   runtime_options.block_size(16);
   KVCacheEstimateContext context;

@@ -376,10 +376,11 @@ void KVCacheShape::init_key_cache_shape(const KVCacheCapacity& kv_cache_cap,
       model_args.n_kv_heads().value_or(model_args.n_heads());
   const int64_t local_kv_head_count =
       get_local_head_count(total_kv_head_count, world_size);
-  key_cache_shape_ = std::vector<int64_t>{kv_cache_cap.n_blocks(),
-                                          kv_cache_cap.block_size(),
-                                          local_kv_head_count,
-                                          get_kv_cache_head_dim(model_args)};
+  key_cache_shape_ =
+      std::vector<int64_t>{kv_cache_cap.n_blocks(),
+                           kv_cache_cap.block_size(),
+                           local_kv_head_count,
+                           get_kv_cache_storage_head_dim(model_args)};
 }
 
 void KVCacheShape::init_value_cache_shape(const KVCacheCapacity& kv_cache_cap,
@@ -411,10 +412,11 @@ void KVCacheShape::init_value_cache_shape(const KVCacheCapacity& kv_cache_cap,
       model_args.n_kv_heads().value_or(model_args.n_heads());
   const int64_t local_kv_head_count =
       get_local_head_count(total_kv_head_count, world_size);
-  value_cache_shape_ = std::vector<int64_t>{kv_cache_cap.n_blocks(),
-                                            kv_cache_cap.block_size(),
-                                            local_kv_head_count,
-                                            get_kv_cache_head_dim(model_args)};
+  value_cache_shape_ =
+      std::vector<int64_t>{kv_cache_cap.n_blocks(),
+                           kv_cache_cap.block_size(),
+                           local_kv_head_count,
+                           get_kv_cache_storage_head_dim(model_args)};
 }
 
 void KVCacheShape::init_mla_packed_c8_shape(const KVCacheCapacity& kv_cache_cap,

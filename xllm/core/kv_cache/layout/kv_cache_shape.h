@@ -54,8 +54,8 @@ inline int64_t mla_packed_c8_row_bytes(int64_t kv_lora_rank,
 }
 
 // Keep cache allocation and budget estimation on the same physical geometry.
-inline int64_t get_kv_cache_head_dim(const ModelArgs& model_args) {
-  const int64_t physical_dim = model_args.kv_cache_head_dim();
+inline int64_t get_kv_cache_storage_head_dim(const ModelArgs& model_args) {
+  const int64_t physical_dim = model_args.kv_cache_storage_head_dim();
   CHECK_GE(physical_dim, 0);
   CHECK(physical_dim == 0 || physical_dim >= model_args.head_dim());
   return physical_dim == 0 ? model_args.head_dim() : physical_dim;

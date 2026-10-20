@@ -36,9 +36,9 @@ TEST(CacheLayoutBuilderTest, FlashinferResolvesPhysicalWidthWithoutModelType) {
   args.head_dim() = 96;
   configure_flashinfer_kv_cache_layout(args);
   EXPECT_EQ(args.head_dim(), 96);
-  EXPECT_EQ(get_kv_cache_head_dim(args), 128);
+  EXPECT_EQ(get_kv_cache_storage_head_dim(args), 128);
   configure_flashinfer_kv_cache_layout(args);
-  EXPECT_EQ(get_kv_cache_head_dim(args), 128);
+  EXPECT_EQ(get_kv_cache_storage_head_dim(args), 128);
 }
 
 TEST(CacheLayoutBuilderTest, FlashinferPreservesNativeAndMlaGeometry) {
@@ -46,14 +46,14 @@ TEST(CacheLayoutBuilderTest, FlashinferPreservesNativeAndMlaGeometry) {
     ModelArgs args;
     args.head_dim() = head_dim;
     configure_flashinfer_kv_cache_layout(args);
-    EXPECT_EQ(args.kv_cache_head_dim(), 0);
-    EXPECT_EQ(get_kv_cache_head_dim(args), head_dim);
+    EXPECT_EQ(args.kv_cache_storage_head_dim(), 0);
+    EXPECT_EQ(get_kv_cache_storage_head_dim(args), head_dim);
   }
   ModelArgs mla_args;
   mla_args.head_dim() = 96;
   mla_args.enable_mla() = true;
   configure_flashinfer_kv_cache_layout(mla_args);
-  EXPECT_EQ(mla_args.kv_cache_head_dim(), 0);
+  EXPECT_EQ(mla_args.kv_cache_storage_head_dim(), 0);
 }
 
 TEST(CacheLayoutBuilderTest, DescribesTokenMajorGqaHeads) {
@@ -313,7 +313,8 @@ TEST(KVShardLayoutTest, MapsTokensAndSlots) {
 
 TEST(CacheLayoutBuilderTest, PhysicalHeadWidthControlsBothCacheShapes) {
   ModelArgs model_args;
-  model_args.head_dim(96).kv_cache_head_dim(128).n_heads(32).n_kv_heads(32);
+  model_args.head_dim(96).kv_cache_storage_head_dim(128).n_heads(32).n_kv_heads(
+      32);
   KVCacheCapacity capacity;
   capacity.n_blocks(8).block_size(16);
 
