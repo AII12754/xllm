@@ -640,7 +640,7 @@ torch::Tensor FusedMoEImpl::forward_experts(
 // forward
 // ---------------------------------------------------------------------------
 torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
-                                    const ModelInputParams& input_params) {
+                                    const MoeExecutionInput& input_params) {
   bool is_dp_ep_parallel =
       parallel_args_.dp_size() > 1 && parallel_args_.ep_size() > 1;
 

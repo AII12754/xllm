@@ -684,7 +684,7 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
                       const torch::Tensor& positions,
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) {
-    return language_model_(tokens, positions, kv_caches, input_params);
+    return language_model_->forward(tokens, positions, kv_caches, input_params);
   }
 
   torch::Tensor pooler(const torch::Tensor& hidden_states,

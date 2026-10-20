@@ -24,6 +24,7 @@ limitations under the License.
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -36,6 +37,7 @@ limitations under the License.
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
 #include "core/runtime/decode_graph_bucket.h"
+#include "core/runtime/graph_input_snapshot.h"
 #include "core/util/utils.h"
 
 // ATB includes
@@ -136,7 +138,8 @@ int64_t get_dp_ep_padding_buffer_capacity(const ModelArgs& args,
   return std::max(graph_capacity * dp_size, aligned_moe_buffer_capacity);
 }
 
-int64_t infer_actual_batch_size(const ModelInputParams& params) {
+template <typename Params>
+int64_t infer_actual_batch_size(const Params& params) {
   if (params.meta.num_sequences == 0 && params.meta.actual_num_sequences == 0) {
     return 0;
   }
@@ -164,9 +167,11 @@ int64_t infer_actual_batch_size(const ModelInputParams& params) {
       params.attention.device.block_tables.dim() >= 2) {
     return params.attention.device.block_tables.size(0);
   }
-  for (const auto& block_table : params.multi_block_tables) {
-    if (block_table.defined() && block_table.dim() >= 2) {
-      return block_table.size(0);
+  if constexpr (std::is_same_v<Params, ModelInputParams>) {
+    for (const auto& block_table : params.multi_block_tables) {
+      if (block_table.defined() && block_table.dim() >= 2) {
+        return block_table.size(0);
+      }
     }
   }
   return 0;
@@ -669,8 +674,9 @@ void zero_tensor_tail(torch::Tensor& tensor,
 
 }  // namespace
 
+template <typename Params>
 void GraphPersistentParam::update_eplb_decode_token_mask(
-    const ModelInputParams& input_params,
+    const Params& input_params,
     uint32_t padded_num_tokens) {
   persistent_eplb_decode_token_mask_.fill_(false);
   if (!input_params.expert.eplb_decode_token_mask.defined()) {
@@ -789,15 +795,20 @@ GraphPersistentParam::update_expanded_spec_decode_attention(
   return expanded_kv_seq_lens_vec;
 }
 
+template <typename Params>
 void GraphPersistentParam::update_tokens(const torch::Tensor& tokens,
-                                         const ModelInputParams& params,
+                                         const Params& params,
                                          uint32_t actual_num_tokens,
                                          uint32_t padded_num_tokens) {
   CHECK_GT(padded_num_tokens, 0) << "padded_num_tokens must be > 0";
-  const torch::Tensor& graph_tokens =
-      params.graph.input_tokens_override.defined()
-          ? params.graph.input_tokens_override
-          : tokens;
+  const torch::Tensor& graph_tokens = [&]() -> const torch::Tensor& {
+    if constexpr (std::is_same_v<Params, ModelInputParams>) {
+      if (params.graph.input_tokens_override.defined()) {
+        return params.graph.input_tokens_override;
+      }
+    }
+    return tokens;
+  }();
   CHECK(graph_tokens.defined()) << "graph tokens must be defined";
   CHECK_GE(graph_tokens.size(0), static_cast<int64_t>(actual_num_tokens))
       << "graph token override is shorter than actual decode tokens";
@@ -913,12 +924,13 @@ void GraphPersistentParam::update_spec_verify_inputs(
       .copy_(params.graph.expanded_block_tables, true);
 }
 
-std::optional<ModelInputParams> GraphPersistentParam::update(
+template <typename Params>
+std::optional<Params> GraphPersistentParam::update(
     const torch::Tensor& tokens,
     const torch::Tensor& k_cache,
     const torch::Tensor& v_cache,
     const torch::Tensor& positions,
-    const ModelInputParams& params,
+    const Params& params,
     uint32_t padded_num_tokens,
     bool return_capture_params,
     bool skip_token_update,
@@ -929,9 +941,13 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   const bool is_decode = params.meta.batch_forward_type.is_decode();
   const bool is_chunked_prefill =
       params.meta.batch_forward_type.is_chunked_prefill();
-  const bool is_hybrid_spec_verify_chunked_prefill =
-      params.is_spec_verify && is_chunked_prefill &&
-      is_hybrid_linear_attention_;
+  const bool is_hybrid_spec_verify_chunked_prefill = [&]() {
+    if constexpr (std::is_same_v<Params, ModelInputParams>) {
+      return params.is_spec_verify && is_chunked_prefill &&
+             is_hybrid_linear_attention_;
+    }
+    return false;
+  }();
   CHECK(is_decode || is_hybrid_spec_verify_chunked_prefill)
       << "ACL graph persistent param only supports decode or hybrid "
          "spec-verify chunked prefill";
@@ -1083,18 +1099,20 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           .fill_(kPaddingLinearStateId);
     }
   }
-  if (params.num_accepted_tokens.defined()) {
-    persistent_num_accepted_tokens_
-        .slice(/*dim=*/0, /*start=*/0, /*end=*/actual_batch_size)
-        .copy_(params.num_accepted_tokens.slice(
-                   /*dim=*/0, /*start=*/0, /*end=*/actual_batch_size),
-               /*non_blocking=*/true);
-    if (padded_batch_size > actual_batch_size) {
+  if constexpr (std::is_same_v<Params, ModelInputParams>) {
+    if (params.num_accepted_tokens.defined()) {
       persistent_num_accepted_tokens_
-          .slice(/*dim=*/0,
-                 /*start=*/actual_batch_size,
-                 /*end=*/padded_batch_size)
-          .fill_(1);
+          .slice(/*dim=*/0, /*start=*/0, /*end=*/actual_batch_size)
+          .copy_(params.num_accepted_tokens.slice(
+                     /*dim=*/0, /*start=*/0, /*end=*/actual_batch_size),
+                 /*non_blocking=*/true);
+      if (padded_batch_size > actual_batch_size) {
+        persistent_num_accepted_tokens_
+            .slice(/*dim=*/0,
+                   /*start=*/actual_batch_size,
+                   /*end=*/padded_batch_size)
+            .fill_(1);
+      }
     }
   }
 
@@ -1166,8 +1184,12 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           : 0;
   if (has_q_cu && q_cu_size > 0) {
     const bool use_hybrid_query_start_loc = is_hybrid_linear_attention_;
-    const bool input_has_leading_zero =
-        params.is_spec_verify && use_hybrid_query_start_loc;
+    const bool input_has_leading_zero = [&]() {
+      if constexpr (std::is_same_v<Params, ModelInputParams>) {
+        return params.is_spec_verify && use_hybrid_query_start_loc;
+      }
+      return false;
+    }();
     const int64_t required_q_cu_seq_lens =
         actual_seq_len_rows + (input_has_leading_zero ? 1 : 0);
     CHECK_GE(params.attention.device.q_cu_seq_lens.numel(),
@@ -1218,8 +1240,13 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   // That path consumes expanded KV lengths, block tables and tiling data, not
   // the dense graph attention mask. Avoid rebuilding the unused mask on every
   // target replay while preserving all other decode/prefill paths.
-  const bool skip_unused_expanded_verify_mask =
-      can_skip_unused_expanded_verify_mask(params, is_hybrid_linear_attention_);
+  const bool skip_unused_expanded_verify_mask = [&]() {
+    if constexpr (std::is_same_v<Params, ModelInputParams>) {
+      return can_skip_unused_expanded_verify_mask(params,
+                                                  is_hybrid_linear_attention_);
+    }
+    return false;
+  }();
   if (need_update_attn_mask_ && !skip_unused_expanded_verify_mask) {
     update_attention_mask(params);
   }
@@ -1244,27 +1271,35 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     padded_q_seq_lens_vec[static_cast<size_t>(i)] =
         is_chunked_prefill ? q_max_seq_len : 1;
   }
-  const bool use_expanded_spec_decode_attention =
-      params.graph.use_expanded_decode_for_spec_verify_attention;
+  const bool use_expanded_spec_decode_attention = [&]() {
+    if constexpr (std::is_same_v<Params, ModelInputParams>) {
+      return params.graph.use_expanded_decode_for_spec_verify_attention;
+    }
+    return false;
+  }();
   if (is_hybrid_spec_verify_chunked_prefill) {
     CHECK(use_expanded_spec_decode_attention)
         << "hybrid spec-verify ACL graph requires expanded "
            "decode attention input";
   }
   std::vector<int32_t> expanded_kv_seq_lens_vec;
-  if (use_expanded_spec_decode_attention) {
-    expanded_kv_seq_lens_vec = update_expanded_spec_decode_attention(
-        params, actual_num_tokens, padded_num_tokens);
+  if constexpr (std::is_same_v<Params, ModelInputParams>) {
+    if (use_expanded_spec_decode_attention) {
+      expanded_kv_seq_lens_vec = update_expanded_spec_decode_attention(
+          params, actual_num_tokens, padded_num_tokens);
+    }
   }
   const auto expanded_block_tables_for_graph = [&]() {
     torch::Tensor block_tables = persistent_expanded_block_tables_.slice(
         /*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens);
-    if (params.graph.spec_verify_source_addresses_stable) {
-      // Stable verify graphs include the active width in their graph key.
-      return block_tables.narrow(
-          /*dim=*/1,
-          /*start=*/0,
-          /*length=*/params.graph.expanded_block_tables.size(1));
+    if constexpr (std::is_same_v<Params, ModelInputParams>) {
+      if (params.graph.spec_verify_source_addresses_stable) {
+        // Stable verify graphs include the active width in their graph key.
+        return block_tables.narrow(
+            /*dim=*/1,
+            /*start=*/0,
+            /*length=*/params.graph.expanded_block_tables.size(1));
+      }
     }
     // Generic graphs key only on token shape, so retain the fixed persistent
     // width used by main instead of binding a request-dependent view.
@@ -1287,7 +1322,7 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
 
     if (k_cache.defined() && v_cache.defined() && k_cache.numel() > 0 &&
         v_cache.numel() > 0) {
-      ModelInputParams plan_params = params.clone().view();
+      Params plan_params = clone_graph_input(params);
       torch::Tensor plan_block_tables;
       if (use_expanded_spec_decode_attention) {
         plan_params.meta.num_sequences =
@@ -1367,8 +1402,8 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   // tiling/workspace. Replay uses the same stable hostData addresses, but
   // refreshes them with the actual per-step lengths above before graph replay.
   if (return_capture_params) {
-    std::optional<ModelInputParams> graph_params =
-        std::make_optional<ModelInputParams>(params.clone().view());
+    std::optional<Params> graph_params =
+        std::make_optional<Params>(clone_graph_input(params));
     // Set persistent buffers in graph_params.
     graph_params->attention.device.kv_seq_lens =
         kv_seq_lens(static_cast<uint32_t>(padded_batch_size));
@@ -1383,8 +1418,13 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           persistent_host_q_seq_lens_;
       const bool use_mla_capture_host_lens = for_capture && is_decode;
       if (use_mla_capture_host_lens) {
-        const int32_t capture_kv_seq_len =
-            get_mla_capture_kv_seq_len_bucket(params, options_);
+        const int32_t capture_kv_seq_len = [&]() {
+          if constexpr (std::is_same_v<Params, ModelInputParams>) {
+            return get_mla_capture_kv_seq_len_bucket(params, options_);
+          }
+          CHECK(!supports_mla_graph_kv_bucketing_);
+          return int32_t{0};
+        }();
         std::fill(capture_host_kv_seq_lens_vec.begin(),
                   capture_host_kv_seq_lens_vec.begin() + padded_batch_size,
                   capture_kv_seq_len);
@@ -1482,20 +1522,24 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       graph_params->embedding.input_embedding =
           persistent_embedding(padded_num_tokens);
     }
-    if (params.num_accepted_tokens.defined()) {
-      graph_params->num_accepted_tokens = persistent_num_accepted_tokens(
-          static_cast<uint32_t>(padded_batch_size));
+    if constexpr (std::is_same_v<Params, ModelInputParams>) {
+      if (params.num_accepted_tokens.defined()) {
+        graph_params->num_accepted_tokens = persistent_num_accepted_tokens(
+            static_cast<uint32_t>(padded_batch_size));
+      }
     }
-    if (use_expanded_spec_decode_attention) {
-      layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
-          *graph_params,
-          expanded_kv_seq_lens_.slice(
-              /*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens),
-          expanded_block_tables_for_graph(),
-          expanded_kv_seq_lens_vec,
-          options_.block_size());
-      graph_params->graph.expanded_tiling_data =
-          uses_paged_attention_tiling() ? tiling_data() : torch::Tensor();
+    if constexpr (std::is_same_v<Params, ModelInputParams>) {
+      if (use_expanded_spec_decode_attention) {
+        layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
+            *graph_params,
+            expanded_kv_seq_lens_.slice(
+                /*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens),
+            expanded_block_tables_for_graph(),
+            expanded_kv_seq_lens_vec,
+            options_.block_size());
+        graph_params->graph.expanded_tiling_data =
+            uses_paged_attention_tiling() ? tiling_data() : torch::Tensor();
+      }
     }
     if (params.attention.device.q_cu_seq_lens.defined()) {
       const bool use_hybrid_query_start_loc = is_hybrid_linear_attention_;
@@ -1537,25 +1581,27 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
                        padded_q_seq_lens_vec[static_cast<size_t>(i)]);
     }
 
-    if (params.num_accepted_tokens.defined() &&
-        params.num_accepted_tokens.numel() > 0) {
-      if (!params.num_accepted_tokens_host.empty()) {
-        const int64_t copy_size = std::min<int64_t>(
-            actual_batch_size, params.num_accepted_tokens_host.size());
-        graph_params->num_accepted_tokens_host.assign(
-            params.num_accepted_tokens_host.begin(),
-            params.num_accepted_tokens_host.begin() + copy_size);
-      } else {
-        torch::Tensor nat_host = params.num_accepted_tokens.to(torch::kCPU)
-                                     .to(torch::kLong)
-                                     .contiguous();
-        const int64_t copy_size =
-            std::min<int64_t>(actual_batch_size, nat_host.numel());
-        const int64_t* data = nat_host.data_ptr<int64_t>();
-        graph_params->num_accepted_tokens_host.assign(data, data + copy_size);
+    if constexpr (std::is_same_v<Params, ModelInputParams>) {
+      if (params.num_accepted_tokens.defined() &&
+          params.num_accepted_tokens.numel() > 0) {
+        if (!params.num_accepted_tokens_host.empty()) {
+          const int64_t copy_size = std::min<int64_t>(
+              actual_batch_size, params.num_accepted_tokens_host.size());
+          graph_params->num_accepted_tokens_host.assign(
+              params.num_accepted_tokens_host.begin(),
+              params.num_accepted_tokens_host.begin() + copy_size);
+        } else {
+          torch::Tensor nat_host = params.num_accepted_tokens.to(torch::kCPU)
+                                       .to(torch::kLong)
+                                       .contiguous();
+          const int64_t copy_size =
+              std::min<int64_t>(actual_batch_size, nat_host.numel());
+          const int64_t* data = nat_host.template data_ptr<int64_t>();
+          graph_params->num_accepted_tokens_host.assign(data, data + copy_size);
+        }
+        graph_params->num_accepted_tokens_host.resize(
+            static_cast<size_t>(padded_batch_size), 1);
       }
-      graph_params->num_accepted_tokens_host.resize(
-          static_cast<size_t>(padded_batch_size), 1);
     }
 
     return graph_params;
@@ -1896,12 +1942,13 @@ GraphPersistentParam::paged_attention_plan_descriptor(
   return descriptor;
 }
 
+template <typename Params>
 void GraphPersistentParam::plan_paged_attention_tiling(
     const torch::Tensor& tokens,
     const torch::Tensor& k_cache,
     const torch::Tensor& v_cache,
     const torch::Tensor& block_tables,
-    const ModelInputParams& input_params,
+    const Params& input_params,
     aclrtStream stream,
     bool copy_to_device) {
   // Convert torch tensors to atb tensors
@@ -1981,13 +2028,15 @@ void GraphPersistentParam::plan_paged_attention_tiling(
   CHECK_GT(tiling_buffer_info.tilingBufferSize, 0)
       << "Tiling buffer size is zero";
 
-  if (input_params.graph.use_expanded_decode_for_spec_verify_attention) {
-    const size_t word_count =
-        static_cast<size_t>(tiling_buffer_info.tilingBufferSize) /
-        sizeof(uint32_t);
-    const auto* words =
-        reinterpret_cast<const uint32_t*>(tiling_buffer_info.tilingBuffer);
-    paged_attention_tiling_template_.assign(words, words + word_count);
+  if constexpr (std::is_same_v<Params, ModelInputParams>) {
+    if (input_params.graph.use_expanded_decode_for_spec_verify_attention) {
+      const size_t word_count =
+          static_cast<size_t>(tiling_buffer_info.tilingBufferSize) /
+          sizeof(uint32_t);
+      const auto* words =
+          reinterpret_cast<const uint32_t*>(tiling_buffer_info.tilingBuffer);
+      paged_attention_tiling_template_.assign(words, words + word_count);
+    }
   }
 
   if (VLOG_IS_ON(kGraphExecutorLogVerboseLevel)) {
@@ -2007,8 +2056,8 @@ void GraphPersistentParam::plan_paged_attention_tiling(
   }
 }
 
-void GraphPersistentParam::update_attention_mask(
-    const ModelInputParams& input_params) {
+template <typename Params>
+void GraphPersistentParam::update_attention_mask(const Params& input_params) {
   // update persistent_mask_ in-place
   const int64_t batch_size = input_params.attention.device.kv_seq_lens.size(0);
   const int64_t max_seq_len = input_params.meta.kv_max_seq_len > 0
@@ -2127,5 +2176,37 @@ void GraphPersistentParam::update_attention_mask(
                      /*non_blocking=*/true);
   }
 }
+
+template std::optional<ModelInputParams> GraphPersistentParam::update(
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const ModelInputParams&,
+    uint32_t,
+    bool,
+    bool,
+    bool,
+    bool);
+template void GraphPersistentParam::update_tokens(const torch::Tensor&,
+                                                  const ModelInputParams&,
+                                                  uint32_t,
+                                                  uint32_t);
+
+template std::optional<RecModelParams> GraphPersistentParam::update(
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const RecModelParams&,
+    uint32_t,
+    bool,
+    bool,
+    bool,
+    bool);
+template void GraphPersistentParam::update_tokens(const torch::Tensor&,
+                                                  const RecModelParams&,
+                                                  uint32_t,
+                                                  uint32_t);
 
 }  // namespace xllm::npu

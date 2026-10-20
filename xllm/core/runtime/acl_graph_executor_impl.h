@@ -31,8 +31,12 @@ limitations under the License.
 #include "core/common/macros.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/model_input_params.h"
+#include "core/framework/model/rec_model.h"
 #include "core/kv_cache/storage/kv_cache.h"
 #include "core/runtime/acl_graph_persistent_param.h"
+#include "core/runtime/rec_executor_backend.h"
+#include "core/runtime/rec_executor_impl_factory.h"
+#include "core/runtime/rec_graph_input.h"
 #include "executor_impl.h"
 #include "executor_impl_factory.h"
 #include "options.h"
@@ -110,12 +114,27 @@ class AclGraph {
                uint32_t bucket_num_tokens,
                c10_npu::MempoolId_t graph_pool);
 
+  bool capture(RecModel* model,
+               const runtime::Options& options,
+               const torch::Tensor& tokens,
+               const torch::Tensor& positions,
+               const RecModelParams& params,
+               std::vector<KVCache>& kv_cache,
+               uint32_t bucket_num_tokens,
+               c10_npu::MempoolId_t graph_pool);
+
   // Replay captured graph with new input data
   ModelOutput replay(CausalLM* model,
                      const torch::Tensor& tokens,
                      const torch::Tensor& positions,
                      std::vector<KVCache>& kv_cache,
                      const ModelInputParams& params);
+
+  ModelOutput replay(RecModel* model,
+                     const torch::Tensor& tokens,
+                     const torch::Tensor& positions,
+                     std::vector<KVCache>& kv_cache,
+                     const RecModelParams& params);
 
   void prepare_replay_inputs(const torch::Tensor& tokens,
                              const torch::Tensor& positions,
@@ -131,6 +150,11 @@ class AclGraph {
 
   c10_npu::MempoolId_t memory_pool() { return graph_.pool(); }
   int64_t capture_stream_id() const { return capture_stream_->id(); }
+
+  bool rec_bindings_match(const RecModelParams& params) const {
+    return rec_capture_params_.has_value() &&
+           rec_graph_bindings_match(*rec_capture_params_, params);
+  }
 
  private:
   // Print graph held tensors for debugging
@@ -154,6 +178,9 @@ class AclGraph {
   bool static_graph_task_signature_matches(
       const ModelInputParams& params) const;
   void capture_static_graph_task_signature(const ModelInputParams& params);
+
+  // Keep native Rec owners alive until captured work has been destroyed.
+  std::optional<RecModelParams> rec_capture_params_;
 
   // NPUGraph with mempool for managing temporary tensors during forward pass
   c10_npu::NPUGraph graph_;
@@ -186,9 +213,15 @@ class AclGraph {
 
 // Executor implementation using ACL graph optimization
 // Uses NPUGraph mempool to reduce memory allocation overhead during inference
-class AclGraphExecutorImpl : public ExecutorImpl {
+class AclGraphExecutorImpl final : public ExecutorImpl,
+                                   public RecExecutorBackend {
  public:
   AclGraphExecutorImpl(CausalLM* model,
+                       const ModelArgs& args,
+                       const torch::Device& device,
+                       const runtime::Options& options);
+
+  AclGraphExecutorImpl(RecModel* model,
                        const ModelArgs& args,
                        const torch::Device& device,
                        const runtime::Options& options);
@@ -200,6 +233,11 @@ class AclGraphExecutorImpl : public ExecutorImpl {
                   const torch::Tensor& positions,
                   std::vector<KVCache>& kv_caches,
                   const ModelInputParams& params) override;
+
+  ModelOutput run(const torch::Tensor& tokens,
+                  const torch::Tensor& positions,
+                  std::vector<KVCache>& kv_caches,
+                  const RecModelParams& params) override;
 
   void prepare_graph_input(const torch::Tensor& tokens,
                            const torch::Tensor& positions,
@@ -227,7 +265,18 @@ class AclGraphExecutorImpl : public ExecutorImpl {
 
  private:
   // not own
-  CausalLM* model_;
+  CausalLM* model_ = nullptr;
+  RecModel* rec_model_ = nullptr;
+
+  void initialize(bool need_update_attn_mask,
+                  bool is_hybrid_linear_attention,
+                  bool supports_mla_graph_kv_bucketing);
+  template <typename Model, typename Params>
+  ModelOutput run_typed(Model* model,
+                        const torch::Tensor& tokens,
+                        const torch::Tensor& positions,
+                        std::vector<KVCache>& kv_caches,
+                        const Params& params);
 
   ModelArgs args_;
   torch::Device device_;
@@ -258,8 +307,13 @@ class AclGraphExecutorImpl : public ExecutorImpl {
   uint64_t get_graph_key(uint32_t bucket_num_tokens,
                          const ModelInputParams& params,
                          uint64_t attention_plan_class = 0) const;
+  uint64_t get_graph_key(uint32_t bucket_num_tokens,
+                         const RecModelParams& params,
+                         uint64_t attention_plan_class = 0) const;
+
   std::optional<uint64_t> find_spec_verify_attention_plan_class(
       uint64_t lookup_key);
 };
 REGISTER_EXECUTOR("npu", AclGraphExecutorImpl);
+REGISTER_REC_EXECUTOR("npu", AclGraphExecutorImpl);
 }  // namespace xllm::npu

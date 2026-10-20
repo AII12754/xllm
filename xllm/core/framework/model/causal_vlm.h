@@ -38,10 +38,10 @@ class CausalVLM : public CausalLM {
       const ModelInputParams& input_params) = 0;
 };
 
-template <typename Model>
+template <typename ModelType>
 class CausalVLMImpl : public CausalVLM {
  public:
-  CausalVLMImpl(Model model, const torch::TensorOptions& options)
+  CausalVLMImpl(ModelType model, const torch::TensorOptions& options)
       : model_(std::move(model)), options_(options) {}
 
   MMDict encode(const ModelInputParams& parameters) override {
@@ -62,7 +62,7 @@ class CausalVLMImpl : public CausalVLM {
   }
 
   bool is_hybrid_linear_attention() override {
-    if constexpr (detail::has_is_hybrid_linear_attention<Model>::value) {
+    if constexpr (detail::has_is_hybrid_linear_attention<ModelType>::value) {
       return model_->is_hybrid_linear_attention();
     } else {
       return CausalLM::is_hybrid_linear_attention();
@@ -70,7 +70,8 @@ class CausalVLMImpl : public CausalVLM {
   }
 
   bool supports_mla_graph_kv_bucketing() const override {
-    if constexpr (detail::has_supports_mla_graph_kv_bucketing<Model>::value) {
+    if constexpr (detail::has_supports_mla_graph_kv_bucketing<
+                      ModelType>::value) {
       return model_->supports_mla_graph_kv_bucketing();
     }
     return CausalLM::supports_mla_graph_kv_bucketing();
@@ -78,7 +79,7 @@ class CausalVLMImpl : public CausalVLM {
 
   torch::Tensor pooler(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes) override {
-    if constexpr (detail::has_pooler<Model>::value) {
+    if constexpr (detail::has_pooler<ModelType>::value) {
       return model_->pooler(hidden_states, seleted_idxes);
     } else {
       return CausalLM::pooler(hidden_states, seleted_idxes);
@@ -93,7 +94,7 @@ class CausalVLMImpl : public CausalVLM {
   torch::Tensor logits(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes,
                        torch::Tensor& out_hidden) override {
-    if constexpr (detail::has_logits_with_hidden<Model>::value) {
+    if constexpr (detail::has_logits_with_hidden<ModelType>::value) {
       return model_->logits(hidden_states, seleted_idxes, out_hidden);
     } else {
       return CausalLM::logits(hidden_states, seleted_idxes, out_hidden);
@@ -113,7 +114,7 @@ class CausalVLMImpl : public CausalVLM {
 
 #if defined(USE_NPU)
   layer::NpuLmHead get_npu_lm_head() override {
-    if constexpr (detail::has_get_npu_lm_head<Model>::value) {
+    if constexpr (detail::has_get_npu_lm_head<ModelType>::value) {
       return model_->get_npu_lm_head();
     } else {
       return CausalLM::get_npu_lm_head();
@@ -121,7 +122,7 @@ class CausalVLMImpl : public CausalVLM {
   }
 
   void set_npu_lm_head(layer::NpuLmHead& head) override {
-    if constexpr (detail::has_set_npu_lm_head<Model>::value) {
+    if constexpr (detail::has_set_npu_lm_head<ModelType>::value) {
       model_->set_npu_lm_head(head);
     } else {
       CausalLM::set_npu_lm_head(head);
@@ -129,7 +130,7 @@ class CausalVLMImpl : public CausalVLM {
   }
 
   layer::NpuWordEmbedding get_npu_word_embedding() override {
-    if constexpr (detail::has_get_npu_word_embedding<Model>::value) {
+    if constexpr (detail::has_get_npu_word_embedding<ModelType>::value) {
       return model_->get_npu_word_embedding();
     } else {
       return CausalLM::get_npu_word_embedding();
@@ -137,7 +138,7 @@ class CausalVLMImpl : public CausalVLM {
   }
 
   void set_npu_word_embedding(layer::NpuWordEmbedding& embedding) override {
-    if constexpr (detail::has_set_npu_word_embedding<Model>::value) {
+    if constexpr (detail::has_set_npu_word_embedding<ModelType>::value) {
       model_->set_npu_word_embedding(embedding);
     } else {
       CausalLM::set_npu_word_embedding(embedding);
@@ -145,7 +146,7 @@ class CausalVLMImpl : public CausalVLM {
   }
 #endif
   layer::LmHead get_lm_head() override {
-    if constexpr (detail::has_get_lm_head<Model>::value) {
+    if constexpr (detail::has_get_lm_head<ModelType>::value) {
       return model_->get_lm_head();
     } else {
       return CausalLM::get_lm_head();
@@ -153,7 +154,7 @@ class CausalVLMImpl : public CausalVLM {
   }
 
   void set_lm_head(layer::LmHead& head) override {
-    if constexpr (detail::has_set_lm_head<Model>::value) {
+    if constexpr (detail::has_set_lm_head<ModelType>::value) {
       model_->set_lm_head(head);
     } else {
       CausalLM::set_lm_head(head);
@@ -161,7 +162,7 @@ class CausalVLMImpl : public CausalVLM {
   }
 
   layer::WordEmbedding get_word_embedding() override {
-    if constexpr (detail::has_get_word_embedding<Model>::value) {
+    if constexpr (detail::has_get_word_embedding<ModelType>::value) {
       return model_->get_word_embedding();
     } else {
       return CausalLM::get_word_embedding();
@@ -169,7 +170,7 @@ class CausalVLMImpl : public CausalVLM {
   }
 
   void set_word_embedding(layer::WordEmbedding& embedding) override {
-    if constexpr (detail::has_set_word_embedding<Model>::value) {
+    if constexpr (detail::has_set_word_embedding<ModelType>::value) {
       model_->set_word_embedding(embedding);
     } else {
       CausalLM::set_word_embedding(embedding);
@@ -181,7 +182,7 @@ class CausalVLMImpl : public CausalVLM {
   const torch::TensorOptions& options() const override { return options_; }
 
  private:
-  Model model_;
+  ModelType model_;
   torch::TensorOptions options_;
 };
 

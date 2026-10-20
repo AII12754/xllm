@@ -129,14 +129,14 @@ class OxygenModelImpl : public QWen3ModelImpl {
 
       auto& layer = layers_[i];
 
-      layer(h,
-            cos_pos,
-            sin_pos,
-            attn_mask,
-            kv_caches[i],
-            input_params_new,
-            event,
-            event_flag);
+      layer->forward(h,
+                     cos_pos,
+                     sin_pos,
+                     attn_mask,
+                     kv_caches[i],
+                     input_params_new,
+                     event,
+                     event_flag);
       if (use_deepstack) {
         if (deep_stacks.size() > 0 && i < deep_stacks.size()) {
           h = h + deep_stacks[i];

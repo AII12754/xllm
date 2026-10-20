@@ -16,90 +16,11 @@ limitations under the License.
 
 #pragma once
 #include <memory>
-#include <type_traits>
 #include <utility>
 
 #include "core/framework/model/llm_model_params.h"
-#include "core/framework/model/rec_model_params.h"
 #include "core/framework/model/vlm_model_params.h"
 namespace xllm {
-struct SpecEmbeddingExecutionInput {
-  std::vector<int32_t> extra_token_ids;
-  torch::Tensor mtp_shifted_token_ids;
-  std::vector<int32_t> mtp_bootstrap_row_idxes;
-  torch::Tensor mtp_bootstrap_embeddings;
-};
-struct SpecGraphExecutionInput {
-  bool use_expanded_decode_for_spec_verify_attention = false;
-  torch::Tensor expanded_kv_seq_lens;
-  torch::Tensor expanded_block_tables;
-  torch::Tensor expanded_paged_kv_indptr;
-  torch::Tensor expanded_paged_kv_indices;
-  torch::Tensor expanded_paged_kv_last_page_len;
-  torch::Tensor expanded_tiling_data;
-  std::vector<int32_t> expanded_kv_seq_lens_vec;
-  torch::Tensor input_tokens_override;
-  std::vector<torch::Tensor> spec_verify_draft_token_sources;
-  bool spec_verify_source_addresses_stable = false;
-  bool spec_verify_static_graph_tasks_prepared = false;
-};
-// Rec shares execution infrastructure without owning speculative input fields.
-struct SpecExecutionState {
-  SpecEmbeddingExecutionInput embedding;
-  SpecGraphExecutionInput graph;
-  std::vector<torch::Tensor> multi_block_tables;
-  torch::Tensor mtp_shifted_token_ids;
-  bool is_spec_verify = false;
-  torch::Tensor num_accepted_tokens;
-  MtpTopkStatePtr mtp_topk_state;
-  std::vector<int64_t> num_accepted_tokens_host;
-};
-namespace detail {
-inline SpecExecutionState spec_execution_state_to(
-    const SpecExecutionState& source,
-    const torch::Device& device) {
-  SpecExecutionState out = source;
-  out.embedding.mtp_shifted_token_ids =
-      safe_to(source.embedding.mtp_shifted_token_ids, device, true);
-  out.embedding.mtp_bootstrap_embeddings =
-      safe_to(source.embedding.mtp_bootstrap_embeddings, device, true);
-  out.graph.expanded_kv_seq_lens =
-      safe_to(source.graph.expanded_kv_seq_lens, device, true);
-  out.graph.expanded_block_tables =
-      safe_to(source.graph.expanded_block_tables, device, true);
-  out.graph.expanded_paged_kv_indptr =
-      safe_to(source.graph.expanded_paged_kv_indptr, device, true);
-  out.graph.expanded_paged_kv_indices =
-      safe_to(source.graph.expanded_paged_kv_indices, device, true);
-  out.graph.expanded_paged_kv_last_page_len =
-      safe_to(source.graph.expanded_paged_kv_last_page_len, device, true);
-  out.graph.expanded_tiling_data =
-      safe_to(source.graph.expanded_tiling_data, device, true);
-  out.graph.input_tokens_override =
-      safe_to(source.graph.input_tokens_override, device, true);
-  out.graph.spec_verify_draft_token_sources.clear();
-  out.graph.spec_verify_draft_token_sources.reserve(
-      source.graph.spec_verify_draft_token_sources.size());
-  for (const auto& token : source.graph.spec_verify_draft_token_sources) {
-    out.graph.spec_verify_draft_token_sources.emplace_back(
-        safe_to(token, device, true));
-  }
-  out.multi_block_tables.clear();
-  out.multi_block_tables.reserve(source.multi_block_tables.size());
-  for (const auto& table : source.multi_block_tables) {
-    out.multi_block_tables.emplace_back(
-        safe_to(table, table.options().device(torch::kCPU), true));
-  }
-  out.mtp_shifted_token_ids =
-      safe_to(source.mtp_shifted_token_ids, device, true);
-  out.num_accepted_tokens = safe_to(source.num_accepted_tokens, device, true);
-  out.mtp_topk_state = source.mtp_topk_state == nullptr
-                           ? nullptr
-                           : source.mtp_topk_state->to(device);
-  return out;
-}
-}  // namespace detail
-
 class EmbeddingInputView final {
  public:
   template <typename Common, typename Spec>
@@ -211,14 +132,11 @@ class ModelInputSnapshot final {
 // host vectors or multimodal payloads.
 class ModelInputParams final {
  private:
-  enum class Domain { LLM, VLM, REC };
-  std::shared_ptr<SpecExecutionState> rec_execution_state_;
+  enum class Domain { LLM, VLM };
   std::shared_ptr<ModelInputSnapshotOwner> snapshot_owner_;
   void* native_owner_ = nullptr;
   Domain domain_;
   VlmVisionInput* multimodal_ = nullptr;
-  RecFeatureInput* features_ = nullptr;
-  RecModelInputParams* rec_params_ = nullptr;
 
  public:
   explicit ModelInputParams(LlmModelParams& owner)
@@ -227,35 +145,6 @@ class ModelInputParams final {
       : ModelInputParams(owner, owner, Domain::VLM) {
     multimodal_ = &owner.multimodal;
   }
-  explicit ModelInputParams(RecModelParams& owner)
-      : ModelInputParams(owner, std::make_shared<SpecExecutionState>()) {}
-  ModelInputParams(RecModelParams& owner,
-                   std::shared_ptr<SpecExecutionState> state)
-      : rec_execution_state_(std::move(state)),
-        native_owner_(&owner),
-        domain_(Domain::REC),
-        features_(&owner.features),
-        rec_params_(&owner.rec_params),
-        meta(owner.meta),
-        attention(owner.attention),
-        embedding(owner.embedding, rec_execution_state_->embedding),
-        parallel(owner.parallel),
-        block_copy(owner.block_copy),
-        expert(owner.expert),
-        graph(owner.graph, rec_execution_state_->graph),
-        linear_state_cache_ops(owner.linear_state_cache_ops),
-        linear_state_validity_mask(owner.linear_state_validity_mask),
-        multi_block_tables(rec_execution_state_->multi_block_tables),
-        mtp_shifted_token_ids(rec_execution_state_->mtp_shifted_token_ids),
-        is_spec_verify(rec_execution_state_->is_spec_verify),
-        prefill_without_cache(owner.prefill_without_cache),
-        num_accepted_tokens(rec_execution_state_->num_accepted_tokens),
-        mtp_topk_state(rec_execution_state_->mtp_topk_state),
-        num_accepted_tokens_host(
-            rec_execution_state_->num_accepted_tokens_host),
-        attn_metadata(owner.attn_metadata),
-        python_attention_metadata(owner.python_attention_metadata),
-        enable_graph(owner.enable_graph) {}
   ModelInputParams(const ModelInputParams&) = default;
   ModelInputParams(ModelInputParams&&) = default;
   ModelInputParams& operator=(const ModelInputParams&) = delete;
@@ -266,16 +155,6 @@ class ModelInputParams final {
   VlmVisionInput& multimodal() const {
     CHECK(multimodal_ != nullptr) << "vision input requires VLM parameters";
     return *multimodal_;
-  }
-  bool has_features() const { return features_ != nullptr; }
-  RecFeatureInput& features() const {
-    CHECK(features_ != nullptr) << "feature input requires Rec parameters";
-    return *features_;
-  }
-  bool has_rec_params() const { return rec_params_ != nullptr; }
-  RecModelInputParams& rec_params() const {
-    CHECK(rec_params_ != nullptr) << "strategy input requires Rec parameters";
-    return *rec_params_;
   }
   void clear_linear_attention_state() {
     embedding.linear_state_ids.clear();
@@ -314,18 +193,6 @@ class ModelInputParams final {
     print_tensor(num_accepted_tokens,
                  "ModelInputParams: num_accepted_tokens",
                  /*max_elements=*/4);
-
-    if (const auto* onerec_xattn = onerec_xattention_params()) {
-      LOG(INFO) << "ModelInputParams: has onerec_xattention_params";
-      onerec_xattn->print();
-    } else if (const auto* onerec = onerec_params()) {
-      LOG(INFO) << "ModelInputParams: has onerec_params";
-      onerec->print();
-    } else if (const auto* llmrec = llmrec_params()) {
-      LOG(INFO) << "ModelInputParams: has llm_rec_multi_round_params"
-                << ", beam_width=" << llmrec->beam_width
-                << ", total_round=" << llmrec->total_round;
-    }
   }
 
   int32_t get_q_seq_len(int32_t seq_idx) const {
@@ -398,71 +265,6 @@ class ModelInputParams final {
   std::shared_ptr<layer::AttentionMetadata>& attn_metadata;
   std::shared_ptr<PythonAttentionMetadata>& python_attention_metadata;
   bool& enable_graph;
-  const OneRecModelInputParams* onerec_params() const {
-    if (rec_params_ == nullptr) {
-      return nullptr;
-    }
-    if (const auto* params = std::get_if<OneRecModelInputParams>(rec_params_)) {
-      return params;
-    }
-    if (const auto* params = std::get_if<OneRecXAttentionParams>(rec_params_)) {
-      return static_cast<const OneRecModelInputParams*>(params);
-    }
-    return nullptr;
-  }
-
-  bool has_onerec_params() const { return onerec_params() != nullptr; }
-
-  OneRecModelInputParams& mutable_onerec_params() {
-    CHECK(rec_params_ != nullptr);
-    if (auto* params = std::get_if<OneRecModelInputParams>(rec_params_)) {
-      return *params;
-    }
-    if (auto* params = std::get_if<OneRecXAttentionParams>(rec_params_)) {
-      return static_cast<OneRecModelInputParams&>(*params);
-    }
-    if (!has_onerec_params()) {
-      rec_params().emplace<OneRecModelInputParams>();
-    }
-    return std::get<OneRecModelInputParams>(rec_params());
-  }
-
-  const OneRecXAttentionParams* onerec_xattention_params() const {
-    if (rec_params_ == nullptr) {
-      return nullptr;
-    }
-    return std::get_if<OneRecXAttentionParams>(rec_params_);
-  }
-
-  bool has_onerec_xattention_params() const {
-    return onerec_xattention_params() != nullptr;
-  }
-
-  OneRecXAttentionParams& mutable_onerec_xattention_params() {
-    CHECK(rec_params_ != nullptr);
-    if (!has_onerec_xattention_params()) {
-      rec_params().emplace<OneRecXAttentionParams>();
-    }
-    return std::get<OneRecXAttentionParams>(rec_params());
-  }
-
-  // Accessors for LLM Rec multi-round params inside rec_params variant
-  const LlmRecMultiRoundParams* llmrec_params() const {
-    if (rec_params_ == nullptr) {
-      return nullptr;
-    }
-    return std::get_if<LlmRecMultiRoundParams>(rec_params_);
-  }
-
-  bool has_llmrec_params() const { return llmrec_params() != nullptr; }
-
-  LlmRecMultiRoundParams& mutable_llmrec_params() {
-    CHECK(rec_params_ != nullptr);
-    if (!has_llmrec_params()) {
-      rec_params().emplace<LlmRecMultiRoundParams>();
-    }
-    return std::get<LlmRecMultiRoundParams>(rec_params());
-  }
 
  private:
   friend class ModelInputSnapshot;
@@ -495,37 +297,14 @@ class NativeModelInputSnapshotOwner final : public ModelInputSnapshotOwner {
  public:
   explicit NativeModelInputSnapshotOwner(NativeParams params)
       : params_(std::move(params)) {}
-  NativeModelInputSnapshotOwner(NativeParams params, SpecExecutionState state)
-      : params_(std::move(params)),
-        rec_execution_state_(
-            std::make_shared<SpecExecutionState>(std::move(state))) {}
-  ModelInputParams view() override {
-    if constexpr (std::is_same_v<NativeParams, RecModelParams>) {
-      if (rec_execution_state_ == nullptr) {
-        rec_execution_state_ = std::make_shared<SpecExecutionState>();
-      }
-      return ModelInputParams(params_, rec_execution_state_);
-    } else {
-      return ModelInputParams(params_);
-    }
-  }
+  ModelInputParams view() override { return ModelInputParams(params_); }
   std::shared_ptr<ModelInputSnapshotOwner> to(
       const torch::Device& device) const override {
-    if constexpr (std::is_same_v<NativeParams, RecModelParams>) {
-      return std::make_shared<NativeModelInputSnapshotOwner>(
-          params_.to(device),
-          rec_execution_state_ == nullptr
-              ? SpecExecutionState()
-              : detail::spec_execution_state_to(*rec_execution_state_, device));
-    } else {
-      return std::make_shared<NativeModelInputSnapshotOwner>(
-          params_.to(device));
-    }
+    return std::make_shared<NativeModelInputSnapshotOwner>(params_.to(device));
   }
 
  private:
   NativeParams params_;
-  std::shared_ptr<SpecExecutionState> rec_execution_state_;
 };
 template <typename NativeParams>
 ModelInputSnapshot::ModelInputSnapshot(NativeParams params)
@@ -555,12 +334,6 @@ inline ModelInputSnapshot ModelInputParams::to(
     case Domain::VLM:
       return ModelInputSnapshot(
           static_cast<VlmModelParams*>(native_owner_)->to(device));
-    case Domain::REC:
-      CHECK(rec_execution_state_ != nullptr);
-      return ModelInputSnapshot(std::shared_ptr<ModelInputSnapshotOwner>(
-          std::make_shared<NativeModelInputSnapshotOwner<RecModelParams>>(
-              static_cast<RecModelParams*>(native_owner_)->to(device),
-              detail::spec_execution_state_to(*rec_execution_state_, device))));
   }
   LOG(FATAL) << "unknown model input domain";
   return ModelInputSnapshot();
@@ -573,11 +346,6 @@ inline ModelInputSnapshot ModelInputParams::clone() const {
     case Domain::VLM:
       return ModelInputSnapshot(
           static_cast<VlmModelParams*>(native_owner_)->clone());
-    case Domain::REC:
-      return ModelInputSnapshot(std::shared_ptr<ModelInputSnapshotOwner>(
-          std::make_shared<NativeModelInputSnapshotOwner<RecModelParams>>(
-              static_cast<RecModelParams*>(native_owner_)->clone(),
-              *rec_execution_state_)));
   }
   LOG(FATAL) << "unknown model input domain";
   return ModelInputSnapshot();

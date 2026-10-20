@@ -28,7 +28,7 @@ limitations under the License.
 
 #include "atb/atb_infer.h"
 #include "core/kv_cache/storage/kv_cache.h"
-#include "framework/model/model_input_params.h"
+#include "core/layers/npu/npu_decoder_input.h"
 #include "framework/model_context/model_context.h"
 #include "framework/state_dict/state_dict.h"
 #include "loader/qwen2_decoder_loader.h"
@@ -59,10 +59,31 @@ class NpuQwen2DecoderLayerImpl : public BaseLayer {
                         torch::Tensor& sin_pos,
                         torch::Tensor& attn_mask,
                         KVCache& kv_cache,
-                        ModelInputParams& input_params,
+                        NpuDecoderInputView input_params,
                         aclrtEvent* event = nullptr,
                         std::atomic<bool>* event_flag = nullptr,
                         int node_id = 0);
+
+  template <typename InputParams>
+  torch::Tensor forward(torch::Tensor& x,
+                        torch::Tensor& cos_pos,
+                        torch::Tensor& sin_pos,
+                        torch::Tensor& attn_mask,
+                        KVCache& kv_cache,
+                        InputParams& input_params,
+                        aclrtEvent* event = nullptr,
+                        std::atomic<bool>* event_flag = nullptr,
+                        int node_id = 0) {
+    return forward(x,
+                   cos_pos,
+                   sin_pos,
+                   attn_mask,
+                   kv_cache,
+                   NpuDecoderInputView(input_params),
+                   event,
+                   event_flag,
+                   node_id);
+  }
 
  private:
   void initialize_quantization_parameters();
@@ -73,7 +94,7 @@ class NpuQwen2DecoderLayerImpl : public BaseLayer {
                                torch::Tensor& sin_pos,
                                torch::Tensor& attn_mask,
                                KVCache& kv_cache,
-                               ModelInputParams& input_params,
+                               NpuDecoderInputView input_params,
                                bool is_prefill);
 
   void param_from_args(atb_speed::qwen::DecoderLayerParam& param,

@@ -12,6 +12,10 @@ Read **Python tests** in `xllm/python/README.md`. Put Python tests in
 `initialize_runtime()` before collection. Do not repeat initialization or add
 test-local extension loading or `sys.path` manipulation.
 
+Read the Python style guide at
+`.agents/skills/code-review/references/custom-code-style-python.md` before
+writing or changing Python tests.
+
 Run `python -m pytest tests/python/<file>.py` from the checkout root against matching
 native build artifacts in the environment required by checkout instructions.
 Direct pytest does not build the extension.
@@ -23,8 +27,9 @@ Direct pytest does not build the extension.
    - Prefer extending an existing nearby `*_test.cpp` and `cc_test` target when the behavior belongs to the same domain.
    - Create a new test source only when it improves isolation, keeps platform setup separate, or follows an existing directory pattern.
 
-2. Read the project style guide before editing production files under `xllm/`, and apply the same C++ style discipline to new test code:
-   `.agents/skills/code-review/references/custom-code-style.md`.
+2. Read the C++ style guide at
+   `.agents/skills/code-review/references/custom-code-style-cpp.md` before editing
+   production files under `xllm/`, and apply the same discipline to new test code.
 
 3. Follow the current test layout and CMake conventions.
    - Read [xllm-test-patterns.md](references/xllm-test-patterns.md) when adding a new test file, new `cc_test`, platform-specific test, or test directory.

@@ -21,8 +21,8 @@ limitations under the License.
 
 #include <nlohmann/json.hpp>
 
+#include "core/layers/npu/npu_decoder_input.h"
 #include "framework/model/model_args.h"
-#include "framework/model/model_input_params.h"
 #include "framework/parallel_state/npu_dp_ep_padding.h"
 #include "framework/quantization/quant_args.h"
 #include "framework/state_dict/state_dict.h"
@@ -54,10 +54,33 @@ class NpuQwen3MoeDecoderLayerImpl : public BaseLayer {
                         torch::Tensor& sin_pos,
                         torch::Tensor& attn_mask,
                         KVCache& kv_cache,
-                        const ModelInputParams& input_params,
+                        NpuDecoderInputView input_params,
                         aclrtEvent* event = nullptr,
                         std::atomic<bool>* event_flag = nullptr,
                         int node_id = 0);
+
+  template <typename InputParams>
+  torch::Tensor forward(torch::Tensor& x,
+                        std::optional<torch::Tensor>& residual,
+                        torch::Tensor& cos_pos,
+                        torch::Tensor& sin_pos,
+                        torch::Tensor& attn_mask,
+                        KVCache& kv_cache,
+                        InputParams& input_params,
+                        aclrtEvent* event = nullptr,
+                        std::atomic<bool>* event_flag = nullptr,
+                        int node_id = 0) {
+    return forward(x,
+                   residual,
+                   cos_pos,
+                   sin_pos,
+                   attn_mask,
+                   kv_cache,
+                   NpuDecoderInputView(input_params),
+                   event,
+                   event_flag,
+                   node_id);
+  }
 
  private:
   struct ShardingConfig {
@@ -104,7 +127,7 @@ class NpuQwen3MoeDecoderLayerImpl : public BaseLayer {
                                torch::Tensor& sin_pos,
                                torch::Tensor& attn_mask,
                                KVCache& kv_cache,
-                               const ModelInputParams& input_params,
+                               NpuDecoderInputView input_params,
                                bool is_prefill,
                                bool use_graph_decode_input);
 

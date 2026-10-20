@@ -117,7 +117,7 @@ torch::Tensor DeepseekV2DecoderLayerImpl::forward(
 
   // MLP / MoE
   if (moe_mlp_) {
-    x = moe_mlp_(x, input_params);
+    x = moe_mlp_->forward(x, input_params);
   } else {
     x = mlp_(x);
   }

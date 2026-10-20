@@ -29,6 +29,7 @@ limitations under the License.
 #include "core/framework/config/rec_config.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
+#include "framework/model/rec_model_params.h"
 #include "layers/common/attention_metadata.h"
 #include "layers/common/expanded_decode_metadata_builder.h"
 
@@ -95,9 +96,10 @@ void convert_cumulative_lengths(std::vector<int32_t>& lengths,
   lengths = std::move(per_sequence_lengths);
 }
 
+template <typename InputParams>
 void populate_fa3_attention_metadata(
     AttentionMetadata& attn_metadata,
-    const ModelInputParams& params,
+    const InputParams& params,
     const std::optional<torch::Tensor>& attn_mask) {
   const bool q_lengths_are_cumulative =
       params.attention.host.q_seq_lens.size() > 1 &&
@@ -212,8 +214,9 @@ void populate_fa3_attention_metadata(
 }
 #endif
 
+template <typename InputParams>
 void materialize_linear_state_validity(
-    const ModelInputParams& params,
+    const InputParams& params,
     const std::optional<torch::Device>& device,
     const AttentionMetadataBuildOptions& build_options,
     AttentionMetadata& attn_metadata) {
@@ -276,8 +279,10 @@ void materialize_linear_state_validity(
           : torch::tensor(params.linear_state_validity_mask, options);
 }
 
-AttentionMetadata build_attention_metadata(
-    const ModelInputParams& params,
+template <typename InputParams>
+AttentionMetadata build_common_attention_metadata(
+    const InputParams& params,
+    bool is_spec_verify,
     bool enable_mla,
     const std::string& compute_dtype,
     const std::optional<torch::Device>& device,
@@ -330,8 +335,7 @@ AttentionMetadata build_attention_metadata(
   attn_metadata.use_dense_flash_attention =
       params.graph.use_dense_flash_attention;
 #endif
-  attn_metadata.expanded_decode = ExpandedDecodeMetadataBuilder::build(params);
-  attn_metadata.is_spec_verify = params.is_spec_verify;
+  attn_metadata.is_spec_verify = is_spec_verify;
 
   // for flashinfer
   attn_metadata.paged_kv_indptr = params.attention.device.paged_kv_indptr;
@@ -369,8 +373,7 @@ AttentionMetadata build_attention_metadata(
                    !params.meta.batch_forward_type.is_mixed() &&
                    !params.meta.batch_forward_type.is_chunked_prefill();
   bool is_spec_verify_chunked_prefill =
-      params.is_spec_verify &&
-      params.meta.batch_forward_type.is_chunked_prefill();
+      is_spec_verify && params.meta.batch_forward_type.is_chunked_prefill();
   bool use_acl_graph = ::xllm::ExecutionConfig::get_instance().enable_graph() &&
                        params.enable_graph &&
                        (is_decode || is_spec_verify_chunked_prefill) &&
@@ -534,8 +537,20 @@ AttentionMetadata build_attention_metadata(
   attn_metadata.block_table = params.attention.device.block_tables;
 #endif
 
-  // TODO: set use_tensor_core from options.
-  // for xattention
+  if (build_options.kv_shard_layout.has_value()) {
+    KVShardBatchMetadataBuildOptions shard_build_options;
+    shard_build_options.materialize_indexer_block_table = false;
+    shard_build_options.materialize_attention_lengths = true;
+    attn_metadata.kv_shard_batch_metadata =
+        build_kv_shard_batch_metadata(attn_metadata,
+                                      build_options.kv_shard_layout.value(),
+                                      shard_build_options);
+  }
+  return attn_metadata;
+}
+
+void populate_rec_attention_metadata(const RecModelParams& params,
+                                     AttentionMetadata& attn_metadata) {
   if (params.has_llmrec_params()) {
     const auto& llmrec_params = *params.llmrec_params();
     if (llmrec_params.current_round_tensor.defined() &&
@@ -582,17 +597,6 @@ AttentionMetadata build_attention_metadata(
 #endif
     }
   }
-
-  if (build_options.kv_shard_layout.has_value()) {
-    KVShardBatchMetadataBuildOptions shard_build_options;
-    shard_build_options.materialize_indexer_block_table = false;
-    shard_build_options.materialize_attention_lengths = true;
-    attn_metadata.kv_shard_batch_metadata =
-        build_kv_shard_batch_metadata(attn_metadata,
-                                      build_options.kv_shard_layout.value(),
-                                      shard_build_options);
-  }
-  return attn_metadata;
 }
 
 }  // namespace
@@ -634,8 +638,42 @@ AttentionMetadata AttentionMetadataBuilder::build(
     const std::optional<torch::Tensor>& attn_mask,
     const std::optional<torch::Device>& device,
     const AttentionMetadataBuildOptions& build_options) {
-  return build_attention_metadata(
-      params, enable_mla, compute_dtype, device, attn_mask, build_options);
+  auto metadata = build_common_attention_metadata(params,
+                                                  params.is_spec_verify,
+                                                  enable_mla,
+                                                  compute_dtype,
+                                                  device,
+                                                  attn_mask,
+                                                  build_options);
+  metadata.expanded_decode = ExpandedDecodeMetadataBuilder::build(params);
+  return metadata;
+}
+
+AttentionMetadata AttentionMetadataBuilder::build(
+    const RecModelParams& params,
+    bool enable_mla,
+    const std::optional<torch::Tensor>& attn_mask,
+    const std::optional<torch::Device>& device,
+    const AttentionMetadataBuildOptions& build_options) {
+  return build(params, enable_mla, "float", attn_mask, device, build_options);
+}
+
+AttentionMetadata AttentionMetadataBuilder::build(
+    const RecModelParams& params,
+    bool enable_mla,
+    const std::string& compute_dtype,
+    const std::optional<torch::Tensor>& attn_mask,
+    const std::optional<torch::Device>& device,
+    const AttentionMetadataBuildOptions& build_options) {
+  auto metadata = build_common_attention_metadata(params,
+                                                  /*is_spec_verify=*/false,
+                                                  enable_mla,
+                                                  compute_dtype,
+                                                  device,
+                                                  attn_mask,
+                                                  build_options);
+  populate_rec_attention_metadata(params, metadata);
+  return metadata;
 }
 
 torch::Tensor AttentionMetadataBuilder::build_chunk_indices(

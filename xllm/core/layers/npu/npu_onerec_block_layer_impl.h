@@ -24,7 +24,7 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
-#include "framework/model/model_input_params.h"
+#include "framework/model/rec_model_params.h"
 #include "framework/model_context/model_context.h"
 #include "framework/state_dict/state_dict.h"
 #include "npu_base_layer.h"
@@ -57,7 +57,7 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
   torch::Tensor forward(torch::Tensor& x,
                         torch::Tensor& attn_mask,
                         KVCache& kv_cache,
-                        ModelInputParams& input_params,
+                        RecModelParams& input_params,
                         torch::Tensor* encoder_output = nullptr,
                         int32_t node_id = 0,
                         aclrtEvent* event = nullptr,
@@ -68,13 +68,12 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
   void param_from_args(atb_speed::onerec::BlockLayerParam& param,
                        const ModelArgs& args,
                        const ParallelArgs& parallel_args,
-                       bool is_prefill,
-                       const ModelInputParams* input_params = nullptr);
+                       bool is_prefill);
 
   void build_encoder_node_variant_pack(atb_speed::Model::Node& node,
                                        torch::Tensor& x,
                                        at::Tensor& attn_mask,
-                                       ModelInputParams& input_params,
+                                       RecModelParams& input_params,
                                        bool is_prefill,
                                        int32_t layer_id = 0);
 
@@ -82,7 +81,7 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
                                        torch::Tensor& x,
                                        at::Tensor& attn_mask,
                                        KVCache& kv_cache,
-                                       ModelInputParams& input_params,
+                                       RecModelParams& input_params,
                                        bool is_prefill,
                                        bool is_first_prefill,
                                        torch::Tensor* encoder_output = nullptr,
@@ -93,7 +92,7 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
       torch::Tensor& x,
       at::Tensor& attn_mask,
       KVCache& kv_cache,
-      ModelInputParams& input_params,
+      RecModelParams& input_params,
       bool is_prefill,
       bool is_first_prefill,
       torch::Tensor* encoder_output = nullptr,
@@ -110,7 +109,7 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
       torch::Tensor& x,
       at::Tensor& attn_mask,
       KVCache& kv_cache,
-      ModelInputParams& input_params,
+      RecModelParams& input_params,
       const atb_speed::onerec::BlockLayerParam& param,
       bool is_first_prefill,
       torch::Tensor* encoder_output = nullptr,

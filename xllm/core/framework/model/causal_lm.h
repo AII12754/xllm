@@ -18,11 +18,8 @@ limitations under the License.
 // clang-format off
 #if defined(USE_NPU)
 #include "graph/types.h"
-#include "layers/npu/npu_lm_head_impl.h"
-#include "layers/npu/npu_word_embedding_impl.h"
 #endif
-#include "layers/common/lm_head.h"
-#include "layers/common/word_embedding.h"
+#include "core/framework/model/model.h"
 // clang-format on
 #include <c10/core/Device.h>
 #include <torch/torch.h>
@@ -34,14 +31,13 @@ limitations under the License.
 #include <vector>
 
 #include "common/macros.h"
-#include "core/framework/model_loader/model_loader.h"
+#include "core/framework/model/model_args.h"
+#include "core/framework/model/model_input_params.h"
+#include "core/framework/model/model_output.h"
+#include "core/framework/model/model_traits.h"
 #include "core/framework/quantization/quant_args.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/kv_cache/storage/kv_cache.h"
-#include "model_args.h"
-#include "model_input_params.h"
-#include "model_output.h"
-#include "model_traits.h"
 
 namespace xllm {
 
@@ -65,7 +61,7 @@ struct DFlash2CandidateOutput {
   torch::Tensor edge_logits;
 };
 
-class CausalLM : public torch::nn::Module {
+class CausalLM : public torch::nn::Module, public Model {
  public:
   ~CausalLM() override = default;
 
@@ -126,74 +122,28 @@ class CausalLM : public torch::nn::Module {
     return logits(hidden_states, seleted_idxes);
   }
 
-  virtual void load_model(std::unique_ptr<ModelLoader> loader) = 0;
+#if defined(USE_NPU)
+  // xlite runtime access, nullptr for non-xlite models.
+  virtual xlite::XliteModelHolder* get_xlite_holder() { return nullptr; }
+#endif
 
-  virtual torch::Device device() const = 0;
+  virtual bool share_weights_from(CausalLM& /*source*/) { return false; }
 
   virtual void prepare_expert_weight(
       int32_t layer_id,
       const std::vector<int32_t>& expert_ids) = 0;
+
   virtual void start_expert_weight_transfer(int32_t /*layer_id*/) {}
+
   virtual void update_expert_weight(int32_t layer_id) = 0;
 
   // Returns whether the last prepare_expert_weight() call for the given layer
   // succeeded. Default is true so models that do not fail-report keep the old
   // behavior; DSV4 (npu_torch) overrides this to expose real prepare status
-  // so EplbExecutor does not advance ready_layer_id on silent failures.
+  // so EplbExecutor does not report a failed preparation as complete.
   virtual bool last_prepare_expert_weight_ok(int32_t /*layer_id*/) const {
     return true;
   }
-
-  virtual const torch::TensorOptions& options() const = 0;
-
-  // MTP-specific interface.
-#if defined(USE_NPU)
-  virtual layer::NpuLmHead get_npu_lm_head() {
-    NOT_IMPLEMENTED();
-    return nullptr;
-  }
-  virtual void set_npu_lm_head(layer::NpuLmHead& head) { NOT_IMPLEMENTED(); }
-  virtual layer::NpuWordEmbedding get_npu_word_embedding() {
-    NOT_IMPLEMENTED();
-    return nullptr;
-  }
-  virtual bool has_restored_npu_word_embedding() { return false; }
-  virtual void set_npu_word_embedding(layer::NpuWordEmbedding& embedding) {
-    NOT_IMPLEMENTED();
-  }
-  virtual void set_restored_npu_word_embedding(
-      layer::NpuWordEmbedding& embedding) {
-    set_npu_word_embedding(embedding);
-  }
-
-  virtual bool init_or_refresh_rolling_runtime(Stream* load_stream,
-                                               Stream* compute_stream,
-                                               int32_t num_cached_slots,
-                                               int32_t requested_rolling_slots,
-                                               const std::string& model_id) {
-    NOT_IMPLEMENTED();
-    return false;
-  }
-
-  // xlite runtime access, nullptr for non-xlite models.
-  virtual xlite::XliteModelHolder* get_xlite_holder() { return nullptr; }
-#endif
-
-  virtual layer::LmHead get_lm_head() {
-    NOT_IMPLEMENTED();
-    return nullptr;
-  }
-  virtual void set_lm_head(layer::LmHead& head) { NOT_IMPLEMENTED(); }
-  virtual layer::WordEmbedding get_word_embedding() {
-    NOT_IMPLEMENTED();
-    return nullptr;
-  }
-
-  virtual void set_word_embedding(layer::WordEmbedding& embedding) {
-    NOT_IMPLEMENTED();
-  }
-
-  virtual bool share_weights_from(CausalLM& /*source*/) { return false; }
 
   // DFlash-specific interface. Attention-free scatter-only pass that projects
   // target hidden into the draft's per-layer KV cache. Not part of forward()
@@ -238,22 +188,12 @@ class CausalLM : public torch::nn::Module {
     return {};
   }
   virtual bool has_dspark_confidence_head() const { return false; }
-
-  virtual void lazy_load_model(std::unique_ptr<ModelLoader> loader) {
-    NOT_IMPLEMENTED();
-  }
-
-  virtual void free_model_weights() { NOT_IMPLEMENTED(); }
-
-  virtual void reload_model_weights() { NOT_IMPLEMENTED(); }
-
-  virtual void reload_model_weights_from_device() { NOT_IMPLEMENTED(); }
 };
 
-template <typename Model>
+template <typename ModelType>
 class CausalLMImpl : public CausalLM {
  public:
-  CausalLMImpl(Model model, const torch::TensorOptions& options)
+  CausalLMImpl(ModelType model, const torch::TensorOptions& options)
       : model_(std::move(model)), options_(options) {}
 
   ModelOutput forward(const torch::Tensor& tokens,
@@ -264,7 +204,8 @@ class CausalLMImpl : public CausalLM {
   }
 
   bool requires_graph_forward_metadata() override {
-    if constexpr (detail::has_requires_graph_forward_metadata<Model>::value) {
+    if constexpr (detail::has_requires_graph_forward_metadata<
+                      ModelType>::value) {
       return model_->requires_graph_forward_metadata();
     } else {
       return CausalLM::requires_graph_forward_metadata();
@@ -272,7 +213,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   bool is_hybrid_linear_attention() override {
-    if constexpr (detail::has_is_hybrid_linear_attention<Model>::value) {
+    if constexpr (detail::has_is_hybrid_linear_attention<ModelType>::value) {
       return model_->is_hybrid_linear_attention();
     } else {
       return CausalLM::is_hybrid_linear_attention();
@@ -280,7 +221,8 @@ class CausalLMImpl : public CausalLM {
   }
 
   bool supports_mla_graph_kv_bucketing() const override {
-    if constexpr (detail::has_supports_mla_graph_kv_bucketing<Model>::value) {
+    if constexpr (detail::has_supports_mla_graph_kv_bucketing<
+                      ModelType>::value) {
       return model_->supports_mla_graph_kv_bucketing();
     }
     return CausalLM::supports_mla_graph_kv_bucketing();
@@ -289,7 +231,7 @@ class CausalLMImpl : public CausalLM {
   std::unique_ptr<ModelGraphMetadataState> create_graph_forward_metadata_state()
       override {
     if constexpr (detail::has_create_graph_forward_metadata_state<
-                      Model>::value) {
+                      ModelType>::value) {
       return model_->create_graph_forward_metadata_state();
     } else {
       return CausalLM::create_graph_forward_metadata_state();
@@ -299,7 +241,8 @@ class CausalLMImpl : public CausalLM {
   void prepare_graph_forward_metadata(ModelGraphMetadataState* state,
                                       const torch::Tensor& positions,
                                       ModelInputParams& parameters) override {
-    if constexpr (detail::has_prepare_graph_forward_metadata<Model>::value) {
+    if constexpr (detail::has_prepare_graph_forward_metadata<
+                      ModelType>::value) {
       model_->prepare_graph_forward_metadata(state, positions, parameters);
     }
   }
@@ -317,7 +260,7 @@ class CausalLMImpl : public CausalLM {
   torch::Tensor logits(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes,
                        torch::Tensor& out_hidden) override {
-    if constexpr (detail::has_logits_with_hidden<Model>::value) {
+    if constexpr (detail::has_logits_with_hidden<ModelType>::value) {
       return model_->logits(hidden_states, seleted_idxes, out_hidden);
     } else {
       return CausalLM::logits(hidden_states, seleted_idxes, out_hidden);
@@ -333,7 +276,7 @@ class CausalLMImpl : public CausalLM {
                                const torch::Tensor& device_cache_slots,
                                std::vector<KVCache>& kv_caches,
                                const ModelInputParams& input_params) override {
-    if constexpr (detail::has_write_context_kv<Model>::value) {
+    if constexpr (detail::has_write_context_kv<ModelType>::value) {
       return model_->write_context_kv(target_hidden,
                                       positions,
                                       device_cache_slots,
@@ -352,7 +295,7 @@ class CausalLMImpl : public CausalLM {
       const torch::Tensor& hidden_states,
       const torch::Tensor& unary_logits,
       const torch::Tensor& anchor_token_ids) override {
-    if constexpr (detail::has_dflash2_candidates<Model>::value) {
+    if constexpr (detail::has_dflash2_candidates<ModelType>::value) {
       return model_->dflash2_candidates(
           hidden_states, unary_logits, anchor_token_ids);
     }
@@ -362,7 +305,7 @@ class CausalLMImpl : public CausalLM {
 
   torch::Tensor dspark_markov_bias(
       const torch::Tensor& previous_token_ids) override {
-    if constexpr (detail::has_dspark_markov_bias<Model>::value) {
+    if constexpr (detail::has_dspark_markov_bias<ModelType>::value) {
       return model_->dspark_markov_bias(previous_token_ids);
     }
     return CausalLM::dspark_markov_bias(previous_token_ids);
@@ -371,21 +314,21 @@ class CausalLMImpl : public CausalLM {
   torch::Tensor dspark_confidence_probs(
       const torch::Tensor& hidden_all,
       const torch::Tensor& prev_matrix) override {
-    if constexpr (detail::has_dspark_confidence_probs<Model>::value) {
+    if constexpr (detail::has_dspark_confidence_probs<ModelType>::value) {
       return model_->dspark_confidence_probs(hidden_all, prev_matrix);
     }
     return CausalLM::dspark_confidence_probs(hidden_all, prev_matrix);
   }
 
   bool has_dspark_confidence_head() const override {
-    if constexpr (detail::has_has_dspark_confidence_head<Model>::value) {
+    if constexpr (detail::has_has_dspark_confidence_head<ModelType>::value) {
       return model_->has_dspark_confidence_head();
     }
     return false;
   }
 
   void lazy_load_model(std::unique_ptr<ModelLoader> loader) override {
-    if constexpr (detail::has_lazy_load_model<Model>::value) {
+    if constexpr (detail::has_lazy_load_model<ModelType>::value) {
       model_->lazy_load_model(std::move(loader));
     } else {
       CausalLM::lazy_load_model(std::move(loader));
@@ -393,7 +336,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   void free_model_weights() override {
-    if constexpr (detail::has_free_model_weights<Model>::value) {
+    if constexpr (detail::has_free_model_weights<ModelType>::value) {
       model_->free_model_weights();
     } else {
       CausalLM::free_model_weights();
@@ -401,7 +344,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   void reload_model_weights() override {
-    if constexpr (detail::has_reload_model_weights<Model>::value) {
+    if constexpr (detail::has_reload_model_weights<ModelType>::value) {
       model_->reload_model_weights();
     } else {
       CausalLM::reload_model_weights();
@@ -409,7 +352,8 @@ class CausalLMImpl : public CausalLM {
   }
 
   void reload_model_weights_from_device() override {
-    if constexpr (detail::has_reload_model_weights_from_device<Model>::value) {
+    if constexpr (detail::has_reload_model_weights_from_device<
+                      ModelType>::value) {
       model_->reload_model_weights_from_device();
     } else {
       CausalLM::reload_model_weights_from_device();
@@ -422,7 +366,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   void start_expert_weight_transfer(int32_t layer_id) override {
-    if constexpr (detail::has_start_expert_weight_transfer<Model>::value) {
+    if constexpr (detail::has_start_expert_weight_transfer<ModelType>::value) {
       model_->start_expert_weight_transfer(layer_id);
     }
   }
@@ -432,7 +376,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   bool last_prepare_expert_weight_ok(int32_t layer_id) const override {
-    if constexpr (detail::has_last_prepare_expert_weight_ok<Model>::value) {
+    if constexpr (detail::has_last_prepare_expert_weight_ok<ModelType>::value) {
       return model_->last_prepare_expert_weight_ok(layer_id);
     } else {
       return CausalLM::last_prepare_expert_weight_ok(layer_id);
@@ -441,7 +385,7 @@ class CausalLMImpl : public CausalLM {
 
 #if defined(USE_NPU)
   layer::NpuLmHead get_npu_lm_head() override {
-    if constexpr (detail::has_get_npu_lm_head<Model>::value) {
+    if constexpr (detail::has_get_npu_lm_head<ModelType>::value) {
       return model_->get_npu_lm_head();
     } else {
       return CausalLM::get_npu_lm_head();
@@ -449,7 +393,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   void set_npu_lm_head(layer::NpuLmHead& head) override {
-    if constexpr (detail::has_set_npu_lm_head<Model>::value) {
+    if constexpr (detail::has_set_npu_lm_head<ModelType>::value) {
       model_->set_npu_lm_head(head);
     } else {
       CausalLM::set_npu_lm_head(head);
@@ -457,7 +401,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   layer::NpuWordEmbedding get_npu_word_embedding() override {
-    if constexpr (detail::has_get_npu_word_embedding<Model>::value) {
+    if constexpr (detail::has_get_npu_word_embedding<ModelType>::value) {
       return model_->get_npu_word_embedding();
     } else {
       return CausalLM::get_npu_word_embedding();
@@ -465,7 +409,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   bool has_restored_npu_word_embedding() override {
-    if constexpr (detail::has_restored_npu_word_embedding<Model>::value) {
+    if constexpr (detail::has_restored_npu_word_embedding<ModelType>::value) {
       return model_->has_restored_npu_word_embedding();
     } else {
       return CausalLM::has_restored_npu_word_embedding();
@@ -473,7 +417,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   void set_npu_word_embedding(layer::NpuWordEmbedding& embedding) override {
-    if constexpr (detail::has_set_npu_word_embedding<Model>::value) {
+    if constexpr (detail::has_set_npu_word_embedding<ModelType>::value) {
       model_->set_npu_word_embedding(embedding);
     } else {
       CausalLM::set_npu_word_embedding(embedding);
@@ -482,7 +426,8 @@ class CausalLMImpl : public CausalLM {
 
   void set_restored_npu_word_embedding(
       layer::NpuWordEmbedding& embedding) override {
-    if constexpr (detail::has_set_restored_npu_word_embedding<Model>::value) {
+    if constexpr (detail::has_set_restored_npu_word_embedding<
+                      ModelType>::value) {
       model_->set_restored_npu_word_embedding(embedding);
     } else {
       CausalLM::set_restored_npu_word_embedding(embedding);
@@ -494,7 +439,8 @@ class CausalLMImpl : public CausalLM {
                                        int32_t num_cached_slots,
                                        int32_t requested_rolling_slots,
                                        const std::string& model_id) override {
-    if constexpr (detail::has_init_or_refresh_rolling_runtime<Model>::value) {
+    if constexpr (detail::has_init_or_refresh_rolling_runtime<
+                      ModelType>::value) {
       return model_->init_or_refresh_rolling_runtime(load_stream,
                                                      compute_stream,
                                                      num_cached_slots,
@@ -508,9 +454,9 @@ class CausalLMImpl : public CausalLM {
                                                      model_id);
   }
 
-  // Forward to inner Model.
+  // Forward to inner ModelType.
   xlite::XliteModelHolder* get_xlite_holder() override {
-    if constexpr (detail::has_get_xlite_holder<Model>::value) {
+    if constexpr (detail::has_get_xlite_holder<ModelType>::value) {
       return model_->get_xlite_holder();
     }
     return CausalLM::get_xlite_holder();
@@ -518,7 +464,7 @@ class CausalLMImpl : public CausalLM {
 #endif
 
   layer::LmHead get_lm_head() override {
-    if constexpr (detail::has_get_lm_head<Model>::value) {
+    if constexpr (detail::has_get_lm_head<ModelType>::value) {
       return model_->get_lm_head();
     } else {
       return CausalLM::get_lm_head();
@@ -526,7 +472,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   void set_lm_head(layer::LmHead& head) override {
-    if constexpr (detail::has_set_lm_head<Model>::value) {
+    if constexpr (detail::has_set_lm_head<ModelType>::value) {
       model_->set_lm_head(head);
     } else {
       CausalLM::set_lm_head(head);
@@ -534,7 +480,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   layer::WordEmbedding get_word_embedding() override {
-    if constexpr (detail::has_get_word_embedding<Model>::value) {
+    if constexpr (detail::has_get_word_embedding<ModelType>::value) {
       return model_->get_word_embedding();
     } else {
       return CausalLM::get_word_embedding();
@@ -542,7 +488,7 @@ class CausalLMImpl : public CausalLM {
   }
 
   void set_word_embedding(layer::WordEmbedding& embedding) override {
-    if constexpr (detail::has_set_word_embedding<Model>::value) {
+    if constexpr (detail::has_set_word_embedding<ModelType>::value) {
       model_->set_word_embedding(embedding);
     } else {
       CausalLM::set_word_embedding(embedding);
@@ -554,7 +500,7 @@ class CausalLMImpl : public CausalLM {
   const torch::TensorOptions& options() const override { return options_; }
 
  private:
-  Model model_;
+  ModelType model_;
 
   torch::TensorOptions options_;
 };

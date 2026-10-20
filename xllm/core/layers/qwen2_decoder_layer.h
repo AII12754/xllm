@@ -26,7 +26,6 @@ limitations under the License.
 #include "common/rms_norm.h"
 #include "core/kv_cache/storage/kv_cache.h"
 #include "framework/model/model_args.h"
-#include "framework/model/model_input_params.h"
 #include "framework/model_context/model_context.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/state_dict/state_dict.h"
@@ -47,8 +46,17 @@ class Qwen2DecoderLayerImpl : public torch::nn::Module {
                         std::optional<torch::Tensor>& residual,
                         torch::Tensor& positions,
                         const AttentionMetadata& attn_metadata,
+                        KVCache& kv_cache);
+
+  template <typename InputParams>
+  torch::Tensor forward(torch::Tensor& x,
+                        std::optional<torch::Tensor>& residual,
+                        torch::Tensor& positions,
+                        const AttentionMetadata& attn_metadata,
                         KVCache& kv_cache,
-                        const ModelInputParams& input_params);
+                        const InputParams&) {
+    return forward(x, residual, positions, attn_metadata, kv_cache);
+  }
 
  private:
   Qwen2Attention attention_{nullptr};

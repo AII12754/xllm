@@ -31,13 +31,18 @@ limitations under the License.
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <variant>
 
 #include "core/common/macros.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/model_input_params.h"
+#include "core/framework/model/rec_model.h"
 #include "core/kernels/cuda/llm_decode_metadata_update.h"
 #include "core/kernels/cuda/piecewise_graphs.h"
 #include "core/kv_cache/storage/kv_cache.h"
+#include "core/runtime/rec_executor_backend.h"
+#include "core/runtime/rec_executor_impl_factory.h"
+#include "core/runtime/rec_graph_input.h"
 #include "executor_impl.h"
 #include "executor_impl_factory.h"
 #include "options.h"
@@ -67,13 +72,14 @@ class CudaGraphPersistentParam {
   // return_capture_params is true, used for build new ModelInputParams for
   // capture. If return_capture_params is false, only updates persistent buffers
   // and returns std::nullopt.
-  std::optional<ModelInputParams> update(const torch::Tensor& tokens,
-                                         const torch::Tensor& k_cache,
-                                         const torch::Tensor& v_cache,
-                                         const torch::Tensor& positions,
-                                         const ModelInputParams& params,
-                                         uint32_t padded_num_tokens = 0,
-                                         bool return_capture_params = false);
+  template <typename Params>
+  std::optional<Params> update(const torch::Tensor& tokens,
+                               const torch::Tensor& k_cache,
+                               const torch::Tensor& v_cache,
+                               const torch::Tensor& positions,
+                               const Params& params,
+                               uint32_t padded_num_tokens = 0,
+                               bool return_capture_params = false);
 
   // Getter methods for persistent tensors
   torch::Tensor persistent_tokens(uint32_t actual_tokens) const {
@@ -198,12 +204,14 @@ class CudaGraphPersistentParam {
   }
 
  private:
+  template <typename Params>
   bool can_use_llm_decode_fast_path(const torch::Tensor& tokens,
                                     const torch::Tensor& positions,
-                                    const ModelInputParams& params) const;
+                                    const Params& params) const;
+  template <typename Params>
   void update_llm_decode_metadata_fast_path(const torch::Tensor& tokens,
                                             const torch::Tensor& positions,
-                                            const ModelInputParams& params,
+                                            const Params& params,
                                             uint32_t padded_num_tokens,
                                             int64_t actual_batch_size,
                                             int64_t actual_num_tokens);
@@ -260,21 +268,53 @@ class CudaGraph {
                uint32_t bucket_num_tokens,
                const at::cuda::MempoolId_t& pool,
                TorchMemPool* pool_ptr = nullptr);
+  bool capture(RecModel* model,
+               const ModelArgs& args,
+               const runtime::Options& options,
+               const torch::Tensor& tokens,
+               const torch::Tensor& positions,
+               const RecModelParams& params,
+               std::vector<KVCache>& kv_cache,
+               uint32_t bucket_num_tokens,
+               const at::cuda::MempoolId_t& pool,
+               TorchMemPool* pool_ptr = nullptr);
 
   // Replay captured graph with new input data
+  template <typename Params>
   ModelOutput replay(const torch::Tensor& tokens,
                      const torch::Tensor& positions,
                      std::vector<KVCache>& kv_cache,
-                     const ModelInputParams& params);
+                     const Params& params);
 
   // Get the hidden states from the last capture
   torch::Tensor get_hidden_states(uint32_t actual_num_tokens) const {
     return persistent_param_.hidden_states(actual_num_tokens);
   }
 
+  bool rec_bindings_match(const RecModelParams& params) const {
+    const auto* captured = std::get_if<RecModelParams>(&capture_params_);
+    return captured != nullptr && rec_graph_bindings_match(*captured, params);
+  }
+
  private:
+  template <typename Model, typename Params>
+  bool capture_typed(Model* model,
+                     const ModelArgs& args,
+                     const runtime::Options& options,
+                     const torch::Tensor& tokens,
+                     const torch::Tensor& positions,
+                     const Params& params,
+                     std::vector<KVCache>& kv_cache,
+                     uint32_t bucket_num_tokens,
+                     const at::cuda::MempoolId_t& pool,
+                     TorchMemPool* pool_ptr);
+
   // Print graph held tensors for debugging
   void print_graph_tensors() const;
+
+  // Destroy captured work before releasing its native input owner.
+  std::variant<std::monostate, ModelInputParams, RecModelParams>
+      capture_params_;
 
   // CUDA graph for capturing and replaying (decode mode)
   at::cuda::CUDAGraph graph_;
@@ -295,9 +335,15 @@ class CudaGraph {
 };
 
 // Executor implementation using CUDA graph optimization
-class CudaGraphExecutorImpl : public ExecutorImpl {
+class CudaGraphExecutorImpl final : public ExecutorImpl,
+                                    public RecExecutorBackend {
  public:
   CudaGraphExecutorImpl(CausalLM* model,
+                        const ModelArgs& args,
+                        const torch::Device& device,
+                        const runtime::Options& options);
+
+  CudaGraphExecutorImpl(RecModel* model,
                         const ModelArgs& args,
                         const torch::Device& device,
                         const runtime::Options& options);
@@ -310,6 +356,11 @@ class CudaGraphExecutorImpl : public ExecutorImpl {
                   std::vector<KVCache>& kv_caches,
                   const ModelInputParams& params) override;
 
+  ModelOutput run(const torch::Tensor& tokens,
+                  const torch::Tensor& positions,
+                  std::vector<KVCache>& kv_caches,
+                  const RecModelParams& params) override;
+
   // Return current graph executor memory usage in bytes (including persistent
   // parameters). Exposed for tests and diagnostics.
   size_t get_graph_memory_usage_bytes();
@@ -319,7 +370,16 @@ class CudaGraphExecutorImpl : public ExecutorImpl {
 
  private:
   // not own
-  CausalLM* model_;
+  CausalLM* model_ = nullptr;
+  RecModel* rec_model_ = nullptr;
+
+  template <typename Model, typename Params>
+  ModelOutput run_typed(Model* model,
+                        const torch::Tensor& tokens,
+                        const torch::Tensor& positions,
+                        std::vector<KVCache>& kv_caches,
+                        const Params& params);
+  void initialize();
 
   ModelArgs args_;
   torch::Device device_;
@@ -402,5 +462,6 @@ class CudaGraphExecutorImpl : public ExecutorImpl {
       c10::DeviceIndex device_index);
 };
 REGISTER_EXECUTOR("cuda", CudaGraphExecutorImpl);
+REGISTER_REC_EXECUTOR("cuda", CudaGraphExecutorImpl);
 
 }  // namespace xllm::runtime::cuda

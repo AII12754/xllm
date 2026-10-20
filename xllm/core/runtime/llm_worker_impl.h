@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/types.h>
 
 #include "forward_params.h"
+#include "framework/eplb/eplb_executor.h"
 #include "framework/model/causal_lm.h"
 #include "framework/model/model_input_params.h"
 #include "options.h"
@@ -58,6 +59,8 @@ class LLMWorkerImpl : public WorkerImpl {
       bool record_ready_event = true);
 
  protected:
+  void prepare_expert_input(ExpertInput& input) const override;
+
   std::optional<ForwardOutput> step_for_schedule_overlap(
       const LlmForwardInput& input) override;
   LlmForwardInput update_input_by_last_step_output_for_schedule_overlap(
@@ -106,6 +109,8 @@ class LLMWorkerImpl : public WorkerImpl {
 
  protected:
   std::unique_ptr<BeamSearcher> beam_searcher_;
+  torch::Tensor expert_load_data_;
+  std::unique_ptr<EplbExecutor> eplb_executor_;
 };
 
 }  // namespace xllm

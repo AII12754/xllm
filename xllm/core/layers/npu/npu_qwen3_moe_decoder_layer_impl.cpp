@@ -332,7 +332,7 @@ torch::Tensor NpuQwen3MoeDecoderLayerImpl::forward(
     torch::Tensor& sin_pos,
     torch::Tensor& attn_mask,
     KVCache& kv_cache,
-    const ModelInputParams& input_params,
+    NpuDecoderInputView input_params,
     aclrtEvent* event,
     std::atomic<bool>* event_flag,
     int node_id) {
@@ -354,7 +354,7 @@ torch::Tensor NpuQwen3MoeDecoderLayerImpl::forward(
   } else {
     const bool use_graph_decode_input =
         ::xllm::ExecutionConfig::get_instance().enable_graph() &&
-        input_params.graph.tiling_data.defined();
+        input_params.tiling_data.defined();
     auto& decode_node =
         use_graph_decode_input ? decode_graph_node_ : decode_eager_node_;
     build_node_variant_pack(decode_node,
@@ -383,7 +383,7 @@ void NpuQwen3MoeDecoderLayerImpl::build_node_variant_pack(
     torch::Tensor& sin_pos,
     torch::Tensor& attn_mask,
     KVCache& kv_cache,
-    const ModelInputParams& input_params,
+    NpuDecoderInputView input_params,
     bool is_prefill,
     bool use_graph_decode_input) {
   internal_tensor_ = atb_speed::Utils::AtTensor2Tensor(x);
@@ -463,9 +463,9 @@ void NpuQwen3MoeDecoderLayerImpl::build_node_variant_pack(
   }
 
   if (!is_prefill && use_graph_decode_input &&
-      input_params.graph.tiling_data.defined()) {
+      input_params.tiling_data.defined()) {
     node.variantPack.inTensors.at(input_idx++) =
-        atb_speed::Utils::AtTensor2Tensor(input_params.graph.tiling_data);
+        atb_speed::Utils::AtTensor2Tensor(input_params.tiling_data);
   }
 
   if (input_params.meta.batch_forward_type.is_decode() &&

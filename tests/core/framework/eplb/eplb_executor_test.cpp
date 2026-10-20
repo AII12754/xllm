@@ -18,6 +18,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -25,22 +26,26 @@ limitations under the License.
 #include <type_traits>
 #include <vector>
 
+#include "core/framework/model/causal_lm.h"
+#include "core/framework/model/rec_model.h"
+
 namespace xllm {
 namespace {
 
 static_assert(std::is_same_v<decltype(EplbInfo::prepare_token), int64_t>);
 static_assert(std::is_same_v<decltype(EplbInfo::activation_token), int64_t>);
+static_assert(
+    std::is_constructible_v<EplbExecutor, CausalLM&, const torch::Device&>);
+static_assert(
+    !std::is_constructible_v<EplbExecutor, RecModel&, const torch::Device&>);
 
-class RecordingCausalLM final : public CausalLM {
+class RecordingModel final : public CausalLM {
  public:
-  explicit RecordingCausalLM(const torch::Device& device)
-      : device_(device), options_(torch::TensorOptions().device(device)) {}
-
   ModelOutput forward(const torch::Tensor&,
                       const torch::Tensor&,
                       std::vector<KVCache>&,
                       const ModelInputParams&) override {
-    return ModelOutput();
+    return {};
   }
 
   torch::Tensor logits(const torch::Tensor& hidden_states,
@@ -48,9 +53,11 @@ class RecordingCausalLM final : public CausalLM {
     return hidden_states;
   }
 
-  void load_model(std::unique_ptr<ModelLoader>) override {}
+  void load_model(std::unique_ptr<ModelLoader> /*loader*/) override {}
 
-  torch::Device device() const override { return device_; }
+  torch::Device device() const override { return options_.device(); }
+
+  const torch::TensorOptions& options() const override { return options_; }
 
   void prepare_expert_weight(int32_t layer_id,
                              const std::vector<int32_t>&) override {
@@ -68,16 +75,13 @@ class RecordingCausalLM final : public CausalLM {
     events_.push_back("finish:" + std::to_string(layer_id));
   }
 
-  const torch::TensorOptions& options() const override { return options_; }
-
   std::vector<std::string> events() const {
     std::lock_guard<std::mutex> lock(events_mutex_);
     return events_;
   }
 
  private:
-  torch::Device device_;
-  torch::TensorOptions options_;
+  torch::TensorOptions options_ = torch::TensorOptions().device(torch::kCPU);
   mutable std::mutex events_mutex_;
   std::vector<std::string> events_;
 };
@@ -86,7 +90,7 @@ TEST(EplbExecutorTest, DefersActivationUntilForwardEnd) {
   Device device(/*device_index=*/0);
   device.set_device();
   device.init_device_context();
-  RecordingCausalLM model(device.unwrap());
+  RecordingModel model;
   EplbExecutor executor(model, device.unwrap());
   EplbInfo info;
   info.update_layer_id = 7;
@@ -106,7 +110,7 @@ TEST(EplbExecutorTest, DefersNextPrepareUntilActivationFinishes) {
   Device device(/*device_index=*/0);
   device.set_device();
   device.init_device_context();
-  RecordingCausalLM model(device.unwrap());
+  RecordingModel model;
   EplbExecutor executor(model, device.unwrap());
   EplbInfo info;
   info.update_layer_id = 7;

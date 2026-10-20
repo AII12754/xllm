@@ -25,6 +25,7 @@ limitations under the License.
 #include <algorithm>
 #include <numeric>
 #include <shared_mutex>
+#include <type_traits>
 #include <unordered_map>
 
 #include "core/common/global_flags.h"
@@ -40,6 +41,7 @@ limitations under the License.
 #include "core/platform/shared_vmm_allocator.h"
 #include "core/platform/stream.h"
 #include "core/platform/vmm_torch_allocator.h"
+#include "core/runtime/graph_input_snapshot.h"
 #include "core/util/rec_model_utils.h"
 #include "core/util/utils.h"
 #include "kernels/cuda/global_capture_instance.h"
@@ -218,12 +220,14 @@ CudaGraphPersistentParam::CudaGraphPersistentParam(
   // aux_hidden_states will be lazily initialized when needed
 }
 
+template <typename Params>
 bool CudaGraphPersistentParam::can_use_llm_decode_fast_path(
     const torch::Tensor& tokens,
     const torch::Tensor& positions,
-    const ModelInputParams& params) const {
+    const Params& params) const {
   if (!params.meta.batch_forward_type.is_decode() ||
-      is_rec_multi_round_mode() || params.has_llmrec_params() ||
+      is_rec_multi_round_graph_input(params) ||
+      has_llmrec_graph_input(params) ||
       params.embedding.input_embedding.defined()) {
     return false;
   }
@@ -240,10 +244,11 @@ bool CudaGraphPersistentParam::can_use_llm_decode_fast_path(
              params.attention.device.paged_kv_last_page_len);
 }
 
+template <typename Params>
 void CudaGraphPersistentParam::update_llm_decode_metadata_fast_path(
     const torch::Tensor& tokens,
     const torch::Tensor& positions,
-    const ModelInputParams& params,
+    const Params& params,
     uint32_t padded_num_tokens,
     int64_t actual_batch_size,
     int64_t actual_num_tokens) {
@@ -252,28 +257,32 @@ void CudaGraphPersistentParam::update_llm_decode_metadata_fast_path(
   const int64_t actual_indices_size =
       params.attention.device.paged_kv_indices.size(0);
   xllm::kernel::cuda::LlmDecodeMetadataUpdateParams update_params{
-      .src_tokens = tokens.data_ptr<int32_t>(),
-      .src_positions = positions.data_ptr<int32_t>(),
+      .src_tokens = tokens.template data_ptr<int32_t>(),
+      .src_positions = positions.template data_ptr<int32_t>(),
       .src_new_cache_slots =
-          params.attention.device.new_cache_slots.data_ptr<int32_t>(),
+          params.attention.device.new_cache_slots.template data_ptr<int32_t>(),
       .src_kv_seq_lens =
-          params.attention.device.kv_seq_lens.data_ptr<int32_t>(),
+          params.attention.device.kv_seq_lens.template data_ptr<int32_t>(),
       .src_paged_kv_indptr =
-          params.attention.device.paged_kv_indptr.data_ptr<int32_t>(),
+          params.attention.device.paged_kv_indptr.template data_ptr<int32_t>(),
       .src_paged_kv_indices =
-          params.attention.device.paged_kv_indices.data_ptr<int32_t>(),
+          params.attention.device.paged_kv_indices.template data_ptr<int32_t>(),
       .src_paged_kv_last_page_len =
-          params.attention.device.paged_kv_last_page_len.data_ptr<int32_t>(),
-      .dst_tokens = persistent_tokens_.data_ptr<int32_t>(),
-      .dst_positions = persistent_positions_.data_ptr<int32_t>(),
-      .dst_new_cache_slots = persistent_new_cache_slots_.data_ptr<int32_t>(),
-      .dst_kv_seq_lens = kv_seq_lens_.data_ptr<int32_t>(),
+          params.attention.device.paged_kv_last_page_len
+              .template data_ptr<int32_t>(),
+      .dst_tokens = persistent_tokens_.template data_ptr<int32_t>(),
+      .dst_positions = persistent_positions_.template data_ptr<int32_t>(),
+      .dst_new_cache_slots =
+          persistent_new_cache_slots_.template data_ptr<int32_t>(),
+      .dst_kv_seq_lens = kv_seq_lens_.template data_ptr<int32_t>(),
       .dst_kv_seq_lens_delta =
-          persistent_kv_seq_lens_delta_.data_ptr<int32_t>(),
-      .dst_paged_kv_indptr = persistent_paged_kv_indptr_.data_ptr<int32_t>(),
-      .dst_paged_kv_indices = persistent_paged_kv_indices_.data_ptr<int32_t>(),
+          persistent_kv_seq_lens_delta_.template data_ptr<int32_t>(),
+      .dst_paged_kv_indptr =
+          persistent_paged_kv_indptr_.template data_ptr<int32_t>(),
+      .dst_paged_kv_indices =
+          persistent_paged_kv_indices_.template data_ptr<int32_t>(),
       .dst_paged_kv_last_page_len =
-          persistent_paged_kv_last_page_len_.data_ptr<int32_t>(),
+          persistent_paged_kv_last_page_len_.template data_ptr<int32_t>(),
       .actual_num_tokens = actual_num_tokens,
       .padded_num_tokens = static_cast<int64_t>(padded_num_tokens),
       .actual_batch_size = actual_batch_size,
@@ -335,19 +344,20 @@ size_t CudaGraphPersistentParam::get_persistent_tensor_bytes() const {
   return total;
 }
 
-std::optional<ModelInputParams> CudaGraphPersistentParam::update(
+template <typename Params>
+std::optional<Params> CudaGraphPersistentParam::update(
     const torch::Tensor& tokens,
     const torch::Tensor& k_cache,
     const torch::Tensor& v_cache,
     const torch::Tensor& positions,
-    const ModelInputParams& params,
+    const Params& params,
     uint32_t padded_num_tokens,
     bool return_capture_params) {
-  std::optional<ModelInputParams> params_for_capture;
+  std::optional<Params> params_for_capture;
   if (return_capture_params) {
     CHECK_GT(padded_num_tokens, 0)
         << "padded_num_tokens must be > 0 when return_capture_params is true";
-    params_for_capture.emplace(params.clone().view());
+    params_for_capture.emplace(clone_graph_input(params));
   }
   // Build attn_metadata with original model_input_params. So we can set actual
   // batch size in plan_info.
@@ -356,8 +366,7 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
           layer::AttentionMetadataBuilder::build(params, args_.enable_mla()));
   CHECK(attn_metadata) << "attn_metadata should not be null";
   attn_metadata->enable_cuda_graph = true;
-  auto build_capture_params_if_needed =
-      [&]() -> std::optional<ModelInputParams> {
+  auto build_capture_params_if_needed = [&]() -> std::optional<Params> {
     if (!return_capture_params) {
       return std::nullopt;
     }
@@ -376,7 +385,7 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
           persistent_linear_state_indices(params.meta.num_sequences);
     }
     params_for_capture->attn_metadata = attn_metadata;
-    return params_for_capture;
+    return std::move(params_for_capture);
   };
 
   const uint32_t actual_num_tokens = tokens.size(0);
@@ -427,7 +436,7 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
     }
   }
 
-  if (!is_rec_multi_round_mode() && !use_llm_decode_fast_path) {
+  if (!is_rec_multi_round_graph_input(params) && !use_llm_decode_fast_path) {
     // q_seq_lens is q_cu_seq_lens in GPU Model.
     // kv_seq_lens is kv_cu_seq_lens in GPU Model.
     VLOG(kGraphExecutorLogVerboseLevel)
@@ -449,7 +458,8 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
           .slice(/*dim=*/0,
                  /*start=*/actual_batch_size + 1,
                  /*end=*/padded_num_tokens + 1)
-          .fill_(params.attention.device.kv_seq_lens[-1].item<int32_t>());
+          .fill_(
+              params.attention.device.kv_seq_lens[-1].template item<int32_t>());
     }
 
     VLOG(kGraphExecutorLogVerboseLevel)
@@ -480,7 +490,7 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
         persistent_new_cache_slots(slot_mapping_tokens);
   }
 
-  if (!is_rec_multi_round_mode() &&
+  if (!is_rec_multi_round_graph_input(params) &&
       !params.embedding.linear_state_ids.empty()) {
     if (params.embedding.linear_state_indices.defined()) {
       persistent_linear_state_indices_
@@ -499,8 +509,9 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
   // expanded to batch_size * beam_width rows while num_sequences still tracks
   // the logical request count. Use the tensor's real row count here.
   const int64_t actual_block_table_batch =
-      is_rec_multi_round_mode() ? params.attention.device.block_tables.size(0)
-                                : actual_batch_size;
+      is_rec_multi_round_graph_input(params)
+          ? params.attention.device.block_tables.size(0)
+          : actual_batch_size;
   const int64_t actual_block_table_len =
       params.attention.device.block_tables.size(1);
   torch::Tensor slice_persistent_block_tables =
@@ -544,7 +555,8 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
   }
 
   const bool is_decode_with_llmrec =
-      params.meta.batch_forward_type.is_decode() && params.has_llmrec_params();
+      params.meta.batch_forward_type.is_decode() &&
+      has_llmrec_graph_input(params);
   const bool use_two_stage_decode =
       !::xllm::RecConfig::get_instance().enable_xattention_one_stage() &&
       is_decode_with_llmrec;
@@ -578,145 +590,151 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
 
   bool use_tensor_core =
       xllm::kernel::cuda::should_use_tensor_core(dtype, n_heads, n_kv_heads);
-  if (use_two_stage_decode) {
-    if (params.attention.device.q_seq_lens.defined() &&
-        params.attention.device.q_seq_lens.numel() > 0) {
-      const int64_t q_numel = params.attention.device.q_seq_lens.numel();
-      q_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/q_numel)
-          .copy_(params.attention.device.q_seq_lens, /*non_blocking=*/true);
-      attn_metadata->q_cu_seq_lens = q_seq_lens(/*actual_batch_size=*/q_numel);
-    }
-
-    if (params.attention.device.kv_seq_lens.defined() &&
-        params.attention.device.kv_seq_lens.numel() > 0) {
-      const int64_t kv_numel = params.attention.device.kv_seq_lens.numel();
-      kv_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/kv_numel)
-          .copy_(params.attention.device.kv_seq_lens, /*non_blocking=*/true);
-      attn_metadata->kv_cu_seq_lens =
-          kv_seq_lens(/*actual_batch_size=*/kv_numel);
-      if (kv_numel > 1) {
-        attn_metadata->kv_seq_lens = torch::diff(attn_metadata->kv_cu_seq_lens);
+  if constexpr (std::is_same_v<Params, RecModelParams>) {
+    if (use_two_stage_decode) {
+      if (params.attention.device.q_seq_lens.defined() &&
+          params.attention.device.q_seq_lens.numel() > 0) {
+        const int64_t q_numel = params.attention.device.q_seq_lens.numel();
+        q_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/q_numel)
+            .copy_(params.attention.device.q_seq_lens, /*non_blocking=*/true);
+        attn_metadata->q_cu_seq_lens =
+            q_seq_lens(/*actual_batch_size=*/q_numel);
       }
+
+      if (params.attention.device.kv_seq_lens.defined() &&
+          params.attention.device.kv_seq_lens.numel() > 0) {
+        const int64_t kv_numel = params.attention.device.kv_seq_lens.numel();
+        kv_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/kv_numel)
+            .copy_(params.attention.device.kv_seq_lens, /*non_blocking=*/true);
+        attn_metadata->kv_cu_seq_lens =
+            kv_seq_lens(/*actual_batch_size=*/kv_numel);
+        if (kv_numel > 1) {
+          attn_metadata->kv_seq_lens =
+              torch::diff(attn_metadata->kv_cu_seq_lens);
+        }
+      }
+
+      attn_metadata->paged_kv_indptr = torch::Tensor();
+      attn_metadata->paged_kv_indices = torch::Tensor();
+      attn_metadata->paged_kv_last_page_len = torch::Tensor();
+      attn_metadata->qo_indptr = torch::Tensor();
+
+      // Update plan_info if attn_metadata exists and enable_cuda_graph is true.
+      const auto& llmrec_params = *params.llmrec_params();
+      auto cache = attn_metadata->xattention_two_stage_decode_cache.value();
+      CHECK(cache.q_cu_seq_lens_shared.defined())
+          << "q_cu_seq_lens_shared must be initialized in rec worker";
+      CHECK(cache.qo_indptr_expanded.defined())
+          << "qo_indptr_expanded must be initialized in rec worker";
+      CHECK(cache.paged_kv_indptr_expanded.defined() &&
+            cache.paged_kv_indices_expanded.defined() &&
+            cache.paged_kv_last_page_len_expanded.defined())
+          << "paged_kv_* expanded tensors must be initialized in rec worker";
+      CHECK(cache.shared_lse.defined() && cache.shared_o.defined() &&
+            cache.unshared_lse.defined() && cache.unshared_o.defined())
+          << "two-stage shared/unshared output cache tensors must be "
+             "initialized in rec worker";
+
+      const int64_t request_batch_size =
+          cache.q_cu_seq_lens_shared.numel() > 0
+              ? (cache.q_cu_seq_lens_shared.numel() - 1)
+              : 0;
+      CHECK_GT(request_batch_size, 0)
+          << "request_batch_size must be > 0 for two-stage xattention";
+      const int64_t beam_width = std::max<int64_t>(llmrec_params.beam_width, 1);
+      const int64_t total_beam = request_batch_size * beam_width;
+
+      CHECK_EQ(cache.shared_o.size(0), total_beam)
+          << "shared_o first dim mismatch: expected total_beam=" << total_beam
+          << ", got " << cache.shared_o.size(0);
+      CHECK_EQ(cache.unshared_o.size(0), total_beam)
+          << "unshared_o first dim mismatch: expected total_beam=" << total_beam
+          << ", got " << cache.unshared_o.size(0);
+      CHECK_EQ(cache.qo_indptr_expanded.numel(), total_beam + 1)
+          << "qo_indptr_expanded size mismatch: expected " << (total_beam + 1)
+          << ", got " << cache.qo_indptr_expanded.numel();
+      CHECK_EQ(cache.paged_kv_indptr_expanded.numel(), total_beam + 1)
+          << "paged_kv_indptr_expanded size mismatch";
+      CHECK_EQ(cache.paged_kv_indices_expanded.numel(), total_beam)
+          << "paged_kv_indices_expanded size mismatch";
+      CHECK_EQ(cache.paged_kv_last_page_len_expanded.numel(), total_beam)
+          << "paged_kv_last_page_len_expanded size mismatch";
+
+      const int64_t max_decode_step =
+          !llmrec_params.unshared_k_caches.empty()
+              ? llmrec_params.unshared_k_caches[0].size(2)
+              : std::max<int64_t>(
+                    ::xllm::RecConfig::get_instance().max_decode_rounds() - 1,
+                    1);
+      CHECK_GT(max_decode_step, 0)
+          << "max_decode_step must be > 0 for two-stage decode";
+
+      cache.cached_batch_size = static_cast<int32_t>(request_batch_size);
+      cache.cached_beam_size = static_cast<int32_t>(beam_width);
+      cache.cached_num_heads = static_cast<int32_t>(n_heads);
+      cache.cached_head_size = static_cast<int32_t>(head_dim);
+      cache.cached_max_decode_step = static_cast<int32_t>(max_decode_step);
+      cache.cached_step =
+          (llmrec_params.current_round_tensor.defined() &&
+           llmrec_params.current_round_tensor.numel() > 0)
+              ? llmrec_params.current_round_tensor.template item<int32_t>()
+              : 0;
+
+      attn_metadata->xattention_two_stage_decode_cache = cache;
+
+      layer::AttentionMetadata shared_attn_meta = *attn_metadata;
+      shared_attn_meta.plan_info = attn_metadata->shared_plan_info;
+      shared_attn_meta.q_cu_seq_lens = cache.q_cu_seq_lens_shared;
+      shared_attn_meta.is_causal = false;
+
+      attn_metadata->shared_plan_info->layer_id = 0;
+      layer::xattention::update_xattention_plan_info(
+          attn_metadata->shared_plan_info,
+          backend,
+          shared_attn_meta,
+          dtype,
+          dtype,
+          dtype,
+          head_dim,
+          head_dim,
+          static_cast<int32_t>(n_heads),
+          static_cast<int32_t>(n_kv_heads),
+          /*block_size=*/1,
+          /*window_size_left=*/-1,
+          /*enable_cuda_graph=*/true,
+          /*causal=*/false,
+          /*use_tensor_core=*/true,
+          /*is_shared_stage_plan*/ true);
+
+      layer::AttentionMetadata unshared_attn_meta = *attn_metadata;
+      unshared_attn_meta.plan_info = attn_metadata->unshared_plan_info;
+      unshared_attn_meta.qo_indptr = cache.qo_indptr_expanded;
+      unshared_attn_meta.paged_kv_indptr = cache.paged_kv_indptr_expanded;
+      unshared_attn_meta.paged_kv_indices = cache.paged_kv_indices_expanded;
+      unshared_attn_meta.paged_kv_last_page_len =
+          cache.paged_kv_last_page_len_expanded;
+      unshared_attn_meta.is_causal = false;
+
+      attn_metadata->unshared_plan_info->layer_id = 0;
+      layer::xattention::update_xattention_plan_info(
+          attn_metadata->unshared_plan_info,
+          backend,
+          unshared_attn_meta,
+          dtype,
+          dtype,
+          dtype,
+          head_dim,
+          head_dim,
+          static_cast<int32_t>(n_heads),
+          static_cast<int32_t>(n_kv_heads),
+          static_cast<int32_t>(max_decode_step),
+          sliding_window,
+          /*enable_cuda_graph=*/true,
+          /*causal=*/false,
+          use_tensor_core,
+          /*is_shared_stage_plan*/ false);
+      return build_capture_params_if_needed();
     }
-
-    attn_metadata->paged_kv_indptr = torch::Tensor();
-    attn_metadata->paged_kv_indices = torch::Tensor();
-    attn_metadata->paged_kv_last_page_len = torch::Tensor();
-    attn_metadata->qo_indptr = torch::Tensor();
-
-    // Update plan_info if attn_metadata exists and enable_cuda_graph is true.
-    const auto& llmrec_params = *params.llmrec_params();
-    auto cache = attn_metadata->xattention_two_stage_decode_cache.value();
-    CHECK(cache.q_cu_seq_lens_shared.defined())
-        << "q_cu_seq_lens_shared must be initialized in rec worker";
-    CHECK(cache.qo_indptr_expanded.defined())
-        << "qo_indptr_expanded must be initialized in rec worker";
-    CHECK(cache.paged_kv_indptr_expanded.defined() &&
-          cache.paged_kv_indices_expanded.defined() &&
-          cache.paged_kv_last_page_len_expanded.defined())
-        << "paged_kv_* expanded tensors must be initialized in rec worker";
-    CHECK(cache.shared_lse.defined() && cache.shared_o.defined() &&
-          cache.unshared_lse.defined() && cache.unshared_o.defined())
-        << "two-stage shared/unshared output cache tensors must be "
-           "initialized in rec worker";
-
-    const int64_t request_batch_size =
-        cache.q_cu_seq_lens_shared.numel() > 0
-            ? (cache.q_cu_seq_lens_shared.numel() - 1)
-            : 0;
-    CHECK_GT(request_batch_size, 0)
-        << "request_batch_size must be > 0 for two-stage xattention";
-    const int64_t beam_width = std::max<int64_t>(llmrec_params.beam_width, 1);
-    const int64_t total_beam = request_batch_size * beam_width;
-
-    CHECK_EQ(cache.shared_o.size(0), total_beam)
-        << "shared_o first dim mismatch: expected total_beam=" << total_beam
-        << ", got " << cache.shared_o.size(0);
-    CHECK_EQ(cache.unshared_o.size(0), total_beam)
-        << "unshared_o first dim mismatch: expected total_beam=" << total_beam
-        << ", got " << cache.unshared_o.size(0);
-    CHECK_EQ(cache.qo_indptr_expanded.numel(), total_beam + 1)
-        << "qo_indptr_expanded size mismatch: expected " << (total_beam + 1)
-        << ", got " << cache.qo_indptr_expanded.numel();
-    CHECK_EQ(cache.paged_kv_indptr_expanded.numel(), total_beam + 1)
-        << "paged_kv_indptr_expanded size mismatch";
-    CHECK_EQ(cache.paged_kv_indices_expanded.numel(), total_beam)
-        << "paged_kv_indices_expanded size mismatch";
-    CHECK_EQ(cache.paged_kv_last_page_len_expanded.numel(), total_beam)
-        << "paged_kv_last_page_len_expanded size mismatch";
-
-    const int64_t max_decode_step =
-        !llmrec_params.unshared_k_caches.empty()
-            ? llmrec_params.unshared_k_caches[0].size(2)
-            : std::max<int64_t>(
-                  ::xllm::RecConfig::get_instance().max_decode_rounds() - 1, 1);
-    CHECK_GT(max_decode_step, 0)
-        << "max_decode_step must be > 0 for two-stage decode";
-
-    cache.cached_batch_size = static_cast<int32_t>(request_batch_size);
-    cache.cached_beam_size = static_cast<int32_t>(beam_width);
-    cache.cached_num_heads = static_cast<int32_t>(n_heads);
-    cache.cached_head_size = static_cast<int32_t>(head_dim);
-    cache.cached_max_decode_step = static_cast<int32_t>(max_decode_step);
-    cache.cached_step = (llmrec_params.current_round_tensor.defined() &&
-                         llmrec_params.current_round_tensor.numel() > 0)
-                            ? llmrec_params.current_round_tensor.item<int32_t>()
-                            : 0;
-
-    attn_metadata->xattention_two_stage_decode_cache = cache;
-
-    layer::AttentionMetadata shared_attn_meta = *attn_metadata;
-    shared_attn_meta.plan_info = attn_metadata->shared_plan_info;
-    shared_attn_meta.q_cu_seq_lens = cache.q_cu_seq_lens_shared;
-    shared_attn_meta.is_causal = false;
-
-    attn_metadata->shared_plan_info->layer_id = 0;
-    layer::xattention::update_xattention_plan_info(
-        attn_metadata->shared_plan_info,
-        backend,
-        shared_attn_meta,
-        dtype,
-        dtype,
-        dtype,
-        head_dim,
-        head_dim,
-        static_cast<int32_t>(n_heads),
-        static_cast<int32_t>(n_kv_heads),
-        /*block_size=*/1,
-        /*window_size_left=*/-1,
-        /*enable_cuda_graph=*/true,
-        /*causal=*/false,
-        /*use_tensor_core=*/true,
-        /*is_shared_stage_plan*/ true);
-
-    layer::AttentionMetadata unshared_attn_meta = *attn_metadata;
-    unshared_attn_meta.plan_info = attn_metadata->unshared_plan_info;
-    unshared_attn_meta.qo_indptr = cache.qo_indptr_expanded;
-    unshared_attn_meta.paged_kv_indptr = cache.paged_kv_indptr_expanded;
-    unshared_attn_meta.paged_kv_indices = cache.paged_kv_indices_expanded;
-    unshared_attn_meta.paged_kv_last_page_len =
-        cache.paged_kv_last_page_len_expanded;
-    unshared_attn_meta.is_causal = false;
-
-    attn_metadata->unshared_plan_info->layer_id = 0;
-    layer::xattention::update_xattention_plan_info(
-        attn_metadata->unshared_plan_info,
-        backend,
-        unshared_attn_meta,
-        dtype,
-        dtype,
-        dtype,
-        head_dim,
-        head_dim,
-        static_cast<int32_t>(n_heads),
-        static_cast<int32_t>(n_kv_heads),
-        static_cast<int32_t>(max_decode_step),
-        sliding_window,
-        /*enable_cuda_graph=*/true,
-        /*causal=*/false,
-        use_tensor_core,
-        /*is_shared_stage_plan*/ false);
-    return build_capture_params_if_needed();
   }
   if (use_llm_decode_fast_path) {
     const uint32_t slot_mapping_tokens =
@@ -762,7 +780,8 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
           .slice(/*dim=*/0,
                  /*start=*/actual_batch_size + 1,
                  /*end=*/padded_num_tokens + 1)
-          .fill_(params.attention.device.paged_kv_indptr[-1].item<int32_t>());
+          .fill_(params.attention.device.paged_kv_indptr[-1]
+                     .template item<int32_t>());
     }
     CHECK(params.attention.device.paged_kv_indices.defined())
         << "paged_kv_indices should not be null";
@@ -894,7 +913,7 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
                 : 0);
   }
 
-  // Return ModelInputParams with persistent buffer references if requested
+  // Return Params with persistent buffer references if requested
   return build_capture_params_if_needed();
 }
 
@@ -909,6 +928,51 @@ bool CudaGraph::capture(CausalLM* model,
                         uint32_t bucket_num_tokens,
                         const at::cuda::MempoolId_t& pool,
                         TorchMemPool* pool_ptr) {
+  return capture_typed(model,
+                       args,
+                       options,
+                       tokens,
+                       positions,
+                       params,
+                       kv_cache,
+                       bucket_num_tokens,
+                       pool,
+                       pool_ptr);
+}
+
+bool CudaGraph::capture(RecModel* model,
+                        const ModelArgs& args,
+                        const runtime::Options& options,
+                        const torch::Tensor& tokens,
+                        const torch::Tensor& positions,
+                        const RecModelParams& params,
+                        std::vector<KVCache>& kv_cache,
+                        uint32_t bucket_num_tokens,
+                        const at::cuda::MempoolId_t& pool,
+                        TorchMemPool* pool_ptr) {
+  return capture_typed(model,
+                       args,
+                       options,
+                       tokens,
+                       positions,
+                       params,
+                       kv_cache,
+                       bucket_num_tokens,
+                       pool,
+                       pool_ptr);
+}
+
+template <typename Model, typename Params>
+bool CudaGraph::capture_typed(Model* model,
+                              const ModelArgs& args,
+                              const runtime::Options& options,
+                              const torch::Tensor& tokens,
+                              const torch::Tensor& positions,
+                              const Params& params,
+                              std::vector<KVCache>& kv_cache,
+                              uint32_t bucket_num_tokens,
+                              const at::cuda::MempoolId_t& pool,
+                              TorchMemPool* pool_ptr) {
   padded_num_tokens_ = bucket_num_tokens;
   const uint32_t actual_num_tokens = tokens.size(0);
   CHECK_GE(padded_num_tokens_, actual_num_tokens)
@@ -961,6 +1025,9 @@ bool CudaGraph::capture(CausalLM* model,
       << "update() should return ModelInputParams when "
          "return_capture_params=true";
 
+  capture_params_.emplace<Params>(std::move(graph_params_opt.value()));
+  auto& graph_params = std::get<Params>(capture_params_);
+
   LOG(INFO) << "CUDA graph capture begin, bucket_num_tokens: "
             << bucket_num_tokens << ", actual_num_tokens: " << actual_num_tokens
             << ", is_piecewise: " << is_piecewise_;
@@ -973,7 +1040,7 @@ bool CudaGraph::capture(CausalLM* model,
     model->forward(persistent_param_.persistent_tokens(padded_num_tokens_),
                    persistent_param_.persistent_positions(padded_num_tokens_),
                    kv_cache,
-                   graph_params_opt.value());
+                   graph_params);
 
     // MemPoolContext has been deprecated in torch >= 2.8
 #if TORCH_VERSION_MAJOR <= 2 && TORCH_VERSION_MINOR <= 7
@@ -993,7 +1060,7 @@ bool CudaGraph::capture(CausalLM* model,
         persistent_param_.persistent_tokens(padded_num_tokens_),
         persistent_param_.persistent_positions(padded_num_tokens_),
         kv_cache,
-        graph_params_opt.value());
+        graph_params);
 
     // Store result in persistent buffer
     persistent_param_.set_hidden_states(forward_result.hidden_states);
@@ -1045,7 +1112,7 @@ bool CudaGraph::capture(CausalLM* model,
         persistent_param_.persistent_tokens(padded_num_tokens_),
         persistent_param_.persistent_positions(padded_num_tokens_),
         kv_cache,
-        graph_params_opt.value());
+        graph_params);
 
     // Store result in persistent buffer
     persistent_param_.set_hidden_states(forward_result.hidden_states);
@@ -1072,10 +1139,11 @@ bool CudaGraph::capture(CausalLM* model,
   return true;
 }
 
+template <typename Params>
 ModelOutput CudaGraph::replay(const torch::Tensor& tokens,
                               const torch::Tensor& positions,
                               std::vector<KVCache>& kv_cache,
-                              const ModelInputParams& params) {
+                              const Params& params) {
   const uint32_t actual_num_tokens = tokens.size(0);
   CHECK_LE(actual_num_tokens, padded_num_tokens_)
       << "num_tokens mismatch: expected <= " << padded_num_tokens_ << ", got "
@@ -1113,7 +1181,7 @@ ModelOutput CudaGraph::replay(const torch::Tensor& tokens,
                                  padded_num_tokens_,
                                  /*return_capture_params=*/true);
     CHECK(updated_params_opt.has_value())
-        << "update() should return ModelInputParams for piecewise replay";
+        << "update() should return Params for piecewise replay";
 
     const auto& updated_params = updated_params_opt.value();
     CHECK(piecewise_graph_.num_runners() > 0)
@@ -1162,12 +1230,21 @@ CudaGraphExecutorImpl::CudaGraphExecutorImpl(CausalLM* model,
                                              const ModelArgs& args,
                                              const torch::Device& device,
                                              const runtime::Options& options)
-    : model_(model),
-      args_(args),
-      device_(device),
-      options_(options),
-      enable_prefill_piecewise_graph_(::xllm::ExecutionConfig::get_instance()
-                                          .enable_prefill_piecewise_graph()) {
+    : model_(model), args_(args), device_(device), options_(options) {
+  initialize();
+}
+
+CudaGraphExecutorImpl::CudaGraphExecutorImpl(RecModel* model,
+                                             const ModelArgs& args,
+                                             const torch::Device& device,
+                                             const runtime::Options& options)
+    : rec_model_(model), args_(args), device_(device), options_(options) {
+  initialize();
+}
+
+void CudaGraphExecutorImpl::initialize() {
+  enable_prefill_piecewise_graph_ =
+      ::xllm::ExecutionConfig::get_instance().enable_prefill_piecewise_graph();
   max_tokens_for_graph_mode_ =
       ::xllm::ExecutionConfig::get_instance().max_tokens_for_graph_mode();
   if (max_tokens_for_graph_mode_ < options_.max_seqs_per_batch()) {
@@ -1451,6 +1528,22 @@ ModelOutput CudaGraphExecutorImpl::run(const torch::Tensor& tokens,
                                        const torch::Tensor& positions,
                                        std::vector<KVCache>& kv_caches,
                                        const ModelInputParams& params) {
+  return run_typed(model_, tokens, positions, kv_caches, params);
+}
+
+ModelOutput CudaGraphExecutorImpl::run(const torch::Tensor& tokens,
+                                       const torch::Tensor& positions,
+                                       std::vector<KVCache>& kv_caches,
+                                       const RecModelParams& params) {
+  return run_typed(rec_model_, tokens, positions, kv_caches, params);
+}
+
+template <typename Model, typename Params>
+ModelOutput CudaGraphExecutorImpl::run_typed(Model* model,
+                                             const torch::Tensor& tokens,
+                                             const torch::Tensor& positions,
+                                             std::vector<KVCache>& kv_caches,
+                                             const Params& params) {
   const bool is_prefill = params.meta.batch_forward_type.is_prefill();
   const bool is_decode = params.meta.batch_forward_type.is_decode();
 
@@ -1470,11 +1563,21 @@ ModelOutput CudaGraphExecutorImpl::run(const torch::Tensor& tokens,
           << " exceeds max_tokens_for_graph_mode ("
           << max_tokens_for_graph_mode_ << "), falling back to eager mode";
       COUNTER_INC(num_model_execution_total_eager);
-      return model_->forward(tokens, positions, kv_caches, params);
+      return model->forward(tokens, positions, kv_caches, params);
     }
 
     // Check if piecewise graph exists for this bucket
     auto it = prefill_graphs_.find(bucket_num_tokens);
+    if constexpr (std::is_same_v<Params, RecModelParams>) {
+      if (it != prefill_graphs_.end() &&
+          !it->second->rec_bindings_match(params)) {
+        // Previous replay must finish before its graph-owned KV bindings
+        // expire.
+        c10::cuda::getCurrentCUDAStream(device_.index()).synchronize();
+        prefill_graphs_.erase(it);
+        it = prefill_graphs_.end();
+      }
+    }
     if (it != prefill_graphs_.end()) {
       // Replay existing piecewise graph
       VLOG(kGraphExecutorLogVerboseLevel)
@@ -1501,7 +1604,7 @@ ModelOutput CudaGraphExecutorImpl::run(const torch::Tensor& tokens,
     const at::cuda::MempoolId_t mem_pool =
         get_mem_pool(kPhysicalPoolIdPrefill, bucket_num_tokens);
 
-    bool capture_success = graph->capture(model_,
+    bool capture_success = graph->capture(model,
                                           args_,
                                           options_,
                                           tokens,
@@ -1543,7 +1646,7 @@ ModelOutput CudaGraphExecutorImpl::run(const torch::Tensor& tokens,
   // Prefill without piecewise graph: use eager mode
   if (is_prefill) {
     COUNTER_INC(num_model_execution_total_eager);
-    return model_->forward(tokens, positions, kv_caches, params);
+    return model->forward(tokens, positions, kv_caches, params);
   }
 
   // Decode phase with full graph
@@ -1557,11 +1660,20 @@ ModelOutput CudaGraphExecutorImpl::run(const torch::Tensor& tokens,
       LOG(WARNING) << "Not suitable for CUDA graph operations, falling back to "
                       "eager mode.";
       COUNTER_INC(num_model_execution_total_eager);
-      return model_->forward(tokens, positions, kv_caches, params);
+      return model->forward(tokens, positions, kv_caches, params);
     }
 
     // Check if captured graph exists for this bucket num_tokens
     auto it = graphs_.find(bucket_num_tokens);
+    if constexpr (std::is_same_v<Params, RecModelParams>) {
+      if (it != graphs_.end() && !it->second->rec_bindings_match(params)) {
+        // Previous replay must finish before its graph-owned KV bindings
+        // expire.
+        c10::cuda::getCurrentCUDAStream(device_.index()).synchronize();
+        graphs_.erase(it);
+        it = graphs_.end();
+      }
+    }
     if (it != graphs_.end()) {
       // Replay the existing graph
       VLOG(kGraphExecutorLogVerboseLevel)
@@ -1587,7 +1699,7 @@ ModelOutput CudaGraphExecutorImpl::run(const torch::Tensor& tokens,
     const at::cuda::MempoolId_t mem_pool =
         get_mem_pool(kPhysicalPoolIdDecode, bucket_num_tokens);
 
-    bool capture_success = graph->capture(model_,
+    bool capture_success = graph->capture(model,
                                           args_,
                                           options_,
                                           tokens,
@@ -1628,7 +1740,7 @@ ModelOutput CudaGraphExecutorImpl::run(const torch::Tensor& tokens,
   LOG(ERROR) << "Failed to capture CUDA graph for bucket num_tokens: "
              << bucket_num_tokens;
   COUNTER_INC(num_model_execution_total_eager);
-  return model_->forward(tokens, positions, kv_caches, params);
+  return model->forward(tokens, positions, kv_caches, params);
 }
 
 // bucket will be [1, 2, 4, 8, 16, 32, 48, 64, ..., max_seqs_per_batch]
@@ -1637,5 +1749,31 @@ uint32_t CudaGraphExecutorImpl::get_bucket_num_tokens(uint32_t num_tokens,
   return static_cast<uint32_t>(
       get_graph_bucket_num_tokens(num_tokens, is_prefill));
 }
+
+template std::optional<ModelInputParams> CudaGraphPersistentParam::update(
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const ModelInputParams&,
+    uint32_t,
+    bool);
+template std::optional<RecModelParams> CudaGraphPersistentParam::update(
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const RecModelParams&,
+    uint32_t,
+    bool);
+
+template ModelOutput CudaGraph::replay(const torch::Tensor&,
+                                       const torch::Tensor&,
+                                       std::vector<KVCache>&,
+                                       const ModelInputParams&);
+template ModelOutput CudaGraph::replay(const torch::Tensor&,
+                                       const torch::Tensor&,
+                                       std::vector<KVCache>&,
+                                       const RecModelParams&);
 
 }  // namespace xllm::runtime::cuda

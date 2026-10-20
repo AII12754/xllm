@@ -38,6 +38,8 @@ limitations under the License.
 #include "core/runtime/executor_impl.h"
 #include "core/runtime/executor_impl_factory.h"
 #include "core/runtime/options.h"
+#include "core/runtime/rec_executor_backend.h"
+#include "core/runtime/rec_executor_impl_factory.h"
 #include "kernels/dcu/piecewise_graphs.h"
 
 namespace xllm::runtime::dcu {
@@ -53,24 +55,27 @@ class DcuGraphPersistentParam final {
   ~DcuGraphPersistentParam() = default;
 
   // Updates persistent tensors.
-  // When return_capture_params is true, returns a ModelInputParams copy whose
+  // When return_capture_params is true, returns a native input snapshot whose
   // attn_metadata points to persistent buffers for graph capture.
-  std::optional<ModelInputParams> update(const torch::Tensor& tokens,
-                                         const torch::Tensor& positions,
-                                         const ModelInputParams& params,
-                                         uint32_t padded_num_tokens = 0,
-                                         bool return_capture_params = false,
-                                         uint32_t graph_max_seq_len = 0);
+  template <typename Params>
+  std::optional<Params> update(const torch::Tensor& tokens,
+                               const torch::Tensor& positions,
+                               const Params& params,
+                               uint32_t padded_num_tokens = 0,
+                               bool return_capture_params = false,
+                               uint32_t graph_max_seq_len = 0);
 
-  ModelInputParams init_decode_params(const torch::Tensor& tokens,
-                                      const torch::Tensor& positions,
-                                      const ModelInputParams& params,
-                                      uint32_t padded_num_tokens,
-                                      uint32_t graph_max_seq_len);
+  template <typename Params>
+  Params init_decode_params(const torch::Tensor& tokens,
+                            const torch::Tensor& positions,
+                            const Params& params,
+                            uint32_t padded_num_tokens,
+                            uint32_t graph_max_seq_len);
 
+  template <typename Params>
   void update_decode_input_buffer(const torch::Tensor& tokens,
                                   const torch::Tensor& positions,
-                                  const ModelInputParams& params,
+                                  const Params& params,
                                   uint32_t padded_num_tokens);
 
   torch::Tensor persistent_tokens(uint32_t n_tokens) const {
@@ -192,27 +197,33 @@ class DcuGraph final {
         device_index_(device_index),
         capture_stream_(capture_stream) {}
 
-  bool capture(CausalLM* model,
+  template <typename ModelType, typename Params>
+  bool capture(ModelType* model,
                const runtime::Options& options,
                const torch::Tensor& tokens,
                const torch::Tensor& positions,
-               const ModelInputParams& params,
+               const Params& params,
                std::vector<KVCache>& kv_cache,
                uint32_t bucket_num_tokens,
                const at::hip::MempoolId_t& pool,
                bool use_piecewise,
                uint32_t graph_max_seq_len = 0);
 
+  template <typename Params>
   ModelOutput replay(const torch::Tensor& tokens,
                      const torch::Tensor& positions,
                      std::vector<KVCache>& kv_cache,
-                     const ModelInputParams& params);
+                     const Params& params);
 
   torch::Tensor get_hidden_states(uint32_t n_tokens) const {
     return persistent_param_.hidden_states(n_tokens);
   }
 
+  bool matches_graph_input(const ModelInputParams&) const { return true; }
+  bool matches_graph_input(const RecModelParams& params) const;
+
  private:
+  std::optional<RecModelParams> rec_graph_input_;
   at::cuda::CUDAGraph graph_;
   bool is_piecewise_ = false;
   std::unique_ptr<::xllm::runtime::dcu::PiecewiseGraphs> piecewise_graph_;
@@ -225,9 +236,15 @@ class DcuGraph final {
   DcuStream capture_stream_;
 };
 
-class DcuGraphExecutorImpl final : public ExecutorImpl {
+class DcuGraphExecutorImpl final : public ExecutorImpl,
+                                   public RecExecutorBackend {
  public:
   DcuGraphExecutorImpl(CausalLM* model,
+                       const ModelArgs& args,
+                       const torch::Device& device,
+                       const runtime::Options& options);
+
+  DcuGraphExecutorImpl(RecModel* model,
                        const ModelArgs& args,
                        const torch::Device& device,
                        const runtime::Options& options);
@@ -239,7 +256,19 @@ class DcuGraphExecutorImpl final : public ExecutorImpl {
                   std::vector<KVCache>& kv_caches,
                   const ModelInputParams& params) override;
 
+  ModelOutput run(const torch::Tensor& tokens,
+                  const torch::Tensor& positions,
+                  std::vector<KVCache>& kv_caches,
+                  const RecModelParams& params) override;
+
  private:
+  template <typename ModelType, typename Params>
+  ModelOutput run_impl(ModelType* model,
+                       const torch::Tensor& tokens,
+                       const torch::Tensor& positions,
+                       std::vector<KVCache>& kv_caches,
+                       const Params& params);
+
   uint32_t get_bucket_num_tokens(uint32_t num_tokens) const;
 
   uint32_t get_graph_max_seq_len(uint32_t kv_max_seq_len) const;
@@ -254,7 +283,8 @@ class DcuGraphExecutorImpl final : public ExecutorImpl {
   static DcuStream get_capture_stream(c10::DeviceIndex device_index);
 
  private:
-  CausalLM* model_;  // not owned
+  CausalLM* model_;                // not owned
+  RecModel* rec_model_ = nullptr;  // not owned
 
   ModelArgs args_;
   torch::Device device_;
@@ -272,5 +302,6 @@ class DcuGraphExecutorImpl final : public ExecutorImpl {
 };
 
 REGISTER_EXECUTOR("dcu", DcuGraphExecutorImpl);
+REGISTER_REC_EXECUTOR("dcu", DcuGraphExecutorImpl);
 
 }  // namespace xllm::runtime::dcu

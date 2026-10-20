@@ -124,8 +124,7 @@ torch::Tensor Qwen2DecoderLayerImpl::forward(
     std::optional<torch::Tensor>& residual,
     torch::Tensor& positions,
     const AttentionMetadata& attn_metadata,
-    KVCache& kv_cache,
-    const ModelInputParams& input_params) {
+    KVCache& kv_cache) {
   auto pre_fp8_scale = attention_->get_fp8_input_scale();
   auto post_fp8_scale = mlp_->get_fp8_input_scale();
 

@@ -1229,6 +1229,7 @@ TEST(BatchPackedInputTest, BorrowedExecutionViewUpdatesNativeMetadata) {
   static_assert(!std::is_copy_constructible_v<VlmModelParams>);
   static_assert(!std::is_copy_constructible_v<RecModelParams>);
   static_assert(!std::is_default_constructible_v<ModelInputParams>);
+  static_assert(!std::is_constructible_v<ModelInputParams, RecModelParams&>);
   LlmModelParams owner;
   owner.attention.host.kv_seq_lens = {2};
   ModelInputParams view(owner);
@@ -1240,8 +1241,6 @@ TEST(BatchPackedInputTest, BorrowedExecutionViewUpdatesNativeMetadata) {
   EXPECT_TRUE(torch::equal(owner.graph.input_tokens_override,
                            torch::tensor({13}, torch::kInt32)));
   EXPECT_FALSE(view.has_multimodal());
-  EXPECT_FALSE(view.has_features());
-  EXPECT_FALSE(view.has_rec_params());
 }
 
 TEST(BatchPackedInputTest,
@@ -1258,14 +1257,13 @@ TEST(BatchPackedInputTest,
   EXPECT_EQ(snapshot_view.attention.host.kv_seq_lens,
             (std::vector<int32_t>{2}));
   EXPECT_TRUE(snapshot_view.has_multimodal());
-  EXPECT_FALSE(snapshot_view.has_features());
   ASSERT_EQ(snapshot_view.multimodal().deep_stacks.size(), 1u);
   EXPECT_TRUE(torch::equal(snapshot_view.multimodal().deep_stacks[0],
                            torch::tensor({1.0F, 3.0F})));
 }
 
-TEST(BatchPackedInputTest, RecSnapshotTransferMovesExecutionTensors) {
-  RecModelParams owner;
+TEST(BatchPackedInputTest, LlmSnapshotTransferMovesSpecExecutionTensors) {
+  LlmModelParams owner;
   ModelInputParams params(owner);
   const torch::Tensor values = torch::tensor({1, 2}, torch::kInt32);
   params.embedding.mtp_shifted_token_ids = values;
@@ -1315,8 +1313,6 @@ TEST(BatchPackedInputTest, RecSnapshotTransferMovesExecutionTensors) {
   }
   ASSERT_NE(converted.mtp_topk_state, nullptr);
   EXPECT_EQ(converted.mtp_topk_state->device(), target_device);
-  EXPECT_TRUE(converted.has_features());
-  EXPECT_TRUE(converted.has_rec_params());
   EXPECT_FALSE(converted.has_multimodal());
   EXPECT_TRUE(converted.is_spec_verify);
   EXPECT_TRUE(converted.graph.use_expanded_decode_for_spec_verify_attention);
@@ -1333,6 +1329,48 @@ TEST(BatchPackedInputTest, RecSnapshotTransferMovesExecutionTensors) {
   EXPECT_EQ(params.graph.expanded_kv_seq_lens_vec, (std::vector<int32_t>{5}));
   EXPECT_TRUE(params.num_accepted_tokens.device().is_cpu());
   EXPECT_TRUE(params.mtp_topk_state->device().is_cpu());
+}
+
+TEST(BatchPackedInputTest, RecSnapshotTransfersNativeExecutionTensors) {
+  RecModelParams source;
+  const torch::Tensor values = torch::tensor({1, 2}, torch::kInt32);
+  source.attention.host.kv_seq_lens = {2};
+  source.attention.device.kv_seq_lens = values;
+  source.embedding.input_embedding = values;
+  source.embedding.linear_state_indices = values;
+  source.embedding.request_ids = {"rec"};
+  source.graph.attn_mask = values;
+  source.graph.tiling_data = values;
+  auto& strategy = source.mutable_llmrec_params();
+  strategy.current_round_tensor = values;
+  strategy.full_k_caches = {values};
+  strategy.full_v_caches = {values};
+  strategy.decode_positions_tensor_list = {values};
+
+  const torch::Device target_device("meta");
+  auto converted = source.clone().to(target_device);
+  ASSERT_TRUE(converted.has_llmrec_params());
+  EXPECT_FALSE(converted.has_onerec_params());
+  const std::vector<torch::Tensor> tensors = {
+      converted.attention.device.kv_seq_lens,
+      converted.embedding.input_embedding,
+      converted.embedding.linear_state_indices,
+      converted.graph.attn_mask,
+      converted.graph.tiling_data,
+      converted.llmrec_params()->current_round_tensor,
+      converted.llmrec_params()->full_k_caches.at(0),
+      converted.llmrec_params()->full_v_caches.at(0),
+      converted.llmrec_params()->decode_positions_tensor_list.at(0)};
+  for (const auto& tensor : tensors) {
+    ASSERT_TRUE(tensor.defined());
+    EXPECT_EQ(tensor.device(), target_device);
+    EXPECT_EQ(tensor.sizes(), values.sizes());
+    EXPECT_EQ(tensor.scalar_type(), values.scalar_type());
+  }
+  converted.attention.host.kv_seq_lens[0] = 9;
+  EXPECT_EQ(source.attention.host.kv_seq_lens, (std::vector<int32_t>{2}));
+  EXPECT_EQ(converted.embedding.request_ids, (std::vector<std::string>{"rec"}));
+  EXPECT_TRUE(source.llmrec_params()->full_k_caches[0].device().is_cpu());
 }
 
 TEST(BatchPackedInputTest, VlmDraftConversionExcludesTargetOnlyState) {

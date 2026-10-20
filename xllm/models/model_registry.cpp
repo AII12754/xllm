@@ -333,7 +333,10 @@ void ModelRegistry::register_rec_model_factory(const std::string& name,
                                               << " already registered.");
   } else {
     instance->model_registry_[name].rec_model_factory = factory;
-    instance->model_backend_[name] = "rec";
+    std::string& backend = instance->model_backend_[name];
+    if (backend.empty()) {
+      backend = "rec";
+    }
   }
 }
 
@@ -660,7 +663,7 @@ std::unique_ptr<CausalLM> create_llm_model(const ModelContext& context) {
   return nullptr;
 }
 
-std::unique_ptr<CausalLM> create_rec_model(const ModelContext& context) {
+std::unique_ptr<RecModel> create_rec_model(const ModelContext& context) {
   std::string resolved_name;
   std::string error_message;
   if (!resolve_model_registration_name(context.get_model_args().model_type(),

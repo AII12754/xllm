@@ -33,9 +33,9 @@ limitations under the License.
 #endif
 #include "common/qwen2_attention.h"
 #include "common/rms_norm.h"
+#include "core/framework/model/moe_execution_input.h"
 #include "core/kv_cache/storage/kv_cache.h"
 #include "framework/model/model_args.h"
-#include "framework/model/model_input_params.h"
 #include "framework/model_context/model_context.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/state_dict/state_dict.h"
@@ -55,10 +55,25 @@ class Qwen3MoeDecoderLayerImpl : public torch::nn::Module {
                         torch::Tensor& positions,
                         const AttentionMetadata& attn_metadata,
                         KVCache& kv_cache,
-                        const ModelInputParams& input_params);
+                        const MoeExecutionInput& input_params);
+
+  template <typename InputParams>
+  torch::Tensor forward(torch::Tensor& x,
+                        std::optional<torch::Tensor>& residual,
+                        torch::Tensor& positions,
+                        const AttentionMetadata& attn_metadata,
+                        KVCache& kv_cache,
+                        const InputParams& input_params) {
+    return forward(x,
+                   residual,
+                   positions,
+                   attn_metadata,
+                   kv_cache,
+                   MoeExecutionInput(input_params));
+  }
 
  private:
-  torch::Tensor run_moe(torch::Tensor x, const ModelInputParams& input_params);
+  torch::Tensor run_moe(torch::Tensor x, const MoeExecutionInput& input_params);
 
   Qwen2Attention attention_{nullptr};
   DenseMLP mlp_{nullptr};

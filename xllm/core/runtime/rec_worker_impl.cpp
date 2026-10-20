@@ -28,18 +28,19 @@ limitations under the License.
 #include "common/metrics.h"
 #include "common/types.h"
 #include "core/framework/config/beam_search_config.h"
-#include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/rec_config.h"
-#include "framework/model/model_input_params.h"
 #include "util/rec_model_utils.h"
 #include "util/tensor_helper.h"
 #if defined(USE_CUDA)
 #include "kernels/cuda/cuda_ops_api.h"
 #include "kernels/cuda/xattention/xattention_ops_api.h"
-#include "layers/cuda/flashinfer_workspace.h"
 #include "layers/cuda/xattention_workspace.h"
 #include "platform/cuda/device_capture_lock.h"
+#endif
+#if defined(USE_CUDA) || defined(USE_MUSA)
+#include "layers/cuda/flashinfer_workspace.h"
 #endif
 #if defined(USE_NPU)
 #include "kernels/npu/npu_ops_api.h"
@@ -441,7 +442,7 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
     const RecForwardInput& input) {
   Timer timer;
   auto& sampling_params = input.sampling_params;
-  ModelInputParams input_params(input.input_params);
+  RecModelParams& input_params = input.input_params;
 
   std::vector<folly::SemiFuture<bool>> futures;
 
@@ -468,19 +469,12 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
 #endif
   }
 
-  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    runtime_.eplb_executor->start_eplb_step(input_params.expert.eplb_info);
-  }
-
   // temporarily use [0], will be adapted in next pr
   // call model executor forward to get hidden states
   auto model_output = runtime_.executor->forward(input.token_ids,
                                                  input.positions,
                                                  runtime_.worker.kv_caches_,
                                                  input_params);
-  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    runtime_.eplb_executor->finish_eplb_step();
-  }
   if (!model_output.hidden_states.defined()) {
     return std::nullopt;
   }
@@ -492,12 +486,6 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
   }
 
   ForwardOutput output;
-  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    output.expert_load_data = runtime_.expert_load_data;
-    output.prepared_token =
-        runtime_.eplb_executor->consume_ready_prepare_token();
-  }
-
   if (!runtime_.worker.driver_ && !runtime_.worker.dp_driver_ &&
       !runtime_.worker.options_.enable_speculative_decode()) {
     auto ret = runtime_.stream->synchronize();
@@ -514,9 +502,6 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
           break;
         }
       }
-    }
-    if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-      return output;
     }
     return std::nullopt;
   }
@@ -683,7 +668,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
   runtime_.worker.device_.set_device();
 
   const auto& sampling_params = input.sampling_params;
-  ModelInputParams input_params(input.input_params);
+  RecModelParams& input_params = input.input_params;
 
   const auto* onerec_params = input_params.onerec_params();
   CHECK(onerec_params != nullptr) << "OneRec requires rec_params.";
@@ -1297,7 +1282,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
       };
 
   RecForwardInput mutable_input = input.clone();
-  ModelInputParams input_params(mutable_input.input_params);
+  RecModelParams& input_params = mutable_input.input_params;
   CHECK(input_params.onerec_xattention_params() != nullptr)
       << "OneRec xattention pipeline requires onerec_xattention_params.";
 
@@ -2131,7 +2116,7 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecMultiRoundPipeline::step(
   device.set_device();
 
   RecForwardInput mutable_input = input.clone();
-  ModelInputParams input_params(mutable_input.input_params);
+  RecModelParams& input_params = mutable_input.input_params;
 
   const auto* step_meta = mutable_input.step_meta();
   CHECK(step_meta != nullptr)
@@ -2844,7 +2829,17 @@ void RecWorkerImpl::initialize_xattention_workspace() {
 RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
                              const torch::Device& device,
                              const runtime::Options& options)
-    : LLMWorkerImpl(parallel_args, device, options) {
+    : WorkerImpl(parallel_args, device, options) {
+  device_.set_device();
+#if defined(USE_CUDA) || defined(USE_MUSA)
+  const auto& model_config = ModelConfig::get_instance();
+  if (!ModelConfig::is_python_model_impl(model_config.model_impl())) {
+    threadpool_.schedule([this]() mutable {
+      ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance().initialize(
+          device_);
+    });
+  }
+#endif
   initialize_xattention_workspace();
 
   if (!is_driver()) {
@@ -2869,46 +2864,21 @@ RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
             << options_.rec_worker_max_concurrency();
 }
 
-RecWorkerImpl::~RecWorkerImpl() {
-  // Release model_ and eplb_executor_ in destructor to avoid
-  // double deletion. Ownership actually belongs to work_pipelines_[0].
-  model_.release();
-
-  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    eplb_executor_.release();
+Model* RecWorkerImpl::model() const {
+  if (work_pipelines_.empty()) {
+    return nullptr;
   }
-}
-
-bool RecWorkerImpl::init_model(const std::string& model_weights_path,
-                               int32_t random_seed,
-                               MasterStatus master_status) {
-  if (!WorkerImpl::init_model(model_weights_path, random_seed, master_status)) {
-    return false;
-  }
-
-  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    work_pipelines_[0]->runtime().expert_load_data = expert_load_data_;
-
-    for (size_t i = 1; i < work_pipelines_.size(); ++i) {
-      work_pipelines_[i]->runtime().expert_load_data =
-          work_pipelines_[0]->runtime().expert_load_data.clone();
-    }
-  }
-
-  return true;
+  return work_pipelines_.front()->runtime().model.get();
 }
 
 bool RecWorkerImpl::init_model(ModelContext& context) {
-  CHECK(model_ == nullptr) << "Model is already initialized.";
+  CHECK(work_pipelines_.empty()) << "Model is already initialized.";
 
-  // Determine rec model kind and pipeline type
+  // Validate the requested model type before creating concurrent pipelines.
   const auto& model_type = context.get_model_args().model_type();
-  const RecModelKind rec_model_kind = get_rec_model_kind(model_type);
-  CHECK(rec_model_kind != RecModelKind::kNone)
+  const RecModelKind expected_model_kind = get_rec_model_kind(model_type);
+  CHECK(expected_model_kind != RecModelKind::kNone)
       << "Unsupported rec model_type: " << model_type;
-
-  // Create concurrent pipeline (not base class pipeline)
-  auto pipeline_type = get_rec_pipeline_type(rec_model_kind);
 
   // Reserve space for model instances
   work_pipelines_.reserve(options_.rec_worker_max_concurrency());
@@ -2924,12 +2894,12 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
                                        context.get_quant_args(),
                                        context.get_tensor_options());
 
-    if (rec_model_kind == RecModelKind::kOneRec) {
-      runtime.model = create_rec_model(*runtime.context.get());
-    } else {
-      runtime.model = create_llm_model(*runtime.context.get());
-    }
+    runtime.model = create_rec_model(*runtime.context);
     CHECK(runtime.model != nullptr) << "Failed to create model instance " << i;
+    const RecModelKind model_kind = runtime.model->model_kind();
+    CHECK(model_kind == expected_model_kind)
+        << "Rec model kind does not match model_type: " << model_type;
+    const RecPipelineType pipeline_type = get_rec_pipeline_type(model_kind);
 
     runtime.executor =
         std::make_unique<RecExecutor>(runtime.model.get(),
@@ -2937,24 +2907,12 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
                                       runtime.worker.device(),
                                       runtime.worker.options_);
 
-    if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-      runtime.eplb_executor = std::make_unique<EplbExecutor>(
-          *runtime.model, runtime.worker.device());
-    }
-
     work_pipelines_.emplace_back(create_pipeline(pipeline_type, runtime));
     index_queue_.enqueue(i);
   }
 
-  model_.reset(work_pipelines_[0]->runtime().model.get());
-
-  // Complete other initialization (EPLB, BeamSearcher, etc.)
   if (::xllm::BeamSearchConfig::get_instance().enable_beam_search_kernel()) {
     beam_searcher_ = std::make_unique<BeamSearcher>();
-  }
-
-  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    eplb_executor_.reset(work_pipelines_[0]->runtime().eplb_executor.get());
   }
 
   LOG(INFO) << "Created " << work_pipelines_.size()

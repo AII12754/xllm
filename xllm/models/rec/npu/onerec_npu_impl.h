@@ -26,7 +26,7 @@ limitations under the License.
 namespace xllm {
 
 inline torch::Tensor pad_encoder_output(const torch::Tensor& encoder_output,
-                                        const ModelInputParams& input_params) {
+                                        const RecModelParams& input_params) {
   const auto* onerec_params = input_params.onerec_params();
   CHECK(onerec_params != nullptr) << "OneRec requires onerec_params().";
 
@@ -71,7 +71,7 @@ inline torch::Tensor compute_onerec_position_bias(
     int64_t max_distance = 128,
     const torch::TensorOptions& options = torch::kFloat32,
     bool is_decode_stage = false,
-    const ModelInputParams* input_params = nullptr) {
+    const RecModelParams* input_params = nullptr) {
   auto device = options.device();
   auto dtype = options.dtype();
 
@@ -190,7 +190,7 @@ class OneRecStackImpl : public torch::nn::Module {
   torch::Tensor forward(const torch::Tensor& tokens,
                         const torch::Tensor& positions,
                         std::vector<KVCache>& kv_caches,
-                        const ModelInputParams& input_params,
+                        const RecModelParams& input_params,
                         const torch::Tensor& encoder_output = torch::Tensor()) {
     (void)positions;
 
@@ -247,7 +247,7 @@ class OneRecStackImpl : public torch::nn::Module {
     auto [query_length, key_length] = compute_sequence_lengths(
         input_params.meta.q_max_seq_len, is_prefill, input_params);
 
-    ModelInputParams input_params_local = input_params.clone().view();
+    RecModelParams input_params_local = input_params.clone();
     auto& mutable_onerec_params = input_params_local.mutable_onerec_params();
     const auto* onerec_xattn_params = input_params.onerec_xattention_params();
 
@@ -397,7 +397,7 @@ class OneRecStackImpl : public torch::nn::Module {
   std::pair<int64_t, int64_t> compute_sequence_lengths(
       int64_t seq_length,
       bool is_prefill,
-      const ModelInputParams& input_params) const {
+      const RecModelParams& input_params) const {
     int64_t query_length = seq_length;
     int64_t key_length = seq_length;
 
@@ -460,12 +460,11 @@ class OneRecStackImpl : public torch::nn::Module {
     return effective_attn_mask;
   }
 
-  torch::Tensor compute_position_bias_mask(
-      int64_t query_length,
-      int64_t key_length,
-      const torch::Tensor& h,
-      bool is_decode_stage,
-      const ModelInputParams& input_params) {
+  torch::Tensor compute_position_bias_mask(int64_t query_length,
+                                           int64_t key_length,
+                                           const torch::Tensor& h,
+                                           bool is_decode_stage,
+                                           const RecModelParams& input_params) {
     CHECK(!position_bias_embedding_.is_empty())
         << "position_bias_embedding is required for relative attention.";
 

@@ -1047,7 +1047,7 @@ torch::Tensor FusedMoEImpl::remap_expert_ids_for_eplb(
 
 void FusedMoEImpl::record_eplb_expert_load(
     const torch::Tensor& ids_2d,
-    const ModelInputParams& input_params,
+    const MoeExecutionInput& input_params,
     bool routed_tokens_are_dp_gathered) const {
   const bool is_eager_warmup = dsv4_eplb::is_eager_warmup(
       input_params.meta.is_graph_warmup, input_params.enable_graph);
@@ -1105,7 +1105,7 @@ void FusedMoEImpl::record_eplb_expert_load(
 
 void FusedMoEImpl::record_eplb_dispatch_expert_load(
     const torch::Tensor& expert_token_counts,
-    const ModelInputParams& input_params) const {
+    const MoeExecutionInput& input_params) const {
   const bool is_eager_warmup = dsv4_eplb::is_eager_warmup(
       input_params.meta.is_graph_warmup, input_params.enable_graph);
   if (!enable_eplb_ || is_eager_warmup || eplb_layer_id_ < 0 ||
@@ -1774,7 +1774,7 @@ torch::Tensor FusedMoEImpl::select_experts(
     const torch::Tensor& hidden_states_2d,
     const torch::Tensor& router_logits_2d,
     SelectedExpertInfo& selected_expert_info,
-    const ModelInputParams& input_params) {
+    const MoeExecutionInput& input_params) {
   auto [topk_weights, topk_ids] =
       select_global_experts(hidden_states_2d, router_logits_2d);
 
@@ -1879,7 +1879,7 @@ void FusedMoEImpl::ensure_mega_moe_weights() {
 torch::Tensor FusedMoEImpl::forward_mega_moe(
     const torch::Tensor& hidden_states,
     const torch::Tensor& router_logits,
-    const ModelInputParams& input_params) {
+    const MoeExecutionInput& input_params) {
   CHECK(mega_moe_enabled_);
   auto comm = mega_moe_comm_resource_.lock();
   CHECK(comm != nullptr)
@@ -1993,7 +1993,7 @@ torch::Tensor FusedMoEImpl::forward_mega_moe(
   return y.reshape(hidden_states_shape);
 }
 
-bool FusedMoEImpl::should_use_mega_moe(const ModelInputParams& input_params,
+bool FusedMoEImpl::should_use_mega_moe(const MoeExecutionInput& input_params,
                                        int64_t input_size) const {
   if (!mega_moe_enabled_) {
     return false;
@@ -2023,7 +2023,7 @@ torch::Tensor FusedMoEImpl::forward_expert(
     const torch::Tensor& hidden_states,
     const torch::Tensor& router_logits,
     const std::optional<torch::Tensor>& shared_output,
-    const ModelInputParams& input_params,
+    const MoeExecutionInput& input_params,
     bool use_mega_moe) {
   if (use_mega_moe) {
     auto output = forward_mega_moe(hidden_states, router_logits, input_params);
@@ -2303,7 +2303,7 @@ torch::Tensor FusedMoEImpl::forward_expert(
 }
 
 torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
-                                    const ModelInputParams& input_params) {
+                                    const MoeExecutionInput& input_params) {
   auto input = hidden_states;
   bool need_slice = false;
   std::vector<int32_t> moe_dp_token_nums;
@@ -2348,7 +2348,7 @@ bool FusedMoEImpl::should_gather_dp_inputs_for_moe() const {
 }
 
 bool FusedMoEImpl::can_use_ep2_dispatch_combine(
-    const ModelInputParams& input_params,
+    const MoeExecutionInput& input_params,
     const torch::Tensor& hidden_states) const {
   if (!enable_ep2_dispatch_combine_) {
     return false;
@@ -2500,7 +2500,7 @@ torch::Tensor FusedMoEImpl::forward_with_dispatch_ffn_combine(
     const torch::Tensor& ids_2d,
     const torch::Tensor& active_token_mask,
     at::IntArrayRef hidden_states_shape,
-    const ModelInputParams& input_params) {
+    const MoeExecutionInput& input_params) {
   std::vector<torch::Tensor> weight1_list = {w13_};
   std::vector<torch::Tensor> weight2_list = {w2_};
   std::vector<torch::Tensor> scale1_list = {dispatch_ffn_w13_scale_};
@@ -2540,7 +2540,7 @@ torch::Tensor FusedMoEImpl::forward_with_dispatch_gmm_combine_decode(
     const torch::Tensor& active_token_mask,
     at::IntArrayRef hidden_states_shape,
     int64_t global_bs,
-    const ModelInputParams& input_params) {
+    const MoeExecutionInput& input_params) {
   std::vector<torch::Tensor> weight1_list = {w13_};
   std::vector<torch::Tensor> weight2_list = {w2_};
   std::vector<torch::Tensor> scale1_list = {w13_scale_};
@@ -2599,7 +2599,7 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts_ep2(
     const torch::Tensor& hidden_states,
     const torch::Tensor& topk_weights,
     const torch::Tensor& topk_ids,
-    const ModelInputParams& input_params) {
+    const MoeExecutionInput& input_params) {
   const auto hidden_states_shape = hidden_states.sizes();
   auto input_2d =
       hidden_states.reshape({-1, hidden_states.size(-1)}).contiguous();
@@ -2829,7 +2829,7 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
     const torch::Tensor& hidden_states,
     const torch::Tensor& topk_weights,
     const torch::Tensor& topk_ids,
-    const ModelInputParams& input_params) {
+    const MoeExecutionInput& input_params) {
   torch::Tensor input = hidden_states;
   torch::Tensor selected_topk_weights = topk_weights;
   torch::Tensor selected_topk_ids = topk_ids;

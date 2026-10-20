@@ -20,18 +20,18 @@ limitations under the License.
 #include <vector>
 
 #include "core/kv_cache/storage/kv_cache.h"
-#include "framework/model/causal_lm.h"
-#include "framework/model/model_input_params.h"
 #include "framework/model/model_output.h"
-#include "runtime/executor_impl.h"
-#include "runtime/executor_impl_factory.h"
+#include "framework/model/rec_model.h"
+#include "framework/model/rec_model_params.h"
 #include "runtime/options.h"
+#include "runtime/rec_executor_backend.h"
+#include "runtime/rec_executor_impl_factory.h"
 
 namespace xllm {
 
-class RecExecutorImpl final : public ExecutorImpl {
+class RecExecutorImpl final : public RecExecutorBackend {
  public:
-  RecExecutorImpl(CausalLM* model,
+  RecExecutorImpl(RecModel* model,
                   const ModelArgs& args,
                   const torch::Device& device,
                   const runtime::Options& options);
@@ -41,12 +41,12 @@ class RecExecutorImpl final : public ExecutorImpl {
   ModelOutput run(const torch::Tensor& tokens,
                   const torch::Tensor& positions,
                   std::vector<KVCache>& kv_caches,
-                  const ModelInputParams& params) override;
+                  const RecModelParams& params) override;
 
  private:
-  CausalLM* model_;  // not owned
+  RecModel* model_;  // not owned
 };
 
-REGISTER_EXECUTOR("rec", RecExecutorImpl);
+REGISTER_REC_EXECUTOR("rec", RecExecutorImpl);
 
 }  // namespace xllm

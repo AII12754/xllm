@@ -20,14 +20,9 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/rec_config.h"
+#include "core/framework/model/rec_model_kind.h"
 
 namespace xllm {
-
-enum class RecModelKind : int8_t {
-  kNone = 0,
-  kOneRec = 1,
-  kLlmRec = 2,
-};
 
 // Pipeline strategy types (extensible for future strategies)
 enum class RecPipelineType : uint8_t {

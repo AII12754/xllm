@@ -46,11 +46,14 @@ using c10::musa::MUSAStream;
 #include "core/common/macros.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/model_input_params.h"
+#include "core/framework/model/rec_model.h"
 #include "core/kernels/musa/llm_decode_metadata_update.h"
 #include "core/kv_cache/storage/kv_cache.h"
 #include "core/runtime/executor_impl.h"
 #include "core/runtime/executor_impl_factory.h"
 #include "core/runtime/options.h"
+#include "core/runtime/rec_executor_backend.h"
+#include "core/runtime/rec_executor_impl_factory.h"
 
 namespace xllm::runtime::musa {
 
@@ -68,11 +71,10 @@ class MusaGraphPersistentParam final {
   ~MusaGraphPersistentParam() = default;
 
   // Update persistent tensors with new input data
-  // If return_capture_params is true, returns a ModelInputParams with
-  // persistent buffer references. padded_num_tokens must be > 0 when
-  // return_capture_params is true, used for build new ModelInputParams for
-  // capture. If return_capture_params is false, only updates persistent buffers
-  // and returns std::nullopt.
+  // Return native capture input with persistent buffer references when
+  // return_capture_params is true. padded_num_tokens must then be > 0.
+  // Otherwise, only update persistent buffers and return std::nullopt.
+
   std::optional<ModelInputParams> update(const torch::Tensor& tokens,
                                          const torch::Tensor& k_cache,
                                          const torch::Tensor& v_cache,
@@ -80,6 +82,14 @@ class MusaGraphPersistentParam final {
                                          const ModelInputParams& params,
                                          uint32_t padded_num_tokens = 0,
                                          bool return_capture_params = false);
+
+  std::optional<RecModelParams> update(const torch::Tensor& tokens,
+                                       const torch::Tensor& k_cache,
+                                       const torch::Tensor& v_cache,
+                                       const torch::Tensor& positions,
+                                       const RecModelParams& params,
+                                       uint32_t padded_num_tokens = 0,
+                                       bool return_capture_params = false);
 
   // Getter methods for persistent tensors
   torch::Tensor persistent_tokens(uint32_t actual_tokens) const {
@@ -221,12 +231,23 @@ class MusaGraphPersistentParam final {
   }
 
  private:
+  template <typename Params>
+  std::optional<Params> update_typed(const torch::Tensor& tokens,
+                                     const torch::Tensor& k_cache,
+                                     const torch::Tensor& v_cache,
+                                     const torch::Tensor& positions,
+                                     const Params& params,
+                                     uint32_t padded_num_tokens,
+                                     bool return_capture_params);
+
+  template <typename Params>
   bool can_use_llm_decode_fast_path(const torch::Tensor& tokens,
                                     const torch::Tensor& positions,
-                                    const ModelInputParams& params) const;
+                                    const Params& params) const;
+  template <typename Params>
   void update_llm_decode_metadata_fast_path(const torch::Tensor& tokens,
                                             const torch::Tensor& positions,
-                                            const ModelInputParams& params,
+                                            const Params& params,
                                             uint32_t padded_num_tokens,
                                             int64_t actual_batch_size,
                                             int64_t actual_num_tokens);
@@ -269,6 +290,7 @@ class MusaGraph final {
         capture_stream_(capture_stream) {}
 
   // Capture computation graph for given bucket num_tokens
+
   bool capture(CausalLM* model,
                const ModelArgs& args,
                const runtime::Options& options,
@@ -280,11 +302,30 @@ class MusaGraph final {
                const c10::musa::MempoolId_t& pool,
                MusaMemPool* pool_ptr = nullptr);
 
+  bool capture(RecModel* model,
+               const ModelArgs& args,
+               const runtime::Options& options,
+               const torch::Tensor& tokens,
+               const torch::Tensor& positions,
+               const RecModelParams& params,
+               std::vector<KVCache>& kv_cache,
+               uint32_t bucket_num_tokens,
+               const c10::musa::MempoolId_t& pool,
+               MusaMemPool* pool_ptr = nullptr);
+
   // Replay captured graph with new input data
+
   ModelOutput replay(const torch::Tensor& tokens,
                      const torch::Tensor& positions,
                      std::vector<KVCache>& kv_cache,
                      const ModelInputParams& params);
+
+  ModelOutput replay(const torch::Tensor& tokens,
+                     const torch::Tensor& positions,
+                     std::vector<KVCache>& kv_cache,
+                     const RecModelParams& params);
+
+  bool matches_rec_bindings(const RecModelParams& params) const;
 
   // Get the hidden states from the last capture
   torch::Tensor get_hidden_states(uint32_t actual_num_tokens) const {
@@ -292,6 +333,23 @@ class MusaGraph final {
   }
 
  private:
+  template <typename Params, typename Model>
+  bool capture_typed(Model* model,
+                     const ModelArgs& args,
+                     const runtime::Options& options,
+                     const torch::Tensor& tokens,
+                     const torch::Tensor& positions,
+                     const Params& params,
+                     std::vector<KVCache>& kv_cache,
+                     uint32_t bucket_num_tokens,
+                     const c10::musa::MempoolId_t& pool,
+                     MusaMemPool* pool_ptr);
+  template <typename Params>
+  ModelOutput replay_typed(const torch::Tensor& tokens,
+                           const torch::Tensor& positions,
+                           std::vector<KVCache>& kv_cache,
+                           const Params& params);
+
   // Print graph held tensors for debugging
   void print_graph_tensors() const;
 
@@ -311,8 +369,7 @@ class MusaGraph final {
   // When attention.host paged-KV mirrors are populated (normal LLM-engine
   // path), copies CPU->pinned host directly and avoids per-step D2H sync.
   void refresh_persistent_paged_kv_host_mirrors(
-      const std::shared_ptr<layer::AttentionMetadata>& attn_metadata,
-      const AttentionHostInputView& host_src);
+      const std::shared_ptr<layer::AttentionMetadata>& attn_metadata);
 
   // Reference to persistent parameters (shared across multiple MusaGraph
   // instances).
@@ -381,13 +438,19 @@ class MusaGraph final {
 
   // Declare graph holders last so they are destroyed before the tensors and
   // host buffers whose addresses were retained during capture.
+  std::optional<RecModelParams> captured_rec_input_;
   at::musa::MUSAGraph graph_;
 };
 
 // Executor implementation using MUSA graph optimization
-class MusaGraphExecutorImpl final : public ExecutorImpl {
+class MusaGraphExecutorImpl final : public ExecutorImpl,
+                                    public RecExecutorBackend {
  public:
   MusaGraphExecutorImpl(CausalLM* model,
+                        const ModelArgs& args,
+                        const torch::Device& device,
+                        const runtime::Options& options);
+  MusaGraphExecutorImpl(RecModel* model,
                         const ModelArgs& args,
                         const torch::Device& device,
                         const runtime::Options& options);
@@ -399,6 +462,10 @@ class MusaGraphExecutorImpl final : public ExecutorImpl {
                   const torch::Tensor& positions,
                   std::vector<KVCache>& kv_caches,
                   const ModelInputParams& params) override;
+  ModelOutput run(const torch::Tensor& tokens,
+                  const torch::Tensor& positions,
+                  std::vector<KVCache>& kv_caches,
+                  const RecModelParams& params) override;
 
   // Return current graph executor memory usage in bytes (including persistent
   // parameters). Exposed for tests and diagnostics.
@@ -410,6 +477,14 @@ class MusaGraphExecutorImpl final : public ExecutorImpl {
  private:
   // not own
   CausalLM* model_;
+  RecModel* rec_model_ = nullptr;
+
+  template <typename Model, typename Params>
+  ModelOutput run_typed(Model* model,
+                        const torch::Tensor& tokens,
+                        const torch::Tensor& positions,
+                        std::vector<KVCache>& kv_caches,
+                        const Params& params);
 
   ModelArgs args_;
   torch::Device device_;
@@ -436,9 +511,10 @@ class MusaGraphExecutorImpl final : public ExecutorImpl {
       const torch::Tensor& hidden_states,
       uint32_t n_tokens) const;
 
-  ModelInputParams maybe_precompute_embedding_for_graph(
-      const torch::Tensor& tokens,
-      const ModelInputParams& params) const;
+  template <typename Model, typename Params>
+  Params maybe_precompute_embedding_for_graph(Model* model,
+                                              const torch::Tensor& tokens,
+                                              const Params& params) const;
 
   // Get MUSA graph memory pool id for capture. When VMM is enabled, uses
   // per-shape MemPool under (physical_pool_id, shape_id). Same physical_pool_id
@@ -495,5 +571,6 @@ class MusaGraphExecutorImpl final : public ExecutorImpl {
 // the whole TU as unused). At runtime the factory's emplace() dedupes the
 // duplicates so only the first registration takes effect.
 REGISTER_EXECUTOR("musa", MusaGraphExecutorImpl);
+REGISTER_REC_EXECUTOR("musa", MusaGraphExecutorImpl);
 
 }  // namespace xllm::runtime::musa

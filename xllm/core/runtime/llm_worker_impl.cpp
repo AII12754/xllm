@@ -32,6 +32,7 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/kv_cache/linear_state_restore.h"
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
+#include "framework/eplb/eplb_utils.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
 #if defined(USE_CUDA) || defined(USE_ILU) || defined(USE_MUSA)
@@ -125,17 +126,38 @@ bool LLMWorkerImpl::init_model(ModelContext& context) {
   model_executor_ = std::make_unique<Executor>(
       model_.get(), context.get_model_args(), device_, options_);
 
-  // MTP draft workers execute a separate one-layer model and must not consume
-  // the target model's EPLB prepare/update commands. Only the target reports
-  // expert load and participates in expert-weight transfer.
-  if (::xllm::EPLBConfig::get_instance().enable_eplb() && !is_spec_draft_) {
-    eplb_executor_ = std::make_unique<EplbExecutor>(*model_, device_);
+  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
+    const auto& args = context.get_model_args();
+    const auto& parallel_args = context.get_parallel_args();
+    const int32_t num_layers = args.n_layers() - args.first_k_dense_replace();
+    const int32_t eplb_device_num = eplb::effective_device_num(
+        parallel_args.world_size(), parallel_args.ep_size());
+    const int32_t num_device_experts = eplb::local_physical_experts_num(
+        args.n_routed_experts(),
+        eplb_device_num,
+        EPLBConfig::get_instance().redundant_experts_num());
+    // TODO: support virtual memory.
+    expert_load_data_ = torch::zeros(
+        {num_layers, num_device_experts},
+        torch::TensorOptions().dtype(torch::kInt64).device(device_));
+    // MTP draft MoE layers still write to their own load buffer, but only
+    // the target reports loads and consumes EPLB prepare/update commands.
+    if (!is_spec_draft_) {
+      eplb_executor_ = std::make_unique<EplbExecutor>(*model_, device_);
+    }
   }
 
   if (::xllm::BeamSearchConfig::get_instance().enable_beam_search_kernel()) {
     beam_searcher_ = std::make_unique<BeamSearcher>();
   }
   return true;
+}
+
+void LLMWorkerImpl::prepare_expert_input(ExpertInput& input) const {
+  if (expert_load_data_.defined()) {
+    // Python/TORCH models also record loads without NPU mapping metadata.
+    input.expert_load_data = expert_load_data_;
+  }
 }
 
 #if defined(USE_NPU)

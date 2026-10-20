@@ -46,7 +46,7 @@ MoEModule create_fused_moe_from_context(const ModelContext& context,
 
 #if defined(USE_MLU)
 bool use_moe_all2all(bool enable_deep_ep,
-                     const ModelInputParams& input_params) {
+                     const MoeExecutionInput& input_params) {
   return enable_deep_ep && all_dp_ranks_are_decode(input_params);
 }
 #endif
@@ -117,7 +117,7 @@ Qwen3MoeDecoderLayerImpl::Qwen3MoeDecoderLayerImpl(const ModelContext& context,
 
 torch::Tensor Qwen3MoeDecoderLayerImpl::run_moe(
     torch::Tensor x,
-    const ModelInputParams& input_params) {
+    const MoeExecutionInput& input_params) {
 #if defined(USE_MLU)
   const bool enable_moe_all2all =
       use_moe_all2all(enable_deep_ep_, input_params);
@@ -128,7 +128,7 @@ torch::Tensor Qwen3MoeDecoderLayerImpl::run_moe(
   }
   return moe_mlp_->forward_experts(x, enable_moe_all2all);
 #else
-  return moe_mlp_(x, input_params);
+  return moe_mlp_->forward(x, input_params);
 #endif
 }
 
@@ -151,7 +151,7 @@ torch::Tensor Qwen3MoeDecoderLayerImpl::forward(
     torch::Tensor& positions,
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
-    const ModelInputParams& input_params) {
+    const MoeExecutionInput& input_params) {
   // Pre-attention norm
   if (!residual.has_value()) {
     residual = x;

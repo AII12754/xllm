@@ -158,14 +158,14 @@ class Glm4ModelImpl
       }
 
       auto& layer = layers_[i];
-      layer(h,
-            cos_pos,
-            sin_pos,
-            attn_mask,
-            kv_caches[i],
-            input_params_new,
-            event,
-            event_flag);
+      layer->forward(h,
+                     cos_pos,
+                     sin_pos,
+                     attn_mask,
+                     kv_caches[i],
+                     input_params_new,
+                     event,
+                     event_flag);
     }
     auto hidden_states = norm_(h, 0);
     return ModelOutput(hidden_states);

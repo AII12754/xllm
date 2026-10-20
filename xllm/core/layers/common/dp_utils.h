@@ -20,7 +20,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "framework/model/model_input_params.h"
+#include "core/framework/model/model_input_types.h"
 #include "framework/parallel_state/parallel_args.h"
 
 namespace xllm {
@@ -65,7 +65,7 @@ bool need_dp_moe_gather(const ParallelArgs& args, bool enable_moe_all2all);
 
 // gather tokens from all dp ranks before moe
 torch::Tensor gather_dp_tokens(const torch::Tensor& input,
-                               const ModelInputParams& params,
+                               const ParallelInput& params,
                                const ParallelArgs& args);
 
 struct SelectedMoeInputs {
@@ -94,11 +94,30 @@ torch::Tensor slice_selected_moe_output(
 // given a tensor containing data from all DP ranks,
 // returns a slice containing only the tokens for the current DP rank
 torch::Tensor get_dp_local_slice(const torch::Tensor& input,
-                                 const ModelInputParams& params,
+                                 const ParallelInput& params,
                                  const ParallelArgs& args);
 
 // check if all dp ranks are decode
-bool all_dp_ranks_are_decode(const ModelInputParams& params);
+bool all_dp_ranks_are_decode(const ParallelInput& params);
+
+template <typename InputParams>
+torch::Tensor gather_dp_tokens(const torch::Tensor& input,
+                               const InputParams& params,
+                               const ParallelArgs& args) {
+  return gather_dp_tokens(input, params.parallel, args);
+}
+
+template <typename InputParams>
+torch::Tensor get_dp_local_slice(const torch::Tensor& input,
+                                 const InputParams& params,
+                                 const ParallelArgs& args) {
+  return get_dp_local_slice(input, params.parallel, args);
+}
+
+template <typename InputParams>
+bool all_dp_ranks_are_decode(const InputParams& params) {
+  return all_dp_ranks_are_decode(params.parallel);
+}
 
 }  // namespace layer
 }  // namespace xllm

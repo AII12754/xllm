@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_input_params.h"
+#include "core/framework/model/rec_model_params.h"
 #include "core/kernels/npu/paged_attention_tiling_layout.h"
 #include "core/runtime/options.h"
 
@@ -80,20 +81,21 @@ class GraphPersistentParam final {
   // for_capture must stay false so dynamic host metadata uses actual lengths.
   // update_paged_attention_plan can be disabled when FIA graph tasks replace
   // the paged-attention task for the current graph.
-  std::optional<ModelInputParams> update(
-      const torch::Tensor& tokens,
-      const torch::Tensor& k_cache,
-      const torch::Tensor& v_cache,
-      const torch::Tensor& positions,
-      const ModelInputParams& params,
-      uint32_t padded_num_tokens,
-      bool return_capture_params = false,
-      bool skip_token_update = false,
-      bool for_capture = false,
-      bool update_paged_attention_plan = true);
+  template <typename Params>
+  std::optional<Params> update(const torch::Tensor& tokens,
+                               const torch::Tensor& k_cache,
+                               const torch::Tensor& v_cache,
+                               const torch::Tensor& positions,
+                               const Params& params,
+                               uint32_t padded_num_tokens,
+                               bool return_capture_params = false,
+                               bool skip_token_update = false,
+                               bool for_capture = false,
+                               bool update_paged_attention_plan = true);
 
+  template <typename Params>
   void update_tokens(const torch::Tensor& tokens,
-                     const ModelInputParams& params,
+                     const Params& params,
                      uint32_t actual_num_tokens,
                      uint32_t padded_num_tokens);
 
@@ -247,17 +249,20 @@ class GraphPersistentParam final {
   void initialize_paged_attention_plan_context(const torch::Device& device);
 
   // Update attention mask efficiently from input parameters
-  void update_attention_mask(const ModelInputParams& input_params);
+  template <typename Params>
+  void update_attention_mask(const Params& input_params);
 
-  void update_eplb_decode_token_mask(const ModelInputParams& input_params,
+  template <typename Params>
+  void update_eplb_decode_token_mask(const Params& input_params,
                                      uint32_t padded_num_tokens);
 
   // Update paged attention tiling based on input parameters
+  template <typename Params>
   void plan_paged_attention_tiling(const torch::Tensor& tokens,
                                    const torch::Tensor& k_cache,
                                    const torch::Tensor& v_cache,
                                    const torch::Tensor& block_tables,
-                                   const ModelInputParams& input_params,
+                                   const Params& input_params,
                                    aclrtStream stream,
                                    bool copy_to_device = true);
 

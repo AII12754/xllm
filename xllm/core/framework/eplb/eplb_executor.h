@@ -25,13 +25,12 @@ limitations under the License.
 #include <thread>
 #include <vector>
 
-#include "common/macros.h"
 #include "core/framework/eplb/eplb_info.h"
-#include "framework/model/causal_lm.h"
-#include "platform/device.h"
-#include "runtime/forward_params.h"
+#include "core/platform/device.h"
 
 namespace xllm {
+
+class CausalLM;
 
 class EplbExecutor final {
  public:

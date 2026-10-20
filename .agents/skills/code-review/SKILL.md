@@ -30,7 +30,7 @@ If `CURRENT_BRANCH` is `main`, warn the user and ask which commits to review.
 
 ### Step 2: Read project standards
 
-Read [custom-code-style.md](references/custom-code-style.md) for project-specific coding style.
+Read the shared rules in [custom-code-style.md](references/custom-code-style.md) and the guide for every language in the diff: [C++](references/custom-code-style-cpp.md) or [Python](references/custom-code-style-python.md).
 
 ### Step 3: Review against the checklist
 
@@ -100,7 +100,7 @@ Use the format below.
 ## Rules
 
 **DO:**
-- Apply project-specific style from [custom-code-style.md](references/custom-code-style.md)
+- Apply project-specific style from the shared guide and the matching language guide in [references/](references/)
 - Follow DDD (Domain Driven Design) principles, and keep the codebase clean and maintainable
 - Categorize by actual severity (not everything is Critical)
 - Be specific with file:line references

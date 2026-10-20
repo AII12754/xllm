@@ -26,8 +26,8 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/model/moe_execution_input.h"
 #include "framework/model/model_args.h"
-#include "framework/model/model_input_params.h"
 #include "framework/parallel_state/mega_moe_comm_resource.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/quantization/quant_args.h"
@@ -74,15 +74,31 @@ class FusedMoEImpl : public torch::nn::Module {
       const torch::Tensor& hidden_states,
       const torch::Tensor& router_logits,
       const std::optional<torch::Tensor>& shared_output,
-      const ModelInputParams& input_params,
+      const MoeExecutionInput& input_params,
       bool use_mega_moe);
   torch::Tensor forward_with_selected_experts(
       const torch::Tensor& hidden_states,
       const torch::Tensor& topk_weights,
       const torch::Tensor& topk_ids,
-      const ModelInputParams& input_params);
+      const MoeExecutionInput& input_params);
+  template <typename InputParams>
+  torch::Tensor forward_with_selected_experts(
+      const torch::Tensor& hidden_states,
+      const torch::Tensor& topk_weights,
+      const torch::Tensor& topk_ids,
+      const InputParams& input_params) {
+    return forward_with_selected_experts(
+        hidden_states, topk_weights, topk_ids, MoeExecutionInput(input_params));
+  }
   torch::Tensor forward(const torch::Tensor& hidden_states,
-                        const ModelInputParams& input_params);
+                        const MoeExecutionInput& input_params);
+
+  template <typename InputParams>
+  torch::Tensor forward(const torch::Tensor& hidden_states,
+                        const InputParams& input_params) {
+    return forward(hidden_states, MoeExecutionInput(input_params));
+  }
+
   void load_state_dict(const StateDict& state_dict);
   void set_eplb_layer_id(int32_t layer_id);
   void prepare_expert_weight(const std::vector<int32_t>& expert_ids);
@@ -111,7 +127,7 @@ class FusedMoEImpl : public torch::nn::Module {
   torch::Tensor select_experts(const torch::Tensor& hidden_states_2d,
                                const torch::Tensor& router_logits_2d,
                                SelectedExpertInfo& selected_expert_info,
-                               const ModelInputParams& input_params);
+                               const MoeExecutionInput& input_params);
 
   // Computes router choices in the global expert-id space. MegaMoe consumes
   // these values before the EPLB physical-expert remap is applied.
@@ -126,11 +142,11 @@ class FusedMoEImpl : public torch::nn::Module {
   // non-uniform or empty DP shards, and output shape restoration.
   torch::Tensor forward_mega_moe(const torch::Tensor& hidden_states,
                                  const torch::Tensor& router_logits,
-                                 const ModelInputParams& input_params);
+                                 const MoeExecutionInput& input_params);
 
   // Returns true when the mega_moe fused kernel should be used instead of
   // the allgather + dispatch/combine path.
-  bool should_use_mega_moe(const ModelInputParams& input_params,
+  bool should_use_mega_moe(const MoeExecutionInput& input_params,
                            int64_t input_size) const;
 
  private:
@@ -204,17 +220,17 @@ class FusedMoEImpl : public torch::nn::Module {
   void preprocess_w4a8_dynamic_weights();
   void clear_w4a8_dynamic_source_weight_cache();
   bool should_gather_dp_inputs_for_moe() const;
-  bool can_use_ep2_dispatch_combine(const ModelInputParams& input_params,
+  bool can_use_ep2_dispatch_combine(const MoeExecutionInput& input_params,
                                     const torch::Tensor& hidden_states) const;
   int64_t local_physical_experts_num() const;
   int64_t global_physical_experts_num() const;
   torch::Tensor remap_expert_ids_for_eplb(const torch::Tensor& ids_2d) const;
   void record_eplb_expert_load(const torch::Tensor& ids_2d,
-                               const ModelInputParams& input_params,
+                               const MoeExecutionInput& input_params,
                                bool routed_tokens_are_dp_gathered) const;
   void record_eplb_dispatch_expert_load(
       const torch::Tensor& expert_token_counts,
-      const ModelInputParams& input_params) const;
+      const MoeExecutionInput& input_params) const;
   void initialize_eplb_state();
   void expand_eplb_weight_storage();
   void expand_eplb_tensor_storage(torch::Tensor& tensor);
@@ -236,7 +252,7 @@ class FusedMoEImpl : public torch::nn::Module {
       const torch::Tensor& ids_2d,
       const torch::Tensor& active_token_mask,
       at::IntArrayRef hidden_states_shape,
-      const ModelInputParams& input_params);
+      const MoeExecutionInput& input_params);
   torch::Tensor forward_with_dispatch_gmm_combine_decode(
       const torch::Tensor& input_2d,
       const torch::Tensor& weights_2d,
@@ -244,12 +260,12 @@ class FusedMoEImpl : public torch::nn::Module {
       const torch::Tensor& active_token_mask,
       at::IntArrayRef hidden_states_shape,
       int64_t global_bs,
-      const ModelInputParams& input_params);
+      const MoeExecutionInput& input_params);
   torch::Tensor forward_with_selected_experts_ep2(
       const torch::Tensor& hidden_states,
       const torch::Tensor& topk_weights,
       const torch::Tensor& topk_ids,
-      const ModelInputParams& input_params);
+      const MoeExecutionInput& input_params);
   const std::string& get_mc2_group_name();
   const std::string& get_moe_ep_process_group_name();
 

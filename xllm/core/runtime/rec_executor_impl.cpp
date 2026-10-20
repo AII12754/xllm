@@ -19,7 +19,7 @@ limitations under the License.
 
 namespace xllm {
 
-RecExecutorImpl::RecExecutorImpl(CausalLM* model,
+RecExecutorImpl::RecExecutorImpl(RecModel* model,
                                  const ModelArgs& /*args*/,
                                  const torch::Device& /*device*/,
                                  const runtime::Options& /*options*/)
@@ -28,7 +28,7 @@ RecExecutorImpl::RecExecutorImpl(CausalLM* model,
 ModelOutput RecExecutorImpl::run(const torch::Tensor& tokens,
                                  const torch::Tensor& positions,
                                  std::vector<KVCache>& kv_caches,
-                                 const ModelInputParams& params) {
+                                 const RecModelParams& params) {
   COUNTER_INC(num_model_execution_total_eager);
   return model_->forward(tokens, positions, kv_caches, params);
 }

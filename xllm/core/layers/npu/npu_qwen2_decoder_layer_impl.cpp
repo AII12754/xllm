@@ -253,15 +253,16 @@ int64_t NpuQwen2DecoderLayerImpl::init_node(
   return atb::NO_ERROR;
 }
 
-torch::Tensor NpuQwen2DecoderLayerImpl::forward(torch::Tensor& x,
-                                                torch::Tensor& cos_pos,
-                                                torch::Tensor& sin_pos,
-                                                torch::Tensor& attn_mask,
-                                                KVCache& kv_cache,
-                                                ModelInputParams& input_params,
-                                                aclrtEvent* event,
-                                                std::atomic<bool>* event_flag,
-                                                int node_id) {
+torch::Tensor NpuQwen2DecoderLayerImpl::forward(
+    torch::Tensor& x,
+    torch::Tensor& cos_pos,
+    torch::Tensor& sin_pos,
+    torch::Tensor& attn_mask,
+    KVCache& kv_cache,
+    NpuDecoderInputView input_params,
+    aclrtEvent* event,
+    std::atomic<bool>* event_flag,
+    int node_id) {
   atb::Status st;
   if (!input_params.meta.batch_forward_type.is_decode()) {
     // mstxRangeId id = mstxRangeStartA("prefill build variant", nullptr);
@@ -301,7 +302,7 @@ void NpuQwen2DecoderLayerImpl::build_node_variant_pack(
     torch::Tensor& sin_pos,
     at::Tensor& attn_mask,
     KVCache& kv_cache,
-    ModelInputParams& input_params,
+    NpuDecoderInputView input_params,
     bool is_prefill) {
   internal_tensors_ = atb_speed::Utils::AtTensor2Tensor(x);
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER) = internal_tensors_;

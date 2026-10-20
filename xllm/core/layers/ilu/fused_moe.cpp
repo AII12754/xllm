@@ -720,7 +720,7 @@ torch::Tensor FusedMoEImpl::forward_experts(const torch::Tensor& hidden_states,
 }
 
 torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
-                                    const ModelInputParams& input_params) {
+                                    const MoeExecutionInput& input_params) {
   // we only support all2all communication for decode stage for now
   bool enable_all2all_communication =
       enable_deep_ep_ && std::all_of(input_params.parallel.dp_is_decode.begin(),

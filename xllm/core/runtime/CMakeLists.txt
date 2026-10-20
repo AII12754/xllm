@@ -20,6 +20,10 @@ cc_library(
     base_executor_impl.h
     rec_executor.h
     rec_executor_impl.h
+    rec_executor_backend.h
+    rec_executor_impl_factory.h
+    graph_input_snapshot.h
+    rec_graph_input.h
     dit_executor.h
     $<$<BOOL:${USE_NPU}>:acl_graph_bucket_policy.h>
     $<$<BOOL:${USE_NPU}>:acl_graph_executor_impl.h>
@@ -65,6 +69,7 @@ cc_library(
     base_executor_impl.cpp
     rec_executor.cpp
     rec_executor_impl.cpp
+    rec_executor_impl_factory.cpp
     vlm_executor_impl.cpp
     dit_executor.cpp
     $<$<BOOL:${USE_NPU}>:acl_graph_executor_impl.cpp>

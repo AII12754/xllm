@@ -20,18 +20,21 @@ limitations under the License.
 
 #include <cstddef>
 #include <optional>
+#include <type_traits>
 
+#include "core/framework/model/causal_lm.h"
+#include "core/framework/model/model_input_params.h"
 #include "core/kv_cache/storage/kv_cache.h"
-#include "executor_impl.h"
-#include "executor_impl_factory.h"
-#include "framework/model/causal_lm.h"
-#include "framework/model/model_input_params.h"
-#include "options.h"
+#include "core/runtime/executor_impl.h"
+#include "core/runtime/executor_impl_factory.h"
+#include "core/runtime/options.h"
+#include "core/runtime/rec_executor_backend.h"
+#include "core/runtime/rec_executor_impl_factory.h"
 
 namespace xllm::mlu {
 // Helper class to hold persistent parameters for graph execution
 // Multiple MluGraph instances can share the same GraphPersistentParam object
-class GraphPersistentParam {
+class GraphPersistentParam final {
  public:
   GraphPersistentParam(const ModelArgs& args,
                        const torch::Device& device,
@@ -39,14 +42,16 @@ class GraphPersistentParam {
 
   ~GraphPersistentParam() = default;
 
-  void init_params(const ModelInputParams& params,
+  template <typename Params>
+  void init_params(const Params& params,
                    uint32_t padding_num_tokens,
                    uint32_t padding_needed);
 
   // Update persistent tensors with new input data
+  template <typename Params>
   void update_input_buffer(const torch::Tensor& tokens,
                            const torch::Tensor& positions,
-                           const ModelInputParams& params,
+                           const Params& params,
                            uint32_t padding_needed);
 
   std::size_t get_persistent_tensor_bytes() const;
@@ -55,6 +60,17 @@ class GraphPersistentParam {
   torch::Tensor tokens_;
   torch::Tensor positions_;
   std::optional<ModelInputParams> params_;
+  std::optional<RecModelParams> rec_params_;
+
+  template <typename Params>
+  Params& capture_params() {
+    if constexpr (std::is_same_v<Params, ModelInputParams>) {
+      return params_.value();
+    } else {
+      static_assert(std::is_same_v<Params, RecModelParams>);
+      return rec_params_.value();
+    }
+  }
   // mrope
   bool use_mrope_ = false;
   // output
@@ -91,7 +107,7 @@ class GraphPersistentParam {
 
 // graph executor using libtorch MLUGraph for memory management
 // MLUGraph provides mempool to manage temporary tensors during forward pass
-class MluGraph {
+class MluGraph final {
  public:
   MluGraph(GraphPersistentParam* persistent_param, uint32_t padding_num_tokens);
 
@@ -99,7 +115,8 @@ class MluGraph {
   // All buckets must capture on the same MLU stream so the caching allocator
   // can reuse scratch freed by earlier captures within the shared mempool;
   // capturing on different streams defeats its per-stream block reuse.
-  void capture(CausalLM* model,
+  template <typename ModelType>
+  void capture(ModelType* model,
                std::vector<KVCache>& kv_cache,
                const torch_mlu::MempoolId_t& pool,
                const torch_mlu::MLUStream& capture_stream,
@@ -107,10 +124,11 @@ class MluGraph {
 
   // Replay captured graph with new input data
   ModelOutput replay();
-  void update_input_buffer(CausalLM* model,
+  template <typename ModelType, typename Params>
+  void update_input_buffer(ModelType* model,
                            const torch::Tensor& tokens,
                            const torch::Tensor& positions,
-                           const ModelInputParams& params,
+                           const Params& params,
                            bool is_init = false);
 
   // Accessor for graph metadata state (used by executor to prepare
@@ -122,7 +140,11 @@ class MluGraph {
   void prepare_model_graph_metadata(CausalLM* model,
                                     const ModelInputParams& params);
 
+  bool matches_graph_input(const ModelInputParams&) const { return true; }
+  bool matches_graph_input(const RecModelParams& params) const;
+
  private:
+  std::optional<RecModelParams> rec_graph_input_;
   // MLUGraph with mempool for managing temporary tensors during forward pass
   torch_mlu::MLUGraph graph_;
 
@@ -138,9 +160,15 @@ class MluGraph {
 
 // Executor implementation using MLU graph optimization
 // Uses MLUGraph mempool to reduce memory allocation overhead during inference
-class MluGraphExecutorImpl : public ExecutorImpl {
+class MluGraphExecutorImpl final : public ExecutorImpl,
+                                   public RecExecutorBackend {
  public:
   MluGraphExecutorImpl(CausalLM* model,
+                       const ModelArgs& args,
+                       const torch::Device& device,
+                       const runtime::Options& options);
+
+  MluGraphExecutorImpl(RecModel* model,
                        const ModelArgs& args,
                        const torch::Device& device,
                        const runtime::Options& options);
@@ -153,15 +181,30 @@ class MluGraphExecutorImpl : public ExecutorImpl {
                   std::vector<KVCache>& kv_caches,
                   const ModelInputParams& params) override;
 
+  ModelOutput run(const torch::Tensor& tokens,
+                  const torch::Tensor& positions,
+                  std::vector<KVCache>& kv_caches,
+                  const RecModelParams& params) override;
+
  private:
-  ModelOutput run_eager(const torch::Tensor& tokens,
+  template <typename ModelType, typename Params>
+  ModelOutput run_impl(ModelType* model,
+                       const torch::Tensor& tokens,
+                       const torch::Tensor& positions,
+                       std::vector<KVCache>& kv_caches,
+                       const Params& params);
+
+  template <typename ModelType, typename Params>
+  ModelOutput run_eager(ModelType* model,
+                        const torch::Tensor& tokens,
                         const torch::Tensor& positions,
                         std::vector<KVCache>& kv_caches,
-                        const ModelInputParams& params);
+                        const Params& params);
   void init_param_once();
   void log_memory_after_capture();
 
-  CausalLM* model_;  // not owned
+  CausalLM* model_;                // not owned
+  RecModel* rec_model_ = nullptr;  // not owned
   ModelArgs args_;
   torch::Device device_;
   runtime::Options options_;
@@ -177,4 +220,5 @@ class MluGraphExecutorImpl : public ExecutorImpl {
   std::unique_ptr<GraphPersistentParam> persistent_param_;
 };
 REGISTER_EXECUTOR("mlu", MluGraphExecutorImpl);
+REGISTER_REC_EXECUTOR("mlu", MluGraphExecutorImpl);
 }  // namespace xllm::mlu

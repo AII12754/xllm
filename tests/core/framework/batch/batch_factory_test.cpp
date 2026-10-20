@@ -272,39 +272,36 @@ TEST(RecModelParamsTest, DeviceConversionPreservesMultiRoundStrategy) {
                            multi_round.decode_positions_tensor_list[0]));
 }
 
-TEST(RecModelParamsTest, BorrowedExecutionViewMutatesNativeOwnedState) {
+TEST(RecModelParamsTest, CloneOwnsHostMetadataAndSharesTensorStorage) {
   RecModelParams owner;
   owner.attention.host.kv_seq_lens = {2, 3};
   owner.embedding.request_ids = {"first", "second"};
   owner.embedding.input_embedding = torch::ones({2, 4});
   auto& strategy = owner.mutable_llmrec_params();
   strategy.full_k_caches = {torch::ones({2, 3, 4})};
-  const auto* original_lengths = owner.attention.host.kv_seq_lens.data();
-  const auto* original_request_ids = owner.embedding.request_ids.data();
-  const void* original_embedding = owner.embedding.input_embedding.data_ptr();
-  const void* original_cache = strategy.full_k_caches[0].data_ptr();
-  {
-    ModelInputParams params(owner);
-    EXPECT_EQ(params.attention.host.kv_seq_lens.data(), original_lengths);
-    EXPECT_EQ(params.embedding.request_ids.data(), original_request_ids);
-    EXPECT_EQ(params.embedding.input_embedding.data_ptr(), original_embedding);
-    EXPECT_EQ(params.llmrec_params()->full_k_caches[0].data_ptr(),
-              original_cache);
-    params.attention.host.kv_seq_lens[1] = 4;
-    params.mutable_llmrec_params().current_round_tensor =
-        torch::tensor({2}, torch::kInt32);
-    params.attn_metadata = std::make_shared<layer::AttentionMetadata>();
-    params.enable_graph = true;
-  }
-  EXPECT_EQ(owner.attention.host.kv_seq_lens, (std::vector<int32_t>{2, 4}));
-  EXPECT_EQ(owner.attention.host.kv_seq_lens.data(), original_lengths);
-  EXPECT_EQ(owner.embedding.request_ids.data(), original_request_ids);
-  EXPECT_EQ(owner.embedding.input_embedding.data_ptr(), original_embedding);
-  EXPECT_EQ(owner.llmrec_params()->full_k_caches[0].data_ptr(), original_cache);
-  EXPECT_TRUE(torch::equal(owner.llmrec_params()->current_round_tensor,
-                           torch::tensor({2}, torch::kInt32)));
-  EXPECT_NE(owner.attn_metadata, nullptr);
-  EXPECT_TRUE(owner.enable_graph);
+  strategy.current_round_tensor = torch::tensor({1}, torch::kInt32);
+  owner.attn_metadata = std::make_shared<layer::AttentionMetadata>();
+
+  auto snapshot = owner.clone();
+  EXPECT_NE(snapshot.attention.host.kv_seq_lens.data(),
+            owner.attention.host.kv_seq_lens.data());
+  EXPECT_NE(snapshot.embedding.request_ids.data(),
+            owner.embedding.request_ids.data());
+  EXPECT_EQ(snapshot.embedding.input_embedding.data_ptr(),
+            owner.embedding.input_embedding.data_ptr());
+  EXPECT_EQ(snapshot.llmrec_params()->full_k_caches[0].data_ptr(),
+            strategy.full_k_caches[0].data_ptr());
+  EXPECT_EQ(snapshot.attn_metadata, owner.attn_metadata);
+
+  snapshot.attention.host.kv_seq_lens[1] = 4;
+  snapshot.embedding.request_ids[0] = "snapshot";
+  snapshot.mutable_llmrec_params().current_round_tensor.fill_(2);
+  EXPECT_EQ(owner.attention.host.kv_seq_lens, (std::vector<int32_t>{2, 3}));
+  EXPECT_EQ(owner.embedding.request_ids[0], "first");
+  EXPECT_EQ(strategy.current_round_tensor.item<int32_t>(), 2);
+
+  snapshot.mutable_llmrec_params().full_k_caches[0] = torch::zeros({2, 3, 4});
+  EXPECT_TRUE(torch::equal(strategy.full_k_caches[0], torch::ones({2, 3, 4})));
 }
 
 TEST(BatchFactoryTest, RecBatchFinishesSequenceAndGroupInputs) {

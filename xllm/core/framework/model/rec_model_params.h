@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <utility>
 
+#include "core/common/macros.h"
 #include "core/framework/model/domain_attention_input.h"
 #include "core/framework/model/rec_strategy_params.h"
 
@@ -132,6 +133,31 @@ class RecModelParams final {
     params.attn_metadata = attn_metadata;
 #endif
     return params;
+  }
+
+  bool synchronize_layer(int64_t layer_idx) const {
+    if (parallel.layer_wise_load_synchronizer == nullptr) {
+      return true;
+    }
+    CHECK_GE(layer_idx, 0) << "Layer index must be non-negative.";
+    if (static_cast<uint64_t>(layer_idx) % parallel.layers_per_event == 0) {
+      return parallel.layer_wise_load_synchronizer->synchronize_layer(
+          layer_idx / parallel.layers_per_event);
+    }
+    return true;
+  }
+
+  bool record_layer(uint32_t layer_idx, const torch::Device& device) const {
+#if defined(USE_MLU) || defined(USE_DCU)
+    if (parallel.layer_synchronizer != nullptr) {
+      return parallel.layer_synchronizer->record_current(layer_idx,
+                                                         device.index());
+    }
+#else
+    (void)layer_idx;
+    (void)device;
+#endif
+    return true;
   }
 
   const OneRecModelInputParams* onerec_params() const {

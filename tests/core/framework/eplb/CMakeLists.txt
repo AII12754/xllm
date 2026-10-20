@@ -95,6 +95,7 @@ cc_test(
   DEPS
     torch
     :eplb
+    :model
     GTest::gtest_main
 )
 target_link_libraries(eplb_executor_test PRIVATE $<$<BOOL:${USE_NPU}>:c_sec>)

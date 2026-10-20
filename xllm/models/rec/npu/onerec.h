@@ -25,7 +25,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "core/framework/model/rec_causal_lm.h"
+#include "core/framework/model/generic_rec.h"
 #include "models/model_registry.h"
 #include "models/rec/npu/onerec_npu_impl.h"
 #include "models/rec/rec_model_base.h"
@@ -48,7 +48,7 @@ class OneRecModelImpl final : public torch::nn::Module {
   ModelOutput forward(const torch::Tensor& tokens,
                       const torch::Tensor& positions,
                       std::vector<KVCache>& kv_caches,
-                      const ModelInputParams& input_params) {
+                      const RecModelParams& input_params) {
     if (!tokens.defined()) {
       return ModelOutput();
     }
@@ -254,10 +254,10 @@ class OneRecModelImpl final : public torch::nn::Module {
 TORCH_MODULE(OneRecModel);
 
 class OneRecForConditionalGenerationImpl final
-    : public RecForCausalLMImplBase<OneRecModel> {
+    : public GenericRecImplBase<OneRecModel> {
  public:
   explicit OneRecForConditionalGenerationImpl(const ModelContext& context)
-      : RecForCausalLMImplBase<OneRecModel>(context) {}
+      : GenericRecImplBase<OneRecModel>(context) {}
 
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "model.") override {
@@ -302,11 +302,11 @@ class OneRecForConditionalGenerationImpl final
 };
 TORCH_MODULE(OneRecForConditionalGeneration);
 
-using OneRecCausalLM = RecCausalLMImpl<OneRecForConditionalGeneration>;
-static_assert(std::is_base_of_v<RecCausalLM, OneRecCausalLM>,
-              "OneRec must satisfy RecCausalLM contract.");
+using OneRecGenericRec = GenericRecImpl<OneRecForConditionalGeneration>;
+static_assert(std::is_base_of_v<GenericRec, OneRecGenericRec>,
+              "OneRec must satisfy GenericRec contract.");
 
-REGISTER_REC_MODEL(onerec, OneRecForConditionalGeneration);
+REGISTER_GENERIC_REC_MODEL(onerec, OneRecForConditionalGeneration);
 
 REGISTER_MODEL_ARGS(onerec, [&] {
   LOAD_ARG_OR(model_type, "model_type", "onerec");

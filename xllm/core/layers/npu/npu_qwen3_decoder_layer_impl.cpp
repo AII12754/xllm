@@ -375,15 +375,17 @@ int64_t NpuQwen3DecoderLayerImpl::init_node(
   return atb::NO_ERROR;
 }
 
-torch::Tensor NpuQwen3DecoderLayerImpl::forward(torch::Tensor& x,
-                                                torch::Tensor& cos_pos,
-                                                torch::Tensor& sin_pos,
-                                                torch::Tensor& attn_mask,
-                                                KVCache& kv_cache,
-                                                ModelInputParams& input_params,
-                                                aclrtEvent* event,
-                                                std::atomic<bool>* event_flag,
-                                                int node_id) {
+torch::Tensor NpuQwen3DecoderLayerImpl::forward_impl(
+    torch::Tensor& x,
+    torch::Tensor& cos_pos,
+    torch::Tensor& sin_pos,
+    torch::Tensor& attn_mask,
+    KVCache& kv_cache,
+    NpuDecoderInputView input_params,
+    aclrtEvent* event,
+    std::atomic<bool>* event_flag,
+    int node_id,
+    const LlmRecMultiRoundParams* llmrec) {
   atb::Status st;
   if (!input_params.meta.batch_forward_type.is_decode()) {
     build_node_variant_pack(prefill_node_,
@@ -395,7 +397,8 @@ torch::Tensor NpuQwen3DecoderLayerImpl::forward(torch::Tensor& x,
                             input_params,
                             /*is_prefill=*/true,
                             node_id,
-                            /*use_graph_decode_input=*/false);
+                            /*use_graph_decode_input=*/false,
+                            llmrec);
     // mstxRangeEnd(id);
     st = execute_node(prefill_node_, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
@@ -403,7 +406,7 @@ torch::Tensor NpuQwen3DecoderLayerImpl::forward(torch::Tensor& x,
   } else {
     const bool use_graph_decode_input =
         ::xllm::ExecutionConfig::get_instance().enable_graph() &&
-        input_params.graph.tiling_data.defined();
+        input_params.tiling_data.defined();
     const bool use_low_latency_decode = use_graph_decode_input &&
                                         enable_optimized_decode_graph_ &&
                                         is_low_latency_decode_bucket(x);
@@ -421,7 +424,8 @@ torch::Tensor NpuQwen3DecoderLayerImpl::forward(torch::Tensor& x,
                             input_params,
                             /*is_prefill=*/false,
                             node_id,
-                            use_graph_decode_input);
+                            use_graph_decode_input,
+                            llmrec);
     st = execute_node(decode_node, node_id + 1000, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
                            << "execute decode layer fail, error code: " << st;
@@ -437,10 +441,11 @@ void NpuQwen3DecoderLayerImpl::build_node_variant_pack(
     torch::Tensor& sin_pos,
     at::Tensor& attn_mask,
     KVCache& kv_cache,
-    ModelInputParams& input_params,
+    NpuDecoderInputView input_params,
     bool is_prefill,
     int node_id,
-    bool use_graph_decode_input) {
+    bool use_graph_decode_input,
+    const LlmRecMultiRoundParams* llmrec) {
   internal_tensors_ = atb_speed::Utils::AtTensor2Tensor(x);
   if (::xllm::KernelConfig::get_instance().enable_interlayer_addnorm() &&
       residual_.defined()) {
@@ -467,9 +472,7 @@ void NpuQwen3DecoderLayerImpl::build_node_variant_pack(
           input_params.attention.device.block_tables);
 
   int input_idx = WEIGHT_COUNT_PER_LAYER + 11;
-  if (is_rec_multi_round_mode()) {
-    const auto* llmrec = input_params.llmrec_params();
-
+  if (llmrec != nullptr) {
     if (is_prefill) {
       node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 4) =
           atb_speed::Utils::AtTensor2Tensor(kv_cache.get_k_cache());
@@ -519,9 +522,9 @@ void NpuQwen3DecoderLayerImpl::build_node_variant_pack(
   }
 
   if (!is_prefill && use_graph_decode_input &&
-      input_params.graph.tiling_data.defined()) {
+      input_params.tiling_data.defined()) {
     node.variantPack.inTensors.at(input_idx++) =
-        atb_speed::Utils::AtTensor2Tensor(input_params.graph.tiling_data);
+        atb_speed::Utils::AtTensor2Tensor(input_params.tiling_data);
   }
 
   for (size_t i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
