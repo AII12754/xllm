@@ -952,6 +952,22 @@ struct TopKPParams {
   torch::Tensor top_p;
 };
 
+// In-place temperature, min-p, top-k and top-p transforms.
+struct FusedLogitsTransformParams {
+  // [batch_size, vocab_size] FP32, FP16 or BF16 tensor. Columns must be
+  // contiguous and rows must not overlap. Modified in place.
+  torch::Tensor logits;
+  // Optional contiguous device vectors with one entry per row. Floating
+  // parameters may be FP32, FP16 or BF16, independently of logits.
+  torch::Tensor temperatures;
+  torch::Tensor min_p;
+  // Optional int64 device vector with one entry per row.
+  torch::Tensor top_k;
+  torch::Tensor top_p;
+  // Return FP32 softmax probabilities in addition to updating logits.
+  bool return_probs = false;
+};
+
 // Random sample parameters
 struct RandomSampleParams {
   // Input tensor of probabilities for sampling.

@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/sampling/logits_utils.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/kernels/cuda/fused_logits_transform.h"
+#include "core/kernels/ops_api.h"
 
 namespace xllm {
 namespace {
@@ -65,13 +66,15 @@ void expect_transform(const torch::Tensor& input,
                       const SamplingParameters& params) {
   auto expected = reference_transform(input.clone(), params);
   auto actual = input.clone();
-  const auto probabilities = kernel::cuda::fused_logits_transform(
+  kernel::FusedLogitsTransformParams transform_params{
       actual,
       params.temperatures,
       params.min_p,
       params.top_k,
       effective_top_p(params, input.scalar_type()),
-      /*return_probs=*/true);
+      /*return_probs=*/true};
+  ASSERT_TRUE(kernel::supports_fused_logits_transform(transform_params));
+  const auto probabilities = kernel::fused_logits_transform(transform_params);
   ASSERT_TRUE(torch::equal(torch::isfinite(actual), torch::isfinite(expected)));
   EXPECT_TRUE(torch::allclose(actual, expected, 1e-5, 1e-6));
   EXPECT_TRUE(torch::allclose(probabilities,
@@ -88,6 +91,36 @@ void expect_transform(const torch::Tensor& input,
   EXPECT_TRUE(
       torch::equal(torch::isfinite(logits_only), torch::isfinite(expected)));
   EXPECT_TRUE(torch::allclose(logits_only, expected, 1e-5, 1e-6));
+}
+
+TEST(CudaLogitsTransformTest, CapabilityCheckRejectsUnsupportedInputs) {
+  kernel::FusedLogitsTransformParams params;
+  EXPECT_FALSE(kernel::supports_fused_logits_transform(params));
+  params.logits = torch::ones({2, 8});
+  EXPECT_FALSE(kernel::supports_fused_logits_transform(params));
+  params.logits = params.logits.to(torch::kCUDA);
+  const auto original = params.logits.clone();
+  EXPECT_TRUE(kernel::supports_fused_logits_transform(params));
+
+  params.temperatures = torch::ones({2});
+  EXPECT_FALSE(kernel::supports_fused_logits_transform(params));
+  params.temperatures = torch::ones({1}, params.logits.options());
+  EXPECT_FALSE(kernel::supports_fused_logits_transform(params));
+  params.temperatures =
+      torch::ones({2}, params.logits.options().dtype(torch::kFloat64));
+  EXPECT_FALSE(kernel::supports_fused_logits_transform(params));
+  params.temperatures =
+      torch::ones({4}, params.logits.options()).slice(0, 0, 4, 2);
+  EXPECT_FALSE(kernel::supports_fused_logits_transform(params));
+  params.temperatures = torch::Tensor();
+  params.top_k = torch::ones({2}, params.logits.options().dtype(torch::kInt32));
+  EXPECT_FALSE(kernel::supports_fused_logits_transform(params));
+  params.top_k = params.top_k.to(torch::kInt64);
+  EXPECT_TRUE(kernel::supports_fused_logits_transform(params));
+  EXPECT_TRUE(torch::equal(params.logits, original));
+
+  params.logits = params.logits.slice(1, 0, 8, 2);
+  EXPECT_FALSE(kernel::supports_fused_logits_transform(params));
 }
 
 TEST(CudaLogitsTransformTest, MatchesReferenceAcrossShapesAndMixedParameters) {

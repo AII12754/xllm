@@ -32,31 +32,10 @@ limitations under the License.
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/sampling/logits_utils.h"
 #include "core/framework/sampling/sampling_params.h"
-
-#if defined(USE_CUDA) && !defined(USE_MACA)
-#include "core/kernels/cuda/fused_logits_transform.h"
-#endif
+#include "core/kernels/ops_api.h"
 
 namespace xllm {
 namespace {
-
-#if defined(USE_CUDA) && !defined(USE_MACA)
-bool supports_fused_parameter(const torch::Tensor& parameter,
-                              const torch::Tensor& logits,
-                              bool is_top_k) {
-  if (!parameter.defined()) {
-    return true;
-  }
-  if (parameter.device() != logits.device() || parameter.dim() != 1 ||
-      parameter.size(0) != logits.size(0) || !parameter.is_contiguous()) {
-    return false;
-  }
-  const torch::ScalarType dtype = parameter.scalar_type();
-  return is_top_k ? dtype == torch::kInt64
-                  : dtype == torch::kFloat32 || dtype == torch::kFloat16 ||
-                        dtype == torch::kBFloat16;
-}
-#endif
 
 uint64_t sampling_seed(int64_t seed, int64_t offset) {
   uint64_t value = static_cast<uint64_t>(seed) +
@@ -156,31 +135,20 @@ torch::Tensor process_logits_impl(torch::Tensor& logits,
     // Native top-k/top-p consumes top-p in the logits dtype.
     top_p = top_p.to(logits.scalar_type());
   }
-#if defined(USE_CUDA) && !defined(USE_MACA)
   const bool has_transforms = params.temperatures.defined() ||
                               params.min_p.defined() ||
                               params.top_k.defined() || top_p.defined();
-  if (has_transforms && logits.is_cuda() && logits.dim() == 2 &&
-      logits.size(0) <= std::numeric_limits<int32_t>::max() &&
-      logits.size(1) > 0 &&
-      logits.size(1) <= std::numeric_limits<int32_t>::max() &&
-      (logits.scalar_type() == torch::kFloat32 ||
-       logits.scalar_type() == torch::kFloat16 ||
-       logits.scalar_type() == torch::kBFloat16) &&
-      logits.stride(1) == 1 && logits.stride(0) >= logits.size(1) &&
-      supports_fused_parameter(
-          params.temperatures, logits, /*is_top_k=*/false) &&
-      supports_fused_parameter(params.min_p, logits, /*is_top_k=*/false) &&
-      supports_fused_parameter(params.top_k, logits, /*is_top_k=*/true) &&
-      supports_fused_parameter(top_p, logits, /*is_top_k=*/false)) {
-    return kernel::cuda::fused_logits_transform(logits,
-                                                params.temperatures,
-                                                params.min_p,
-                                                params.top_k,
-                                                top_p,
-                                                return_probs);
+  if (has_transforms) {
+    kernel::FusedLogitsTransformParams transform_params{logits,
+                                                        params.temperatures,
+                                                        params.min_p,
+                                                        params.top_k,
+                                                        top_p,
+                                                        return_probs};
+    if (kernel::supports_fused_logits_transform(transform_params)) {
+      return kernel::fused_logits_transform(transform_params);
+    }
   }
-#endif
   if (params.temperatures.defined()) {
     apply_temperatures(logits, params.temperatures);
   }

@@ -38,14 +38,36 @@ limitations under the License.
 #endif
 
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 #include "common/macros.h"
+#if defined(USE_CUDA) && !defined(USE_MACA)
+#include "core/kernels/cuda/fused_logits_transform.h"
+#endif
 #include "layers/common/attention_metadata.h"
 
 namespace xllm::kernel {
 
 namespace {
+#if defined(USE_CUDA) && !defined(USE_MACA)
+bool supports_fused_parameter(const torch::Tensor& parameter,
+                              const torch::Tensor& logits,
+                              bool is_top_k) {
+  if (!parameter.defined()) {
+    return true;
+  }
+  if (parameter.device() != logits.device() || parameter.dim() != 1 ||
+      parameter.size(0) != logits.size(0) || !parameter.is_contiguous()) {
+    return false;
+  }
+  const torch::ScalarType dtype = parameter.scalar_type();
+  return is_top_k ? dtype == torch::kInt64
+                  : dtype == torch::kFloat32 || dtype == torch::kFloat16 ||
+                        dtype == torch::kBFloat16;
+}
+#endif
+
 #if defined(USE_NPU)
 bool is_supported_initial_state_dtype(torch::ScalarType dtype) {
   return dtype == torch::kBFloat16 || dtype == torch::kFloat32;
@@ -895,6 +917,40 @@ torch::Tensor apply_top_k_top_p(TopKPParams& params) {
 #if defined(USE_MLU)
   return mlu::apply_top_k_top_p(
       params.logits, params.temperatures, params.top_k, params.top_p);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+bool supports_fused_logits_transform(const FusedLogitsTransformParams& params) {
+#if defined(USE_CUDA) && !defined(USE_MACA)
+  const auto& logits = params.logits;
+  return logits.defined() && logits.is_cuda() && logits.dim() == 2 &&
+         logits.size(0) <= std::numeric_limits<int32_t>::max() &&
+         logits.size(1) > 0 &&
+         logits.size(1) <= std::numeric_limits<int32_t>::max() &&
+         (logits.scalar_type() == torch::kFloat32 ||
+          logits.scalar_type() == torch::kFloat16 ||
+          logits.scalar_type() == torch::kBFloat16) &&
+         logits.stride(1) == 1 && logits.stride(0) >= logits.size(1) &&
+         supports_fused_parameter(
+             params.temperatures, logits, /*is_top_k=*/false) &&
+         supports_fused_parameter(params.min_p, logits, /*is_top_k=*/false) &&
+         supports_fused_parameter(params.top_k, logits, /*is_top_k=*/true) &&
+         supports_fused_parameter(params.top_p, logits, /*is_top_k=*/false);
+#else
+  return false;
+#endif
+}
+
+torch::Tensor fused_logits_transform(FusedLogitsTransformParams& params) {
+#if defined(USE_CUDA) && !defined(USE_MACA)
+  return cuda::fused_logits_transform(params.logits,
+                                      params.temperatures,
+                                      params.min_p,
+                                      params.top_k,
+                                      params.top_p,
+                                      params.return_probs);
 #else
   NOT_IMPLEMENTED();
 #endif
