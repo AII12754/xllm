@@ -33,8 +33,30 @@ limitations under the License.
 #include "core/framework/sampling/logits_utils.h"
 #include "core/framework/sampling/sampling_params.h"
 
+#if defined(USE_CUDA) && !defined(USE_MACA)
+#include "core/kernels/cuda/fused_logits_transform.h"
+#endif
+
 namespace xllm {
 namespace {
+
+#if defined(USE_CUDA) && !defined(USE_MACA)
+bool supports_fused_parameter(const torch::Tensor& parameter,
+                              const torch::Tensor& logits,
+                              bool is_top_k) {
+  if (!parameter.defined()) {
+    return true;
+  }
+  if (parameter.device() != logits.device() || parameter.dim() != 1 ||
+      parameter.size(0) != logits.size(0) || !parameter.is_contiguous()) {
+    return false;
+  }
+  const torch::ScalarType dtype = parameter.scalar_type();
+  return is_top_k ? dtype == torch::kInt64
+                  : dtype == torch::kFloat32 || dtype == torch::kFloat16 ||
+                        dtype == torch::kBFloat16;
+}
+#endif
 
 uint64_t sampling_seed(int64_t seed, int64_t offset) {
   uint64_t value = static_cast<uint64_t>(seed) +
@@ -95,12 +117,15 @@ void Sampler::apply_sampling_penalties(torch::Tensor& logits,
   }
 }
 
-void Sampler::process_logits(torch::Tensor& logits,
-                             const SamplingParameters& params,
-                             const torch::Tensor& filter_mask) {
+namespace {
+
+torch::Tensor process_logits_impl(torch::Tensor& logits,
+                                  const SamplingParameters& params,
+                                  const torch::Tensor& filter_mask,
+                                  bool return_probs) {
   const torch::Tensor& effective_filter_mask =
       filter_mask.defined() ? filter_mask : params.filter_mask;
-  apply_sampling_penalties(logits, params);
+  Sampler::apply_sampling_penalties(logits, params);
 
   // Penalties, logits_bias, and the filter masks can move the argmax, so
   // they always run. Temperature, min-p, top-k, and top-p are argmax
@@ -123,7 +148,7 @@ void Sampler::process_logits(torch::Tensor& logits,
   }
   if (params.sampling_mode == SamplingMode::GREEDY && !params.logprobs &&
       !params.return_logits) {
-    return;
+    return {};
   }
 
   torch::Tensor top_p = params.top_p;
@@ -131,11 +156,45 @@ void Sampler::process_logits(torch::Tensor& logits,
     // Native top-k/top-p consumes top-p in the logits dtype.
     top_p = top_p.to(logits.scalar_type());
   }
+#if defined(USE_CUDA) && !defined(USE_MACA)
+  const bool has_transforms = params.temperatures.defined() ||
+                              params.min_p.defined() ||
+                              params.top_k.defined() || top_p.defined();
+  if (has_transforms && logits.is_cuda() && logits.dim() == 2 &&
+      logits.size(0) <= std::numeric_limits<int32_t>::max() &&
+      logits.size(1) > 0 &&
+      logits.size(1) <= std::numeric_limits<int32_t>::max() &&
+      (logits.scalar_type() == torch::kFloat32 ||
+       logits.scalar_type() == torch::kFloat16 ||
+       logits.scalar_type() == torch::kBFloat16) &&
+      logits.stride(1) == 1 && logits.stride(0) >= logits.size(1) &&
+      supports_fused_parameter(
+          params.temperatures, logits, /*is_top_k=*/false) &&
+      supports_fused_parameter(params.min_p, logits, /*is_top_k=*/false) &&
+      supports_fused_parameter(params.top_k, logits, /*is_top_k=*/true) &&
+      supports_fused_parameter(top_p, logits, /*is_top_k=*/false)) {
+    return kernel::cuda::fused_logits_transform(logits,
+                                                params.temperatures,
+                                                params.min_p,
+                                                params.top_k,
+                                                top_p,
+                                                return_probs);
+  }
+#endif
   if (params.temperatures.defined()) {
     apply_temperatures(logits, params.temperatures);
   }
   apply_min_p(logits, params.min_p);
   apply_top_k_top_p(logits, torch::Tensor(), params.top_k, top_p);
+  return {};
+}
+
+}  // namespace
+
+void Sampler::process_logits(torch::Tensor& logits,
+                             const SamplingParameters& params,
+                             const torch::Tensor& filter_mask) {
+  process_logits_impl(logits, params, filter_mask, /*return_probs=*/false);
 }
 
 SampleOutput Sampler::forward(torch::Tensor& logits,
@@ -148,7 +207,11 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
           ? torch::log_softmax(logits, /*dim=*/-1, torch::kFloat32)
           : torch::Tensor();
 
-  process_logits(logits, params, filter_mask);
+  torch::Tensor probs = process_logits_impl(
+      logits,
+      params,
+      filter_mask,
+      /*return_probs=*/params.sampling_mode != SamplingMode::GREEDY);
 
   // Keep the model dtype; consumers upcast where the reduction needs fp32.
   if (params.return_logits) {
@@ -172,8 +235,7 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
       params.seeds.defined() && params.sampling_mode != SamplingMode::GREEDY;
   const bool need_probs = params.sampling_mode == SamplingMode::RANDOM ||
                           params.sampling_mode == SamplingMode::MIXED;
-  torch::Tensor probs;
-  if (need_probs) {
+  if (need_probs && !probs.defined()) {
     probs = torch::softmax(logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
   }
   torch::Tensor samples;

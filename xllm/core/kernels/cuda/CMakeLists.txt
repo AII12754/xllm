@@ -22,6 +22,7 @@ set(CUDA_HEADER_FILES
   cutlass_w8a8/c3x/scaled_mm_sm120_fp8_dispatch.cuh
   cutlass_w8a8/c3x/scaled_mm_sm90_fp8_dispatch.cuh
   fp8_quant_utils.cuh
+  fused_logits_transform.h
   global_capture_instance.h
   llm_decode_metadata_update.h
   piecewise_graphs.h
@@ -129,6 +130,7 @@ set(CUDA_SOURCE_FILES
   fp8_quant.cu
   fp8_scaled_matmul.cpp
   fp8_scaled_quantize.cpp
+  fused_logits_transform.cu
   fused_qknorm_rope.cu
   global_capture_instance.cpp
   llm_decode_metadata_update.cu
@@ -149,6 +151,17 @@ set(CUDA_SOURCE_FILES
   moe/moe_fused_topk.cu
   moe/fused_moe.cpp
 )
+
+if(USE_MACA)
+  list(REMOVE_ITEM CUDA_SOURCE_FILES fused_logits_transform.cu)
+  list(REMOVE_ITEM CUDA_HEADER_FILES fused_logits_transform.h)
+else()
+  # Sampling boundaries must preserve subnormal logits and temperatures even
+  # though other CUDA kernels use fast math.
+  set_source_files_properties(fused_logits_transform.cu PROPERTIES
+    COMPILE_OPTIONS "--ftz=false"
+  )
+endif()
 
 cc_library(
   NAME

@@ -35,10 +35,15 @@ target_link_libraries(sampler_test
                       $<$<BOOL:${USE_NPU}>:nnopbase>)
 add_dependencies(sampler_test brpc-static)
 
+set(SAMPLER_CONTROLS_DEVICE_TEST_SRCS)
+if(USE_CUDA AND NOT USE_MACA)
+  list(APPEND SAMPLER_CONTROLS_DEVICE_TEST_SRCS cuda_logits_transform_test.cpp)
+endif()
+
 cc_test(
   NAME sampler_controls_test
   NO_NPU_RUNTIME
-  SRCS logits_utils_test.cpp sampler_controls_test.cpp
+  SRCS logits_utils_test.cpp sampler_controls_test.cpp ${SAMPLER_CONTROLS_DEVICE_TEST_SRCS}
   DEPS absl::strings GTest::gtest_main :config :sampler glog::glog :state_dict
 )
 target_link_libraries(sampler_controls_test PRIVATE
