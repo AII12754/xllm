@@ -384,6 +384,8 @@ engine 从正常回收的结果统计逐位置前缀接受概率
 | `enable_aclnn_matmul` | `bool` | `false` | 是否为支持的 NPU ATB layer 启用 ACLNN matmul 后端。 |
 | `enable_aclnn_swiglu` | `bool` | `false` | 是否为支持的 NPU ATB layer 启用 ACLNN SwiGLU 后端。 |
 | `enable_dspark_native_sas` | `bool` | `false` | 启用 NPU DSpark 原生 SparseAttnSharedkv 语义。旧版算子若不接受非空 `ori_sparse_indices`，可能在 tiling 阶段终止进程；请保持关闭以使用 q_len=1 兼容模式。 |
+| `enable_qwen35_gdn_packed_prefill` | `bool` | `true` | 普通和分块 Qwen3.5 GDN Prefill 投影保持 packed 布局；设置为 `false` 恢复原有布局。Decode 和推测验证使用原有布局。 |
+| `qwen35_gdn_prefill_projection` | `string` | `grouped` | NPU Qwen3.5 GDN Prefill 投影策略：`separate` 或 `grouped`。Grouped 对非量化 BF16 权重使用四个独立矩阵乘，输出连续的 QKV/Z/B/A；量化或其他权重类型保留独立投影。设置为 `separate` 可单独关闭分组，与 packed prefill 开关独立。Decode 和推测验证保留原有投影。性能取决于设备、TP 数和负载。 |
 
 ## DiTConfig
 

@@ -17,12 +17,14 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
 
-#include "qwen3_next_gated_delta_net.h"
+#include "core/layers/npu_torch/qwen3_5_gdn_projection.h"
+#include "core/layers/npu_torch/qwen3_next_gated_delta_net.h"
 
 namespace xllm {
 namespace layer {
@@ -64,6 +66,9 @@ class Qwen3_5GatedDeltaNetImpl : public Qwen3NextGatedDeltaNetImpl {
   void verify_projection_weights(const std::string& prefix) const override;
 
  private:
+  bool enable_packed_prefill_ = false;
+  GdnProjectionMode prefill_projection_mode_ = GdnProjectionMode::SEPARATE;
+  std::unique_ptr<GdnPrefillProjection> prefill_projection_;
   ColumnParallelLinear in_proj_qkv_{nullptr};
   ColumnParallelLinear in_proj_z_{nullptr};
   ColumnParallelLinear in_proj_b_{nullptr};

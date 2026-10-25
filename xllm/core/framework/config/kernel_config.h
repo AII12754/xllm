@@ -50,6 +50,8 @@ class KernelConfig final {
          "enable_aclnn_swiglu",
          "enable_mega_moe",
          "enable_dspark_native_sas",
+         "enable_qwen35_gdn_packed_prefill",
+         "qwen35_gdn_prefill_projection",
          "enable_flashcomm1",
          "flashcomm1_min_prefill_tokens",
          "enable_mmrs_fusion",
@@ -77,6 +79,10 @@ class KernelConfig final {
   PROPERTY(bool, enable_mega_moe) = false;
 
   PROPERTY(bool, enable_dspark_native_sas) = false;
+
+  PROPERTY(bool, enable_qwen35_gdn_packed_prefill) = true;
+
+  PROPERTY(std::string, qwen35_gdn_prefill_projection) = "grouped";
 
   PROPERTY(bool, enable_flashcomm1) = false;
 

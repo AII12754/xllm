@@ -431,6 +431,8 @@ DECLARE_bool(enable_aclnn_swiglu);
 
 DECLARE_bool(enable_dspark_native_sas);
 
+DECLARE_bool(enable_qwen35_gdn_packed_prefill);
+DECLARE_string(qwen35_gdn_prefill_projection);
 DECLARE_bool(enable_flashcomm1);
 
 DECLARE_int32(flashcomm1_min_prefill_tokens);

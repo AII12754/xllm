@@ -375,6 +375,71 @@ TEST(ExecutionConfigTest, AttnDpCommandLineFlagOverridesJson) {
   EXPECT_TRUE(execution_config.enable_attn_dp_weight_sharding());
 }
 
+#if defined(USE_NPU)
+TEST(KernelConfigTest, GdnProjectionOptionsDefaultOnAndOmitDefaultValues) {
+  google::FlagSaver flag_saver;
+  KernelConfig defaults;
+  EXPECT_TRUE(defaults.enable_qwen35_gdn_packed_prefill());
+  EXPECT_EQ(defaults.qwen35_gdn_prefill_projection(), "grouped");
+  defaults.from_flags();
+  EXPECT_TRUE(defaults.enable_qwen35_gdn_packed_prefill());
+  EXPECT_EQ(defaults.qwen35_gdn_prefill_projection(), "grouped");
+  nlohmann::ordered_json serialized = nlohmann::ordered_json::object();
+  defaults.append_config_json(serialized);
+  EXPECT_FALSE(serialized.contains("enable_qwen35_gdn_packed_prefill"));
+  EXPECT_FALSE(serialized.contains("qwen35_gdn_prefill_projection"));
+}
+
+TEST(KernelConfigTest, GdnProjectionOptionsDisableRoundTrip) {
+  google::FlagSaver flag_saver;
+  nlohmann::ordered_json serialized = nlohmann::ordered_json::object();
+  {
+    // from_json writes back to gflags. Restore that state before simulating
+    // another configuration load so it cannot masquerade as a CLI override.
+    google::FlagSaver json_flag_saver;
+    KernelConfig defaults;
+    const JsonReader json = config::parse_json_string(
+        R"json({"enable_qwen35_gdn_packed_prefill":false,"qwen35_gdn_prefill_projection":"separate"})json");
+    defaults.from_json(json);
+    EXPECT_FALSE(defaults.enable_qwen35_gdn_packed_prefill());
+    EXPECT_EQ(defaults.qwen35_gdn_prefill_projection(), "separate");
+    defaults.append_config_json(serialized);
+    EXPECT_EQ(serialized.at("enable_qwen35_gdn_packed_prefill"), false);
+    EXPECT_EQ(serialized.at("qwen35_gdn_prefill_projection"), "separate");
+  }
+  KernelConfig restored;
+  restored.from_json(config::parse_json_string(serialized.dump()));
+  EXPECT_FALSE(restored.enable_qwen35_gdn_packed_prefill());
+  EXPECT_EQ(restored.qwen35_gdn_prefill_projection(), "separate");
+}
+
+TEST(KernelConfigTest, GdnProjectionExplicitDisableFlagsOverrideJson) {
+  google::FlagSaver flag_saver;
+  google::SetCommandLineOption("enable_qwen35_gdn_packed_prefill", "false");
+  google::SetCommandLineOption("qwen35_gdn_prefill_projection", "separate");
+  KernelConfig defaults;
+  defaults.from_flags();
+  const JsonReader json = config::parse_json_string(
+      R"json({"enable_qwen35_gdn_packed_prefill":true,"qwen35_gdn_prefill_projection":"grouped"})json");
+  defaults.from_json(json);
+  EXPECT_FALSE(defaults.enable_qwen35_gdn_packed_prefill());
+  EXPECT_EQ(defaults.qwen35_gdn_prefill_projection(), "separate");
+}
+
+TEST(KernelConfigTest, GdnProjectionExplicitEnableFlagsOverrideJson) {
+  google::FlagSaver flag_saver;
+  google::SetCommandLineOption("enable_qwen35_gdn_packed_prefill", "true");
+  google::SetCommandLineOption("qwen35_gdn_prefill_projection", "grouped");
+  KernelConfig defaults;
+  defaults.from_flags();
+  const JsonReader json = config::parse_json_string(
+      R"json({"enable_qwen35_gdn_packed_prefill":false,"qwen35_gdn_prefill_projection":"separate"})json");
+  defaults.from_json(json);
+  EXPECT_TRUE(defaults.enable_qwen35_gdn_packed_prefill());
+  EXPECT_EQ(defaults.qwen35_gdn_prefill_projection(), "grouped");
+}
+#endif
+
 #if !defined(USE_NPU)
 TEST(KernelConfigTest, RejectsNpuOnlyDsparkNativeSas) {
   JsonReader json_config =

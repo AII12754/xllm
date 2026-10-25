@@ -10,7 +10,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "qwen3_5_gated_delta_net.h"
+#include "core/layers/npu_torch/qwen3_5_gated_delta_net.h"
 
 #include <glog/logging.h>
 #include <torch/torch.h>
@@ -21,8 +21,10 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
+#include "core/framework/config/kernel_config.h"
 #include "core/kernels/npu/xllm_ops/mega_gdn_constants.h"
 #include "core/kernels/ops_api.h"
+#include "core/layers/npu_torch/qwen3_5_gdn_prefill_layout.h"
 #include "core/util/tensor_helper.h"
 #include "core/util/utils.h"
 
@@ -257,6 +259,18 @@ Qwen3_5GatedDeltaNetImpl::Qwen3_5GatedDeltaNetImpl(
                                  parallel_args,
                                  options,
                                  /*init_projections=*/false) {
+  const auto& kernel_config = KernelConfig::get_instance();
+  enable_packed_prefill_ = kernel_config.enable_qwen35_gdn_packed_prefill();
+  prefill_projection_mode_ =
+      resolve_gdn_projection_mode(kernel_config.qwen35_gdn_prefill_projection(),
+                                  quant_args,
+                                  options.dtype().toScalarType());
+  if (kernel_config.qwen35_gdn_prefill_projection() == "grouped" &&
+      prefill_projection_mode_ == GdnProjectionMode::SEPARATE) {
+    LOG_FIRST_N(INFO, 1)
+        << "Using separate Qwen3.5 GDN prefill projections: grouped "
+           "projections require unquantized BF16 weights.";
+  }
   CHECK_EQ(num_k_heads_ % tp_size_, 0)
       << "MegaGdn operators require key heads divisible by TP size.";
   CHECK_EQ(num_v_heads_ % tp_size_, 0)
@@ -325,14 +339,63 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
   const bool is_any_prefill =
       attn_metadata.is_prefill || attn_metadata.is_chunked_prefill;
 
-  auto split_inputs =
-      project_split_inputs(gathered_hidden_states, attn_metadata);
-  CHECK(split_inputs.has_value())
-      << "Qwen3.5 requires separate qkv, z, b, and a projections.";
-  auto [mixed_qkv, z, b, a] = split_inputs.value();
-  const int64_t batch_size = mixed_qkv.size(0);
-  const int64_t sequence_length = mixed_qkv.size(1);
-
+  const bool packed_prefill =
+      use_packed_gdn_prefill(enable_packed_prefill_,
+                             attn_metadata.is_prefill,
+                             attn_metadata.is_chunked_prefill,
+                             use_spec_verify);
+  if (packed_prefill) {
+    CHECK(!attn_metadata.q_seq_lens_vec.empty())
+        << "Packed GDN prefill requires host query lengths.";
+    int64_t packed_tokens = 0;
+    for (const int32_t query_length : attn_metadata.q_seq_lens_vec) {
+      CHECK_GT(query_length, 0);
+      CHECK_LE(query_length, attn_metadata.max_query_len);
+      packed_tokens += query_length;
+    }
+    CHECK_EQ(packed_tokens, original_num_tokens)
+        << "Packed GDN prefill input does not match host query lengths.";
+  }
+  const bool optimized_projection =
+      !use_spec_verify && is_any_prefill &&
+      prefill_projection_mode_ != GdnProjectionMode::SEPARATE;
+  torch::Tensor mixed_qkv, z, b, a;
+  if (packed_prefill || optimized_projection) {
+    GdnProjectionTensors projected;
+    if (prefill_projection_) {
+      projected = prefill_projection_->forward(gathered_hidden_states);
+    } else {
+      CHECK(!optimized_projection) << "Prefill projection weights not prepared";
+      projected = {in_proj_qkv_->forward(gathered_hidden_states),
+                   in_proj_z_->forward(gathered_hidden_states),
+                   in_proj_b_->forward(gathered_hidden_states),
+                   in_proj_a_->forward(gathered_hidden_states)};
+    }
+    if (packed_prefill) {
+      mixed_qkv = projected[0];
+      z = projected[1].view(
+          {original_num_tokens, num_v_heads_ / tp_size_, head_v_dim_});
+      b = projected[2];
+      a = projected[3];
+    } else {
+      mixed_qkv =
+          reshape_projected_tokens_with_pad(attn_metadata, projected[0]);
+      z = reshape_projected_tokens_with_pad(attn_metadata, projected[1]);
+      z = z.view({z.size(0), z.size(1), num_v_heads_ / tp_size_, head_v_dim_});
+      b = reshape_projected_tokens_with_pad(attn_metadata, projected[2]);
+      a = reshape_projected_tokens_with_pad(attn_metadata, projected[3]);
+    }
+  } else {
+    auto split_inputs =
+        project_split_inputs(gathered_hidden_states, attn_metadata);
+    CHECK(split_inputs.has_value());
+    std::tie(mixed_qkv, z, b, a) = split_inputs.value();
+  }
+  const int64_t batch_size =
+      packed_prefill ? static_cast<int64_t>(attn_metadata.q_seq_lens_vec.size())
+                     : mixed_qkv.size(0);
+  const int64_t sequence_length =
+      packed_prefill ? attn_metadata.max_query_len : mixed_qkv.size(1);
   CHECK_GT(batch_size, 0) << "GDN batch size must be positive.";
   CHECK_GT(sequence_length, 0) << "GDN sequence length must be positive.";
   const int64_t local_value_heads = num_v_heads_ / tp_size_;
@@ -343,24 +406,26 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
   torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
   torch::Tensor conv_weight = conv1d_->weight();
 
-  check_tensor(mixed_qkv, "mixed_qkv", torch::kBFloat16, 3, device);
-  check_tensor(z, "z", torch::kBFloat16, 4, device);
-  check_tensor(b, "b", torch::kBFloat16, 3, device);
-  check_tensor(a, "a", torch::kBFloat16, 3, device);
+  check_tensor(
+      mixed_qkv, "mixed_qkv", torch::kBFloat16, packed_prefill ? 2 : 3, device);
+  check_tensor(z, "z", torch::kBFloat16, packed_prefill ? 3 : 4, device);
+  check_tensor(b, "b", torch::kBFloat16, packed_prefill ? 2 : 3, device);
+  check_tensor(a, "a", torch::kBFloat16, packed_prefill ? 2 : 3, device);
   check_tensor(conv_weight, "conv_weight", torch::kBFloat16, 2, device);
   check_tensor(conv_cache, "conv_cache", torch::kBFloat16, 3, device);
   check_tensor(ssm_cache, "ssm_cache", torch::kFloat32, 4, device);
   check_tensor(A_log_, "A_log", torch::kFloat32, 1, device);
   check_tensor(dt_bias_, "dt_bias", torch::kFloat32, 1, device);
   check_tensor(norm_->weight(), "norm_weight", torch::kBFloat16, 1, device);
-  CHECK_EQ(mixed_qkv.size(2), local_conv_dim)
-      << "mixed_qkv channel count does not match the model geometry.";
-  CHECK_EQ(z.size(0), batch_size);
-  CHECK_EQ(z.size(1), sequence_length);
-  CHECK_EQ(b.size(0), batch_size);
-  CHECK_EQ(b.size(1), sequence_length);
-  CHECK_EQ(a.size(0), batch_size);
-  CHECK_EQ(a.size(1), sequence_length);
+  CHECK_EQ(mixed_qkv.size(-1), local_conv_dim);
+  CHECK_EQ(z.size(0), mixed_qkv.size(0));
+  CHECK_EQ(b.size(0), mixed_qkv.size(0));
+  CHECK_EQ(a.size(0), mixed_qkv.size(0));
+  if (!packed_prefill) {
+    CHECK_EQ(z.size(1), sequence_length);
+    CHECK_EQ(b.size(1), sequence_length);
+    CHECK_EQ(a.size(1), sequence_length);
+  }
   CHECK_EQ(conv_weight.size(0), conv_kernel_size_)
       << "conv weight kernel width does not match the model configuration.";
   CHECK_EQ(conv_weight.size(1), local_conv_dim)
@@ -373,10 +438,10 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
       << "SSM cache key dimension does not match the model geometry.";
   CHECK_EQ(ssm_cache.size(3), head_v_dim_)
       << "SSM cache value dimension does not match the model geometry.";
-  CHECK_EQ(z.size(2), local_value_heads);
-  CHECK_EQ(z.size(3), head_v_dim_);
-  CHECK_EQ(b.size(2), local_value_heads);
-  CHECK_EQ(a.size(2), local_value_heads);
+  CHECK_EQ(z.size(-2), local_value_heads);
+  CHECK_EQ(z.size(-1), head_v_dim_);
+  CHECK_EQ(b.size(-1), local_value_heads);
+  CHECK_EQ(a.size(-1), local_value_heads);
 
   const int64_t num_slots = conv_cache.size(0);
   CHECK_GT(num_slots, 0) << "GDN cache must contain at least one slot.";
@@ -492,19 +557,30 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
     CHECK_EQ(conv_cache.size(1), checkpoint_stride + 2)
         << "MegaGdnPrefill conv history must be R+2.";
 
-    torch::Tensor packed_qkv = reshape_qkvz_unpad(
-        attn_metadata,
-        mixed_qkv.reshape({batch_size * sequence_length, local_conv_dim}));
+    torch::Tensor packed_qkv =
+        packed_prefill ? mixed_qkv
+                       : reshape_qkvz_unpad(
+                             attn_metadata,
+                             mixed_qkv.reshape({batch_size * sequence_length,
+                                                local_conv_dim}));
     torch::Tensor packed_z =
-        reshape_qkvz_unpad(attn_metadata,
-                           z.reshape({batch_size * sequence_length,
-                                      local_value_heads * head_v_dim_}));
-    torch::Tensor packed_b = reshape_qkvz_unpad(
-        attn_metadata,
-        b.reshape({batch_size * sequence_length, local_value_heads}));
-    torch::Tensor packed_a = reshape_qkvz_unpad(
-        attn_metadata,
-        a.reshape({batch_size * sequence_length, local_value_heads}));
+        packed_prefill
+            ? z.reshape({original_num_tokens, -1})
+            : reshape_qkvz_unpad(attn_metadata,
+                                 z.reshape({batch_size * sequence_length,
+                                            local_value_heads * head_v_dim_}));
+    torch::Tensor packed_b =
+        packed_prefill
+            ? b
+            : reshape_qkvz_unpad(
+                  attn_metadata,
+                  b.reshape({batch_size * sequence_length, local_value_heads}));
+    torch::Tensor packed_a =
+        packed_prefill
+            ? a
+            : reshape_qkvz_unpad(
+                  attn_metadata,
+                  a.reshape({batch_size * sequence_length, local_value_heads}));
     const int64_t total_tokens = packed_qkv.size(0);
     int64_t expected_tokens = 0;
     for (const int32_t query_length : attn_metadata.q_seq_lens_vec) {
@@ -665,6 +741,17 @@ void Qwen3_5GatedDeltaNetImpl::load_projection_state_dict(
   auto in_proj_a_state_dict = state_dict.get_dict_with_prefix("in_proj_a.");
   if (in_proj_a_state_dict.size() > 0 && !in_proj_a_->is_weight_loaded()) {
     in_proj_a_->load_state_dict(in_proj_a_state_dict);
+  }
+  if (!prefill_projection_ &&
+      prefill_projection_mode_ != GdnProjectionMode::SEPARATE &&
+      in_proj_qkv_->is_weight_loaded() && in_proj_z_->is_weight_loaded() &&
+      in_proj_b_->is_weight_loaded() && in_proj_a_->is_weight_loaded()) {
+    prefill_projection_ = std::make_unique<GdnPrefillProjection>(
+        GdnProjectionTensors{in_proj_qkv_->weight(),
+                             in_proj_z_->weight(),
+                             in_proj_b_->weight(),
+                             in_proj_a_->weight()},
+        prefill_projection_mode_);
   }
 }
 
