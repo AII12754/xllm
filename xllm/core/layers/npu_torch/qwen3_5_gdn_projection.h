@@ -18,7 +18,6 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <array>
-#include <string_view>
 #include <vector>
 
 namespace xllm {
@@ -29,11 +28,8 @@ namespace xllm::layer {
 
 enum class GdnProjectionMode { SEPARATE, GROUPED };
 
-GdnProjectionMode parse_gdn_projection_mode(std::string_view mode);
-
 // Select the supported path before loading weights or executing device work.
-GdnProjectionMode resolve_gdn_projection_mode(std::string_view mode,
-                                              const QuantArgs& quant_args,
+GdnProjectionMode resolve_gdn_projection_mode(const QuantArgs& quant_args,
                                               torch::ScalarType dtype);
 
 // Stable field order for both weights and outputs: QKV, Z, B, A.

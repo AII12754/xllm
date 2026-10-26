@@ -19,11 +19,10 @@ namespace xllm::layer {
 
 // Spec verification keeps its dense per-sequence layout, even when the
 // executor marks it as chunked prefill. Decode never uses packed prefill.
-constexpr bool use_packed_gdn_prefill(bool enabled,
-                                      bool is_prefill,
+constexpr bool use_packed_gdn_prefill(bool is_prefill,
                                       bool is_chunked_prefill,
                                       bool is_spec_verify) {
-  return enabled && !is_spec_verify && (is_prefill || is_chunked_prefill);
+  return !is_spec_verify && (is_prefill || is_chunked_prefill);
 }
 
 }  // namespace xllm::layer

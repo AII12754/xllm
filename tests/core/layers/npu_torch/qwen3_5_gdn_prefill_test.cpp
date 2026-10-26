@@ -18,12 +18,12 @@ limitations under the License.
 #include <torch_npu/torch_npu.h>
 
 #include <algorithm>
+#include <array>
 #include <numeric>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "core/framework/config/kernel_config.h"
 #include "core/framework/model/model_params_view.h"
 #include "core/kv_cache/storage/kv_cache.h"
 #include "core/layers/npu_torch/qwen3_5_gated_delta_net.h"
@@ -63,49 +63,82 @@ ModelArgs make_args(int64_t hidden = kHidden) {
   args.rms_norm_eps() = 1e-6;
   return args;
 }
-// Accumulate BF16 input/weight products on CPU in FP32 and round once to
-// BF16, then run the unchanged production GDN and output path.
-class GdnFp32ProjectionReference final : public Qwen3_5GatedDeltaNetImpl {
+// Independent projection oracle: use four linear calls, or accumulate BF16
+// products on CPU in FP32 and round once to BF16. Neither uses the prefill
+// plan.
+template <bool AccumulateFp32>
+class GdnProjectionReference final : public Qwen3_5GatedDeltaNetImpl {
  public:
   using Qwen3_5GatedDeltaNetImpl::Qwen3_5GatedDeltaNetImpl;
 
+  int64_t projection_calls() const { return projection_calls_; }
+  int64_t dense_projection_calls() const { return dense_projection_calls_; }
+
+  torch::Tensor round_trip_layout(const AttentionMetadata& metadata,
+                                  const torch::Tensor& projected) const {
+    return reshape_qkvz_unpad(
+        metadata, reshape_projected_tokens_with_pad(metadata, projected));
+  }
+
  protected:
+  GdnProjectionTensors project_prefill_inputs(
+      const torch::Tensor& hidden_states) override {
+    ++projection_calls_;
+    return project(hidden_states);
+  }
+
   std::optional<
       std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>>
   project_split_inputs(const torch::Tensor& hidden_states,
                        const AttentionMetadata& metadata) override {
-    const auto input = hidden_states.to(torch::kCPU, torch::kFloat32);
-    const auto parameters = named_parameters();
-    auto project = [&](const std::string& name) {
-      auto weight = parameters[name].to(torch::kCPU, torch::kFloat32);
-      auto projected = torch::nn::functional::linear(input, weight)
-                           .to(hidden_states.device(), torch::kBFloat16);
-      return reshape_projected_tokens_with_pad(metadata, projected);
-    };
-    auto qkv = project("in_proj_qkv.weight");
-    auto z = project("in_proj_z.weight");
-    auto b = project("in_proj_b.weight");
-    auto a = project("in_proj_a.weight");
-    z = z.view({z.size(0), z.size(1), b.size(2), 128});
-    return std::make_tuple(qkv, z, b, a);
+    ++dense_projection_calls_;
+    auto projected = project(hidden_states);
+    for (auto& tensor : projected) {
+      tensor = reshape_projected_tokens_with_pad(metadata, tensor);
+    }
+    auto z = projected[1].view({projected[1].size(0),
+                                projected[1].size(1),
+                                num_v_heads_ / tp_size_,
+                                head_v_dim_});
+    return std::make_tuple(projected[0], z, projected[2], projected[3]);
   }
+
+ private:
+  GdnProjectionTensors project(const torch::Tensor& hidden_states) const {
+    const auto parameters = named_parameters();
+    GdnProjectionTensors projected;
+    const std::array<std::string, 4> names = {"in_proj_qkv.weight",
+                                              "in_proj_z.weight",
+                                              "in_proj_b.weight",
+                                              "in_proj_a.weight"};
+    for (size_t index = 0; index < names.size(); ++index) {
+      if constexpr (AccumulateFp32) {
+        projected[index] =
+            torch::nn::functional::linear(
+                hidden_states.to(torch::kCPU, torch::kFloat32),
+                parameters[names[index]].to(torch::kCPU, torch::kFloat32))
+                .to(hidden_states.device(), torch::kBFloat16);
+      } else {
+        projected[index] = torch::nn::functional::linear(
+            hidden_states, parameters[names[index]]);
+      }
+    }
+    return projected;
+  }
+
+  int64_t projection_calls_ = 0;
+  int64_t dense_projection_calls_ = 0;
 };
-using GdnFp32Reference = torch::nn::ModuleHolder<GdnFp32ProjectionReference>;
+using GdnSeparateReference =
+    torch::nn::ModuleHolder<GdnProjectionReference<false>>;
+using GdnFp32Reference = torch::nn::ModuleHolder<GdnProjectionReference<true>>;
 
 template <typename Layer = Qwen3_5GatedDeltaNet>
-Layer make_layer(const ParallelArgs& parallel,
-                 const WeightMap& weights,
-                 bool packed,
-                 const std::string& strategy) {
-  auto& config = KernelConfig::get_instance();
-  const KernelConfig saved = config;
-  config.enable_qwen35_gdn_packed_prefill() = packed;
-  config.qwen35_gdn_prefill_projection() = strategy;
+Layer make_layer(const ParallelArgs& parallel, const WeightMap& weights) {
   Layer layer(make_args(weights.at("in_proj_qkv.weight").size(1)),
               QuantArgs{},
               parallel,
               torch::TensorOptions().device(kDevice).dtype(torch::kBFloat16));
-  config = saved;
   // Simulate checkpoint shards with QKV arriving after the other projections.
   WeightMap first = weights;
   first.erase("in_proj_qkv.weight");
@@ -172,30 +205,18 @@ void expect_equivalent(const torch::Tensor& actual,
   }
 }
 
-class Qwen35GdnPrefillTest : public ::testing::TestWithParam<std::string> {};
-
-TEST(Qwen35GdnPrefillDefaultsTest, MatchesExplicitGroupedPackedThroughDecode) {
+TEST(Qwen35GdnPrefillTest, PreservesColdWarmRaggedAndDecodeOutputsAndCaches) {
   torch::InferenceMode inference;
-  torch::manual_seed(20261025);
+  torch::manual_seed(20261024);
   const auto weights = make_checkpoint();
-  for (const int32_t tp : {1, 2, 4}) {
+  for (const int32_t tp : {1, 2, 4, 8}) {
     SCOPED_TRACE(tp);
     test::MockProcessGroup group(kDevice, tp - 1, tp);
     ParallelArgs parallel(tp - 1, tp, &group);
     parallel.tp_group_ = &group;
     parallel.single_rank_group_ = &group;
-    auto& config = KernelConfig::get_instance();
-    const KernelConfig saved = config;
-    config = KernelConfig{};
-    Qwen3_5GatedDeltaNet candidate(
-        make_args(),
-        QuantArgs{},
-        parallel,
-        torch::TensorOptions().device(kDevice).dtype(torch::kBFloat16));
-    config = saved;
-    candidate->load_state_dict(StateDict(weights));
-    candidate->verify_loaded_weights("");
-    auto reference = make_layer(parallel, weights, true, "grouped");
+    auto reference = make_layer<GdnSeparateReference>(parallel, weights);
+    auto candidate = make_layer(parallel, weights);
     auto reference_cache = make_cache(tp);
     auto candidate_cache = make_cache(tp);
     LlmModelParams params;
@@ -204,75 +225,31 @@ TEST(Qwen35GdnPrefillDefaultsTest, MatchesExplicitGroupedPackedThroughDecode) {
     const std::vector<std::vector<int32_t>> steps = {
         {17, 33, 65}, {13, 7, 9}, {1, 1, 1}};
     for (size_t step = 0; step < steps.size(); ++step) {
+      SCOPED_TRACE(step);
       auto metadata = make_metadata(steps[step], step == 1, step == 2);
       const int64_t tokens =
           std::accumulate(steps[step].begin(), steps[step].end(), int64_t{0});
       auto input =
           (torch::randn({tokens, kHidden}) * 0.2).to(kDevice, torch::kBFloat16);
-      const auto expected = reference->forward(
+      auto expected = reference->forward(
           input, metadata, reference_cache, ModelParamsView(params));
-      const auto actual = candidate->forward(
+      auto actual = candidate->forward(
           input, metadata, candidate_cache, ModelParamsView(params));
-      expect_equivalent(actual, expected, true);
+      expect_equivalent(actual, expected, false);
       expect_equivalent(candidate_cache.get_conv_cache(),
                         reference_cache.get_conv_cache(),
-                        true);
+                        false);
       expect_equivalent(candidate_cache.get_ssm_cache(),
                         reference_cache.get_ssm_cache(),
-                        true);
+                        false);
       params.linear_state_validity_mask = {1, 1, 1};
     }
+    EXPECT_EQ(reference->projection_calls(), 2);
+    EXPECT_EQ(reference->dense_projection_calls(), 1);
   }
 }
 
-TEST_P(Qwen35GdnPrefillTest, PreservesColdWarmRaggedAndDecodeOutputsAndCaches) {
-  torch::InferenceMode inference;
-  torch::manual_seed(20261024);
-  const auto weights = make_checkpoint();
-  for (const bool packed : {false, true}) {
-    SCOPED_TRACE(packed);
-    for (const int32_t tp : {1, 2, 4, 8}) {
-      SCOPED_TRACE(tp);
-      test::MockProcessGroup group(kDevice, tp - 1, tp);
-      ParallelArgs parallel(tp - 1, tp, &group);
-      parallel.tp_group_ = &group;
-      parallel.single_rank_group_ = &group;
-      auto reference = make_layer(parallel, weights, false, "separate");
-      auto candidate = make_layer(parallel, weights, packed, GetParam());
-      auto reference_cache = make_cache(tp);
-      auto candidate_cache = make_cache(tp);
-      LlmModelParams params;
-      params.embedding.linear_state_ids = {1, 3, 5};
-      params.linear_state_validity_mask = {0, 0, 0};
-      const std::vector<std::vector<int32_t>> steps = {
-          {17, 33, 65}, {13, 7, 9}, {1, 1, 1}};
-      for (size_t step = 0; step < steps.size(); ++step) {
-        SCOPED_TRACE(step);
-        auto metadata = make_metadata(steps[step], step == 1, step == 2);
-        const int64_t tokens =
-            std::accumulate(steps[step].begin(), steps[step].end(), int64_t{0});
-        auto input = (torch::randn({tokens, kHidden}) * 0.2)
-                         .to(kDevice, torch::kBFloat16);
-        auto expected = reference->forward(
-            input, metadata, reference_cache, ModelParamsView(params));
-        auto actual = candidate->forward(
-            input, metadata, candidate_cache, ModelParamsView(params));
-        const bool exact = GetParam() == "separate";
-        expect_equivalent(actual, expected, exact);
-        expect_equivalent(candidate_cache.get_conv_cache(),
-                          reference_cache.get_conv_cache(),
-                          exact);
-        expect_equivalent(candidate_cache.get_ssm_cache(),
-                          reference_cache.get_ssm_cache(),
-                          exact);
-        params.linear_state_validity_mask = {1, 1, 1};
-      }
-    }
-  }
-}
-
-TEST_P(Qwen35GdnPrefillTest,
-       PreservesSingleAndEqualLengthPrefillWithEachLayoutSwitch) {
+TEST(Qwen35GdnPrefillTest, PreservesSingleAndEqualLengthPrefill) {
   torch::InferenceMode inference;
   torch::manual_seed(871);
   const auto weights = make_checkpoint();
@@ -280,41 +257,37 @@ TEST_P(Qwen35GdnPrefillTest,
   ParallelArgs parallel(0, 1, &group);
   parallel.tp_group_ = &group;
   const std::vector<std::vector<int32_t>> batches = {{65}, {17, 17, 17, 17}};
-  for (const bool packed : {false, true}) {
-    SCOPED_TRACE(packed);
-    auto reference = make_layer(parallel, weights, false, "separate");
-    auto candidate = make_layer(parallel, weights, packed, GetParam());
-    for (const auto& lengths : batches) {
-      auto reference_cache = make_cache(1);
-      auto candidate_cache = make_cache(1);
-      auto metadata = make_metadata(lengths);
-      const int64_t tokens =
-          std::accumulate(lengths.begin(), lengths.end(), int64_t{0});
-      auto input =
-          (torch::randn({tokens, kHidden}) * 0.2).to(kDevice, torch::kBFloat16);
-      LlmModelParams params;
-      for (size_t i = 0; i < lengths.size(); ++i) {
-        params.embedding.linear_state_ids.emplace_back(
-            static_cast<int32_t>(i + 1));
-      }
-      params.linear_state_validity_mask.resize(lengths.size(), 0);
-      auto expected = reference->forward(
-          input, metadata, reference_cache, ModelParamsView(params));
-      auto actual = candidate->forward(
-          input, metadata, candidate_cache, ModelParamsView(params));
-      const bool exact = GetParam() == "separate";
-      expect_equivalent(actual, expected, exact);
-      expect_equivalent(candidate_cache.get_conv_cache(),
-                        reference_cache.get_conv_cache(),
-                        exact);
-      expect_equivalent(candidate_cache.get_ssm_cache(),
-                        reference_cache.get_ssm_cache(),
-                        exact);
+  auto reference = make_layer<GdnSeparateReference>(parallel, weights);
+  auto candidate = make_layer(parallel, weights);
+  for (const auto& lengths : batches) {
+    auto reference_cache = make_cache(1);
+    auto candidate_cache = make_cache(1);
+    auto metadata = make_metadata(lengths);
+    const int64_t tokens =
+        std::accumulate(lengths.begin(), lengths.end(), int64_t{0});
+    auto input =
+        (torch::randn({tokens, kHidden}) * 0.2).to(kDevice, torch::kBFloat16);
+    LlmModelParams params;
+    for (size_t i = 0; i < lengths.size(); ++i) {
+      params.embedding.linear_state_ids.emplace_back(
+          static_cast<int32_t>(i + 1));
     }
+    params.linear_state_validity_mask.resize(lengths.size(), 0);
+    auto expected = reference->forward(
+        input, metadata, reference_cache, ModelParamsView(params));
+    auto actual = candidate->forward(
+        input, metadata, candidate_cache, ModelParamsView(params));
+    expect_equivalent(actual, expected, false);
+    expect_equivalent(candidate_cache.get_conv_cache(),
+                      reference_cache.get_conv_cache(),
+                      false);
+    expect_equivalent(candidate_cache.get_ssm_cache(),
+                      reference_cache.get_ssm_cache(),
+                      false);
   }
 }
 
-TEST_P(Qwen35GdnPrefillTest, PreservesCheckpointRowsAcrossEveryTpRank) {
+TEST(Qwen35GdnPrefillTest, PreservesCheckpointRowsAcrossEveryTpRank) {
   torch::InferenceMode inference;
   torch::manual_seed(713);
   const auto weights = make_checkpoint();
@@ -325,7 +298,7 @@ TEST_P(Qwen35GdnPrefillTest, PreservesCheckpointRowsAcrossEveryTpRank) {
       test::MockProcessGroup group(kDevice, rank, tp);
       ParallelArgs parallel(rank, tp, &group);
       parallel.tp_group_ = &group;
-      auto candidate = make_layer(parallel, weights, true, GetParam());
+      auto candidate = make_layer(parallel, weights);
       const auto parameters = candidate->named_parameters();
       std::vector<torch::Tensor> qkv_parts;
       qkv_parts.reserve(3);
@@ -353,7 +326,7 @@ TEST_P(Qwen35GdnPrefillTest, PreservesCheckpointRowsAcrossEveryTpRank) {
   }
 }
 
-TEST_P(Qwen35GdnPrefillTest, LeavesRaggedSpeculativeVerificationUnchanged) {
+TEST(Qwen35GdnPrefillTest, LeavesRaggedSpeculativeVerificationUnchanged) {
   torch::InferenceMode inference;
   torch::manual_seed(516);
   const auto weights = make_checkpoint();
@@ -361,8 +334,8 @@ TEST_P(Qwen35GdnPrefillTest, LeavesRaggedSpeculativeVerificationUnchanged) {
   ParallelArgs parallel(0, 1, &group);
   parallel.tp_group_ = &group;
   parallel.single_rank_group_ = &group;
-  auto reference = make_layer(parallel, weights, false, "separate");
-  auto candidate = make_layer(parallel, weights, true, GetParam());
+  auto reference = make_layer<GdnSeparateReference>(parallel, weights);
+  auto candidate = make_layer(parallel, weights);
   auto reference_cache = make_cache(1, 2);
   auto candidate_cache = make_cache(1, 2);
   LlmModelParams params;
@@ -377,22 +350,23 @@ TEST_P(Qwen35GdnPrefillTest, LeavesRaggedSpeculativeVerificationUnchanged) {
   auto actual = candidate->forward(
       input, metadata, candidate_cache, ModelParamsView(params));
   expect_equivalent(actual, expected, true);
+  EXPECT_EQ(reference->projection_calls(), 0);
+  EXPECT_EQ(reference->dense_projection_calls(), 1);
   expect_equivalent(
       candidate_cache.get_conv_cache(), reference_cache.get_conv_cache(), true);
   expect_equivalent(
       candidate_cache.get_ssm_cache(), reference_cache.get_ssm_cache(), true);
 }
 
-TEST_P(Qwen35GdnPrefillTest, MatchesFp32ProjectionOracle) {
+TEST(Qwen35GdnPrefillTest, MatchesFp32ProjectionOracle) {
   torch::InferenceMode inference;
   torch::manual_seed(20261025);
   const auto weights = make_checkpoint();
   test::MockProcessGroup group(kDevice);
   ParallelArgs parallel(0, 1, &group);
   parallel.tp_group_ = &group;
-  auto oracle =
-      make_layer<GdnFp32Reference>(parallel, weights, false, "separate");
-  auto candidate = make_layer(parallel, weights, true, GetParam());
+  auto oracle = make_layer<GdnFp32Reference>(parallel, weights);
+  auto candidate = make_layer(parallel, weights);
   auto oracle_cache = make_cache(1);
   auto candidate_cache = make_cache(1);
   LlmModelParams params;
@@ -413,11 +387,30 @@ TEST_P(Qwen35GdnPrefillTest, MatchesFp32ProjectionOracle) {
         candidate_cache.get_ssm_cache(), oracle_cache.get_ssm_cache(), false);
     params.linear_state_validity_mask = {1, 1};
   }
+  EXPECT_EQ(oracle->projection_calls(), 2);
 }
 
-INSTANTIATE_TEST_SUITE_P(Strategies,
-                         Qwen35GdnPrefillTest,
-                         ::testing::Values("separate", "grouped"));
+TEST(Qwen35GdnPrefillTest, PackedTokensMatchLegacyPadUnpadForEachProjection) {
+  torch::InferenceMode inference;
+  torch::manual_seed(20261026);
+  test::MockProcessGroup group(kDevice);
+  ParallelArgs parallel(0, 1, &group);
+  parallel.tp_group_ = &group;
+  auto reference =
+      make_layer<GdnSeparateReference>(parallel, make_checkpoint());
+  for (const std::vector<int32_t> lengths :
+       {std::vector<int32_t>{1}, {17, 17, 17, 17}, {1, 17, 33, 65}}) {
+    const auto metadata = make_metadata(lengths);
+    const int64_t tokens =
+        std::accumulate(lengths.begin(), lengths.end(), int64_t{0});
+    for (const int64_t width : {10240, 6144, 48}) {
+      const auto projected =
+          torch::randn({tokens, width}).to(kDevice, torch::kBFloat16);
+      const auto restored = reference->round_trip_layout(metadata, projected);
+      EXPECT_TRUE(torch::equal(restored, projected));
+    }
+  }
+}
 
 }  // namespace
 }  // namespace xllm::layer

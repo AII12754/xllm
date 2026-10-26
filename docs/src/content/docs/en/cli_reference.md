@@ -397,8 +397,6 @@ flag defaults to false and leaves fixed-width MTP unchanged when disabled.
 | `enable_aclnn_matmul` | `bool` | `false` | Whether to enable the ACLNN matmul backend for supported NPU ATB layers. |
 | `enable_aclnn_swiglu` | `bool` | `false` | Whether to enable the ACLNN SwiGLU backend for supported NPU ATB layers. |
 | `enable_dspark_native_sas` | `bool` | `false` | Enable native NPU DSpark SparseAttnSharedkv semantics. Older operators that reject non-empty `ori_sparse_indices` may terminate during tiling; keep this disabled to use q_len=1 compatibility mode. |
-| `enable_qwen35_gdn_packed_prefill` | `bool` | `true` | Keep ordinary and chunked Qwen3.5 GDN Prefill projections packed. Set `false` to restore the original layout. Decode and speculative verification retain their existing layouts. |
-| `qwen35_gdn_prefill_projection` | `string` | `grouped` | NPU Qwen3.5 GDN prefill projection: `separate` or `grouped`. Grouped uses four independent matmuls with contiguous QKV/Z/B/A outputs for unquantized BF16 weights; quantized and other weight dtypes retain separate projections. Set `separate` to disable grouping independently of packed prefill. Decode and speculative verification keep their original projections. Performance depends on device, TP size, and workload. |
 
 ## DiTConfig
 

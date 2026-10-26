@@ -28,27 +28,15 @@ limitations under the License.
 
 namespace xllm::layer {
 
-GdnProjectionMode parse_gdn_projection_mode(std::string_view mode) {
-  if (mode == "separate") {
-    return GdnProjectionMode::SEPARATE;
-  }
-  if (mode == "grouped") {
-    return GdnProjectionMode::GROUPED;
-  }
-  LOG(FATAL) << "Unknown GDN prefill projection mode: " << mode;
-  return GdnProjectionMode::SEPARATE;
-}
-
-GdnProjectionMode resolve_gdn_projection_mode(std::string_view mode,
-                                              const QuantArgs& quant_args,
+GdnProjectionMode resolve_gdn_projection_mode(const QuantArgs& quant_args,
                                               torch::ScalarType dtype) {
-  const GdnProjectionMode requested_mode = parse_gdn_projection_mode(mode);
   const bool supports_grouped =
       dtype == torch::kBFloat16 && quant_args.quant_method().empty() &&
       quant_args.quantize_type().empty() && quant_args.quant_descs().empty() &&
       quant_args.compressed_groups().empty() &&
       !quant_args.is_compressed_tensors_w8a8_dynamic();
-  return supports_grouped ? requested_mode : GdnProjectionMode::SEPARATE;
+  return supports_grouped ? GdnProjectionMode::GROUPED
+                          : GdnProjectionMode::SEPARATE;
 }
 
 GdnPrefillProjection::GdnPrefillProjection(GdnProjectionTensors weights,

@@ -56,6 +56,10 @@ class Qwen3_5GatedDeltaNetImpl : public Qwen3NextGatedDeltaNetImpl {
                         const ModelParamsView& input_params) override;
 
  protected:
+  // Prefill projections remain token-packed; Decode uses project_split_inputs.
+  virtual GdnProjectionTensors project_prefill_inputs(
+      const torch::Tensor& hidden_states);
+
   std::optional<
       std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>>
   project_split_inputs(const torch::Tensor& hidden_states,
@@ -66,7 +70,6 @@ class Qwen3_5GatedDeltaNetImpl : public Qwen3NextGatedDeltaNetImpl {
   void verify_projection_weights(const std::string& prefix) const override;
 
  private:
-  bool enable_packed_prefill_ = false;
   GdnProjectionMode prefill_projection_mode_ = GdnProjectionMode::SEPARATE;
   std::unique_ptr<GdnPrefillProjection> prefill_projection_;
   ColumnParallelLinear in_proj_qkv_{nullptr};

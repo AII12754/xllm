@@ -21,7 +21,6 @@ limitations under the License.
 #include <torch_npu/torch_npu.h>
 
 #include <algorithm>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -30,23 +29,17 @@ limitations under the License.
 namespace xllm::layer {
 namespace {
 const torch::Device kDevice(torch::kPrivateUse1, 0);
-const std::vector<std::string> kModes = {"separate", "grouped"};
+const std::vector<GdnProjectionMode> kModes = {GdnProjectionMode::SEPARATE,
+                                               GdnProjectionMode::GROUPED};
 
 TEST(GdnProjectionModeTest, UsesGroupedForUnquantizedBf16) {
-  EXPECT_EQ(
-      resolve_gdn_projection_mode("grouped", QuantArgs{}, torch::kBFloat16),
-      GdnProjectionMode::GROUPED);
-}
-
-TEST(GdnProjectionModeTest, PreservesExplicitSeparateForSupportedWeights) {
-  EXPECT_EQ(
-      resolve_gdn_projection_mode("separate", QuantArgs{}, torch::kBFloat16),
-      GdnProjectionMode::SEPARATE);
+  EXPECT_EQ(resolve_gdn_projection_mode(QuantArgs{}, torch::kBFloat16),
+            GdnProjectionMode::GROUPED);
 }
 
 TEST(GdnProjectionModeTest, UsesSeparateForNonBf16Weights) {
   for (const torch::ScalarType dtype : {torch::kFloat16, torch::kFloat32}) {
-    EXPECT_EQ(resolve_gdn_projection_mode("grouped", QuantArgs{}, dtype),
+    EXPECT_EQ(resolve_gdn_projection_mode(QuantArgs{}, dtype),
               GdnProjectionMode::SEPARATE);
   }
 }
@@ -64,9 +57,8 @@ TEST(GdnProjectionModeTest, UsesSeparateForEachQuantizationMetadataSource) {
   groups.compressed_groups() = {CompressedQuantGroup{}};
   for (const auto& quant_args :
        {method, type, descriptions, compressed, groups}) {
-    EXPECT_EQ(
-        resolve_gdn_projection_mode("grouped", quant_args, torch::kBFloat16),
-        GdnProjectionMode::SEPARATE);
+    EXPECT_EQ(resolve_gdn_projection_mode(quant_args, torch::kBFloat16),
+              GdnProjectionMode::SEPARATE);
   }
 }
 
@@ -97,7 +89,7 @@ void expect_close(const GdnProjectionTensors& actual,
     EXPECT_TRUE(torch::allclose(result, reference, 0.02, 0.02));
   }
 }
-class GdnProjectionTest : public ::testing::TestWithParam<std::string> {};
+class GdnProjectionTest : public ::testing::TestWithParam<GdnProjectionMode> {};
 TEST_P(GdnProjectionTest, MatchesIndependentBf16ForAllTpWidths) {
   torch::InferenceMode inference;
   torch::manual_seed(1327);
@@ -105,8 +97,7 @@ TEST_P(GdnProjectionTest, MatchesIndependentBf16ForAllTpWidths) {
     SCOPED_TRACE(tp);
     auto weights = make_weights(5120, tp);
     GdnPrefillProjection reference(weights, GdnProjectionMode::SEPARATE);
-    GdnPrefillProjection candidate(weights,
-                                   parse_gdn_projection_mode(GetParam()));
+    GdnPrefillProjection candidate(weights, GetParam());
     for (const int64_t tokens : {1, 17, 128}) {
       SCOPED_TRACE(tokens);
       auto input =
@@ -122,8 +113,7 @@ TEST_P(GdnProjectionTest, PreservesOutputsAcrossQueuedAllocationReuse) {
     SCOPED_TRACE(tp);
     auto weights = make_weights(5120, tp);
     GdnPrefillProjection reference(weights, GdnProjectionMode::SEPARATE);
-    GdnPrefillProjection candidate(weights,
-                                   parse_gdn_projection_mode(GetParam()));
+    GdnPrefillProjection candidate(weights, GetParam());
     for (const int64_t tokens : {1, 17, 322}) {
       SCOPED_TRACE(tokens);
       auto input =
@@ -173,8 +163,7 @@ TEST_P(GdnProjectionTest, PreservesRankLocalHeadOrdering) {
     }
     auto input = torch::ones({7, 32}, weights[0].options());
     GdnPrefillProjection reference(weights, GdnProjectionMode::SEPARATE);
-    GdnPrefillProjection candidate(weights,
-                                   parse_gdn_projection_mode(GetParam()));
+    GdnPrefillProjection candidate(weights, GetParam());
     expect_close(candidate.forward(input), reference.forward(input));
   }
 }
@@ -188,8 +177,7 @@ TEST_P(GdnProjectionTest, PreparedWeightsOutliveOriginalOwnersAndServeDecode) {
     for (size_t index = 0; index < weights.size(); ++index) {
       original[index] = weights[index].cpu();
     }
-    GdnPrefillProjection candidate(std::move(weights),
-                                   parse_gdn_projection_mode(GetParam()));
+    GdnPrefillProjection candidate(std::move(weights), GetParam());
     const auto& prepared = candidate.weights();
     for (size_t index = 0; index < prepared.size(); ++index) {
       EXPECT_TRUE(prepared[index].is_contiguous());
@@ -214,19 +202,14 @@ INSTANTIATE_TEST_SUITE_P(Strategies,
                          GdnProjectionTest,
                          ::testing::ValuesIn(kModes));
 TEST(GdnPackedPrefillTest, ExcludesDecodeAndSpeculativeVerification) {
-  EXPECT_TRUE(use_packed_gdn_prefill(true, true, false, false));
-  EXPECT_TRUE(use_packed_gdn_prefill(true, false, true, false));
-  EXPECT_FALSE(use_packed_gdn_prefill(false, true, true, false));
-  EXPECT_FALSE(use_packed_gdn_prefill(true, false, false, false));
-  EXPECT_FALSE(use_packed_gdn_prefill(true, false, true, true));
-  EXPECT_FALSE(use_packed_gdn_prefill(true, true, false, true));
-}
-TEST(GdnProjectionDeathTest, RejectsUnknownStrategyBeforeExecution) {
-  GTEST_FLAG_SET(death_test_style, "threadsafe");
-  EXPECT_DEATH(parse_gdn_projection_mode("invalid"), "Unknown GDN");
-  EXPECT_DEATH(
-      resolve_gdn_projection_mode("invalid", QuantArgs{}, torch::kFloat32),
-      "Unknown GDN");
+  EXPECT_TRUE(use_packed_gdn_prefill(true, false, false));
+  EXPECT_TRUE(use_packed_gdn_prefill(false, true, false));
+  EXPECT_TRUE(use_packed_gdn_prefill(true, true, false));
+  EXPECT_FALSE(use_packed_gdn_prefill(false, false, false));
+  EXPECT_FALSE(use_packed_gdn_prefill(false, true, true));
+  EXPECT_FALSE(use_packed_gdn_prefill(true, false, true));
+  EXPECT_FALSE(use_packed_gdn_prefill(false, false, true));
+  EXPECT_FALSE(use_packed_gdn_prefill(true, true, true));
 }
 TEST(GdnProjectionTest, GroupedSupportsOtherProjectionWidths) {
   torch::InferenceMode inference;
