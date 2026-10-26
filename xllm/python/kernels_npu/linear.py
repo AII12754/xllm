@@ -22,6 +22,19 @@ import torch_npu
 _FRACTAL_NZ_FORMAT = 29
 
 
+def grouped_linear(hidden: torch.Tensor, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Project a shared input into separate contiguous outputs in one launch.
+
+    The input has shape ``[tokens, in_features]``. Weights are transpose
+    views in ``[in_features, out_features]`` order.
+    Keeping the outputs separate avoids splitting and copying a concatenated
+    projection before consumers that require contiguous tensors.
+    """
+    # Normalize a strided input once rather than once per grouped operand.
+    hidden = hidden.contiguous()
+    return torch_npu.npu_grouped_matmul([hidden] * len(weights), weights, split_item=0, group_type=-1)
+
+
 def prepare_row_parallel_weight(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, bool]:
@@ -83,6 +96,7 @@ def atb_matmul_ein_sum_out(x: torch.Tensor, weight: torch.Tensor, out: torch.Ten
 
 
 __all__ = [
+    "grouped_linear",
     "atb_matmul_ein_sum",
     "atb_matmul_ein_sum_out",
     "prepare_row_parallel_weight",

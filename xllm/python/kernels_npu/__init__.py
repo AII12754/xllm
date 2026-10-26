@@ -47,6 +47,7 @@ _EXPORTS = {
         "mega_gdn_prefill",
     ),
     "linear": (
+        "grouped_linear",
         "atb_matmul_ein_sum",
         "atb_matmul_ein_sum_out",
         "prepare_quant_weight",
@@ -158,6 +159,7 @@ __all__ = [
     "update_decode_graph_metadata",
     "vision_fusion_attention",
     "atb_matmul_ein_sum",
+    "grouped_linear",
     "atb_matmul_ein_sum_out",
     "fused_qk_norm_rope",
     "build_split_qkv_rmsnorm_mrope_gather_pattern",
