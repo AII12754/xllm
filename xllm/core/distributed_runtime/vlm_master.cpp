@@ -411,6 +411,7 @@ void VLMMaster::handle_request(std::string prompt,
                                MMData mm_data,
                                RequestParams sp,
                                OutputCallback callback) {
+  const auto arrival_time = std::chrono::steady_clock::now();
   scheduler_->incr_pending_requests(1);
   auto cb = [callback = std::move(callback),
              scheduler = scheduler_.get()](const RequestOutput& output) {
@@ -422,6 +423,7 @@ void VLMMaster::handle_request(std::string prompt,
                          prompt = std::move(prompt),
                          mm_data = std::move(mm_data),
                          sp = std::move(sp),
+                         arrival_time,
                          callback = std::move(cb)]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_completion);
 
@@ -439,8 +441,11 @@ void VLMMaster::handle_request(std::string prompt,
     }
 
     rate_limit_guard.dismiss();
-    auto request = request_factory_->create(
-        std::move(prompt), std::move(mm_data), sp, std::move(callback));
+    auto request = request_factory_->create(std::move(prompt),
+                                            std::move(mm_data),
+                                            sp,
+                                            std::move(callback),
+                                            arrival_time);
     if (!request) {
       return;
     }
@@ -457,6 +462,7 @@ void VLMMaster::handle_request(std::vector<Message> messages,
                                std::string payload,
                                OutputCallback callback,
                                bool use_prompt_as_is) {
+  const auto arrival_time = std::chrono::steady_clock::now();
   // Offline-only guard: fail loudly on the caller thread (pybind surfaces
   // the exception to the Python caller) before any scheduling side effect.
   if (use_prompt_as_is && !join_message_texts(messages).has_value()) {
@@ -475,6 +481,7 @@ void VLMMaster::handle_request(std::vector<Message> messages,
                          sp = std::move(sp),
                          payload = std::move(payload),
                          use_prompt_as_is,
+                         arrival_time,
                          callback = std::move(cb)]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_chat);
 
@@ -495,7 +502,8 @@ void VLMMaster::handle_request(std::vector<Message> messages,
                                             sp,
                                             std::move(payload),
                                             std::move(callback),
-                                            use_prompt_as_is);
+                                            use_prompt_as_is,
+                                            arrival_time);
     if (!request) {
       return;
     }

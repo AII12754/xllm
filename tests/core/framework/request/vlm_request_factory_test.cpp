@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -260,7 +261,27 @@ TEST_F(VLMRequestFactoryTest, MessageOverloadFailsWhenTemplateRejects) {
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
-TEST_F(VLMRequestFactoryTest, MessageOverloadCreatesRequestOnSuccess) {
+TEST_F(VLMRequestFactoryTest,
+       CompletionPreservesAdmissionTimeBeforePromptProcessing) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  const std::chrono::steady_clock::time_point arrival_time{};
+  auto request = factory->create(/*prompt=*/"describe this",
+                                 /*mm_data=*/MMData{},
+                                 sp,
+                                 make_capture_callback(&capture),
+                                 arrival_time);
+
+  ASSERT_NE(request, nullptr);
+  const std::optional<double> elapsed =
+      request->server_elapsed_seconds(arrival_time + std::chrono::seconds(7));
+  ASSERT_TRUE(elapsed.has_value());
+  EXPECT_DOUBLE_EQ(*elapsed, 7.0);
+}
+
+TEST_F(VLMRequestFactoryTest,
+       ChatPreservesAdmissionTimeBeforeMultimodalPreprocessing) {
   auto factory = make_factory();
   CallbackCapture capture;
   RequestParams sp;
@@ -272,14 +293,21 @@ TEST_F(VLMRequestFactoryTest, MessageOverloadCreatesRequestOnSuccess) {
   std::vector<Message> messages;
   messages.emplace_back("user", content);
 
+  const std::chrono::steady_clock::time_point arrival_time{};
   auto request = factory->create(messages,
                                  sp,
                                  /*payload=*/std::string{},
-                                 make_capture_callback(&capture));
+                                 make_capture_callback(&capture),
+                                 /*use_prompt_as_is=*/false,
+                                 arrival_time);
 
   ASSERT_NE(request, nullptr);
   EXPECT_FALSE(capture.called);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+  const std::optional<double> elapsed =
+      request->server_elapsed_seconds(arrival_time + std::chrono::seconds(7));
+  ASSERT_TRUE(elapsed.has_value());
+  EXPECT_DOUBLE_EQ(*elapsed, 7.0);
 }
 
 }  // namespace

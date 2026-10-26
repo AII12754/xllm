@@ -246,6 +246,29 @@ Keep `--stream` enabled to observe TTFT and token arrival intervals. These are
 client-observed service metrics; use
 [Profiling a Running Service](/en/dev_guide/online_profiling/) for device execution analysis.
 
+### Server TTFT boundaries
+
+Client benchmark TTFT and server metrics have different timing boundaries. Use
+the same client, endpoint, and definition of the first valid output chunk when
+comparing frameworks.
+
+| Server metric | Timing boundary | Sample unit |
+| --- | --- | --- |
+| `time_to_first_token_latency_milliseconds` | Sequence creation to the scheduler processing its first real token. Includes scheduling waits and all prefill chunks, but excludes earlier templating, tokenization, and request thread-pool waits. | Each Sequence; preserves the existing log, heartbeat, and scheduling semantics. |
+| `server_time_to_first_token_latency_milliseconds` | Before an LLM/VLM request enters the preprocessing thread pool to the scheduler processing its first real token. Includes templating, tokenization, preprocessing queues, and inference waits; ends before output dispatch and detokenization. | Once per Request, including requests with multiple `n`/`best_of` sequences. |
+
+Both metrics use milliseconds and can measure the actual server first-token
+latency for non-streaming requests. The new metric uses a monotonic clock;
+internal warmup/profiling requests without an ingress timing marker do not emit
+new metric samples.
+
+In PD mode, the original Prefill ingress records the new metric after Decode
+acknowledges `FirstGeneration` successfully. This includes handoff, required KV
+restoration, and the acknowledgement's return trip, using the same ingress clock.
+Decode does not emit a duplicate sample. This boundary observes acceptance of the
+first output at the ingress; it does not cover the complete external xllm-service
+gateway and client network path or mean that visible text has reached the client.
+
 EvalScope prints the actual output path under `RUN_DIR`, writes `benchmark.log`,
 and creates a `performance_summary.txt` for the multiple-concurrency run. Preserve
 the per-run request database (`benchmark_data.db`) to inspect payloads, failures,

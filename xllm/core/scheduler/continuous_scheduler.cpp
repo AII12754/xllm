@@ -669,10 +669,16 @@ void ContinuousSchedulerBase::process_batch_output(
   refresh_sequences_from_requests(requests, output_sequences_);
   scheduler_metrics_->update(output_sequences_);
 
+  const auto output_time = std::chrono::steady_clock::now();
   std::vector<std::shared_ptr<Request>> stream_requests;
   stream_requests.reserve(requests.size());
   // process request output in batch
   for (const auto& request : requests) {
+    // PD Prefill records at handoff acknowledgement; Decode has no local
+    // ingress timestamp and must not contribute a second sample.
+    if (request->state().decode_address.empty()) {
+      request->record_server_first_token(output_time);
+    }
     // ignore cancelled/finished requests when enable_schedule_overlap.
     if (options_.enable_schedule_overlap()) {
       if (request->state().stream) {

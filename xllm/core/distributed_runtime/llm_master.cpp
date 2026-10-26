@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <thread>
@@ -475,11 +476,13 @@ void LLMMaster::schedule_batch_request(std::vector<Input> inputs,
   }
 
   scheduler_->incr_pending_requests(num_requests);
+  const auto arrival_time = std::chrono::steady_clock::now();
   threadpool_->schedule([this,
                          inputs = std::move(inputs),
                          params = std::move(params),
                          callback = std::move(callback),
-                         num_requests]() mutable {
+                         num_requests,
+                         arrival_time]() mutable {
     AutoCounter handling_latency(
         std::is_same_v<Input, std::string>
             ? COUNTER_request_handling_latency_seconds_completion
@@ -489,8 +492,8 @@ void LLMMaster::schedule_batch_request(std::vector<Input> inputs,
         scheduler_->decr_pending_requests();
       }
     });
-    auto requests =
-        request_factory_->create_batch(std::move(inputs), params, callback);
+    auto requests = request_factory_->create_batch(
+        std::move(inputs), params, callback, arrival_time);
     for (size_t i = 0; i < requests.size(); ++i) {
       if (requests[i] == nullptr) {
         continue;
@@ -529,6 +532,7 @@ void LLMMaster::handle_request(std::string prompt,
                                RequestParams sp,
                                std::optional<Call*> call,
                                OutputCallback callback) {
+  const auto arrival_time = std::chrono::steady_clock::now();
   scheduler_->incr_pending_requests(1);
   // add into the queue
   threadpool_->schedule([this,
@@ -536,6 +540,7 @@ void LLMMaster::handle_request(std::string prompt,
                          prompt_token = std::move(prompt_tokens),
                          sp = std::move(sp),
                          callback = std::move(callback),
+                         arrival_time,
                          call]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_completion);
 
@@ -555,8 +560,13 @@ void LLMMaster::handle_request(std::string prompt,
     }
 
     rate_limit_guard.dismiss();
-    auto request = request_factory_->create(
-        std::move(prompt), std::move(prompt_token), sp, call, callback);
+    auto request = request_factory_->create(std::move(prompt),
+                                            std::move(prompt_token),
+                                            sp,
+                                            call,
+                                            callback,
+                                            /*generation_mode=*/std::nullopt,
+                                            arrival_time);
     if (!request) {
       return;
     }
@@ -575,6 +585,7 @@ void LLMMaster::handle_request(std::vector<Message> messages,
                                RequestParams sp,
                                std::optional<Call*> call,
                                OutputCallback callback) {
+  const auto arrival_time = std::chrono::steady_clock::now();
   scheduler_->incr_pending_requests(1);
   // add into the queue
   threadpool_->schedule([this,
@@ -582,6 +593,7 @@ void LLMMaster::handle_request(std::vector<Message> messages,
                          prompt_token = std::move(prompt_tokens),
                          sp = std::move(sp),
                          callback = std::move(callback),
+                         arrival_time,
                          call]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_chat);
 
@@ -599,7 +611,7 @@ void LLMMaster::handle_request(std::vector<Message> messages,
 
     rate_limit_guard.dismiss();
     auto request = request_factory_->create(
-        messages, std::move(prompt_token), sp, call, callback);
+        messages, std::move(prompt_token), sp, call, callback, arrival_time);
     if (!request) {
       return;
     }

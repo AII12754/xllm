@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -29,6 +30,7 @@ limitations under the License.
 #include "common/options.h"
 #include "common/rate_limiter.h"
 #include "core/common/message.h"
+#include "core/common/metrics.h"
 #include "core/common/types.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
@@ -318,6 +320,134 @@ TEST_F(LLMRequestFactoryTest, RejectsEmptyPromptAndReleasesRateLimitSlot) {
   EXPECT_EQ(capture.status->message(), "Prompt is empty");
   // The factory must release the rate-limit slot on every early return.
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest,
+       ServerTtftIncludesPreprocessingAndRecordsFirstTokenOnce) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams params;
+  params.n = 2;
+  const std::chrono::steady_clock::time_point arrival_time{};
+  auto request = factory->create(/*prompt=*/"hello",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 params,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture),
+                                 /*generation_mode=*/std::nullopt,
+                                 arrival_time);
+  ASSERT_NE(request, nullptr);
+  ASSERT_TRUE(request->expand_sequences(/*share_prefix=*/false));
+  ASSERT_EQ(request->sequences().size(), 2u);
+  const int64_t sample_count =
+      HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
+  const auto first_token_time = arrival_time + std::chrono::seconds(3);
+  EXPECT_FALSE(request->record_server_first_token(first_token_time));
+  EXPECT_FALSE(request->server_ttft_seconds().has_value());
+
+  Sequence& sequence = *request->sequences().back();
+  sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+  sequence.append_token(Token(kNonStopToken));
+  EXPECT_TRUE(request->record_server_first_token(first_token_time));
+  ASSERT_TRUE(request->server_ttft_seconds().has_value());
+  EXPECT_DOUBLE_EQ(*request->server_ttft_seconds(), 3.0);
+  EXPECT_DOUBLE_EQ(sequence.time_to_first_token_latency_seconds(), 0.0);
+  EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+            sample_count + 1);
+
+  Sequence& other_sequence = *request->sequences().front();
+  other_sequence.kv_state().set_kv_cache_tokens_num(
+      other_sequence.num_prompt_tokens());
+  other_sequence.append_token(Token(kNonStopToken));
+  EXPECT_FALSE(request->record_server_first_token(first_token_time +
+                                                  std::chrono::seconds(1)));
+  EXPECT_DOUBLE_EQ(*request->server_ttft_seconds(), 3.0);
+  EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+            sample_count + 1);
+}
+
+TEST_F(LLMRequestFactoryTest,
+       ChatPreservesAdmissionTimeBeforeTemplateRendering) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams params;
+  const std::chrono::steady_clock::time_point arrival_time{};
+  auto request = factory->create(
+      std::vector<Message>{Message("user", std::string("hello"))},
+      /*prompt_tokens=*/std::nullopt,
+      params,
+      /*call=*/std::nullopt,
+      make_capture_callback(&capture),
+      arrival_time);
+  ASSERT_NE(request, nullptr);
+  const std::optional<double> elapsed =
+      request->server_elapsed_seconds(arrival_time + std::chrono::seconds(7));
+  ASSERT_TRUE(elapsed.has_value());
+  EXPECT_DOUBLE_EQ(*elapsed, 7.0);
+}
+
+TEST_F(LLMRequestFactoryTest, ServerTtftRequiresAdmissionAndUncancelledOutput) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  auto request = factory->create(/*prompt=*/"hello",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 RequestParams{},
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+  ASSERT_NE(request, nullptr);
+  Sequence& sequence = *request->sequences().front();
+  sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+  sequence.append_token(Token(kNonStopToken));
+  const int64_t sample_count =
+      HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
+
+  request->state().arrival_time.reset();
+  EXPECT_FALSE(request->record_server_first_token());
+  EXPECT_FALSE(request->server_ttft_seconds().has_value());
+  request->state().arrival_time = std::chrono::steady_clock::now();
+  request->set_cancel();
+  EXPECT_FALSE(request->record_server_first_token());
+  EXPECT_FALSE(request->server_ttft_seconds().has_value());
+  EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+            sample_count);
+}
+
+TEST_F(LLMRequestFactoryTest, PromptBatchPreservesSharedAdmissionTime) {
+  auto factory = make_factory();
+  const std::vector<std::string> prompts = {"hello", "world"};
+  acquire_batch_slots(prompts.size());
+  BatchCallbackCapture capture(prompts.size());
+  const std::chrono::steady_clock::time_point arrival_time{};
+  auto requests = factory->create_batch(
+      prompts, {RequestParams{}}, capture.callback(), arrival_time);
+  ASSERT_EQ(requests.size(), prompts.size());
+  for (const auto& request : requests) {
+    ASSERT_NE(request, nullptr);
+    const std::optional<double> elapsed =
+        request->server_elapsed_seconds(arrival_time + std::chrono::seconds(7));
+    ASSERT_TRUE(elapsed.has_value());
+    EXPECT_DOUBLE_EQ(*elapsed, 7.0);
+  }
+}
+
+TEST_F(LLMRequestFactoryTest, ChatBatchPreservesSharedAdmissionTime) {
+  auto factory = make_factory();
+  const std::vector<std::vector<Message>> conversations = {
+      {Message("user", std::string("hello"))},
+      {Message("user", std::string("world"))}};
+  acquire_batch_slots(conversations.size());
+  BatchCallbackCapture capture(conversations.size());
+  const std::chrono::steady_clock::time_point arrival_time{};
+  auto requests = factory->create_batch(
+      conversations, {RequestParams{}}, capture.callback(), arrival_time);
+  ASSERT_EQ(requests.size(), conversations.size());
+  for (const auto& request : requests) {
+    ASSERT_NE(request, nullptr);
+    const std::optional<double> elapsed =
+        request->server_elapsed_seconds(arrival_time + std::chrono::seconds(7));
+    ASSERT_TRUE(elapsed.has_value());
+    EXPECT_DOUBLE_EQ(*elapsed, 7.0);
+  }
 }
 
 TEST_F(LLMRequestFactoryTest, FailsWhenPromptEncodingFails) {

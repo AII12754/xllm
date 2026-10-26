@@ -267,6 +267,7 @@ DECLARE_HISTOGRAM(num_prompt_tokens_per_request);
 DECLARE_HISTOGRAM(num_generated_tokens_per_request);
 
 DECLARE_HISTOGRAM(time_to_first_token_latency_milliseconds);
+DECLARE_HISTOGRAM(server_time_to_first_token_latency_milliseconds);
 DECLARE_HISTOGRAM(inter_token_latency_milliseconds);
 DECLARE_HISTOGRAM(inter_token_latency_microseconds);
 

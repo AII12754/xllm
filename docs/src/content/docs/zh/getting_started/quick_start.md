@@ -50,8 +50,14 @@ git submodule update --init --recursive
 
 在新镜像中，第一次编译 xllm 耗时较长，因为需要编译 vcpkg 中的所有依赖，但是后续编译会很快。
 ```bash
-# 只编译 cpp 二进制文件
+# 编译 C++ 二进制文件和 Python 扩展，不编译单测目标
 python setup.py build
+
+# 编译产品、编译并运行单测
+python setup.py build test
+
+# 编译并运行指定单测目标
+python setup.py test --test-name common_test
 
 # 编译 python wheel
 python setup.py bdist_wheel
@@ -59,6 +65,16 @@ python setup.py bdist_wheel
 # 编译 python wheel 并安装
 python setup.py install
 ```
+
+`build` 只编译交付产物；`build test` 随后复用同一个构建目录编译并运行单测。
+已有产品构建时，也可单独执行 `python setup.py test` 来编译并运行单测。
+为兼容第三方构建定义，CMake 中仍保留测试目标注册。
+可传入 `--device npu` 等参数指定硬件后端。
+构建 wheel 时仍会编译和运行单测，设置 `SKIP_TEST=1` 可跳过；
+`SKIP_EXPORT=1` 则单独控制普通构建是否编译 Python 扩展。
+使用 `MAX_JOBS` 控制原生代码和 xllm_ops 的编译并发数；如需单独调整
+xllm_ops，可设置 `OPS_CPU_NUMBER`。运行 NPU 单测时建议设置
+`CTEST_PARALLEL=1`，避免超过设备允许的进程数。
 
 ## 启动xllm
 请参考 [xllm 启动方式](/zh/getting_started/launch_xllm/)。

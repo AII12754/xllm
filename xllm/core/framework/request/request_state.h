@@ -18,6 +18,7 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <limits>
@@ -134,6 +135,10 @@ class RequestState final {
   RequestState& operator=(const RequestState&) = delete;
 
  public:
+  // Captured before request preprocessing, using the local monotonic clock.
+  // Profile and warmup requests leave this unset.
+  std::optional<std::chrono::steady_clock::time_point> arrival_time;
+
   // sampling parameters
   RequestSamplingParam sampling_param;
 

@@ -206,6 +206,9 @@ DEFINE_HISTOGRAM(num_generated_tokens_per_request,
 // ttft latency histogram
 DEFINE_HISTOGRAM(time_to_first_token_latency_milliseconds,
                  "Histogram of time to first token latency in milliseconds");
+DEFINE_HISTOGRAM(server_time_to_first_token_latency_milliseconds,
+                 "Time from preprocessing admission to first-token output "
+                 "readiness, once per request, in milliseconds");
 // inter token latency histogram
 DEFINE_HISTOGRAM(inter_token_latency_milliseconds,
                  "Histogram of inter token latency in milliseconds");

@@ -19,8 +19,10 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -89,6 +91,20 @@ class Request : public RequestBase {
   void set_upstream_latency_seconds(double upstream_latency_seconds);
 
   double end_to_end_latency_seconds() const;
+
+  // Record first-token output readiness once per request. The scheduler calls
+  // this before local detokenization or after a successful PD handoff.
+  // Returns true only when a new sample is recorded for a real generated token.
+  bool record_server_first_token(std::chrono::steady_clock::time_point now =
+                                     std::chrono::steady_clock::now());
+
+  std::optional<double> server_ttft_seconds() const {
+    return server_ttft_seconds_;
+  }
+
+  std::optional<double> server_elapsed_seconds(
+      std::chrono::steady_clock::time_point now =
+          std::chrono::steady_clock::now()) const;
 
   void log_error_statistic(Status status);
 
@@ -207,6 +223,8 @@ class Request : public RequestBase {
   bool prefix_cache_hit_metrics_recorded_ = false;
 
   double end_to_end_latency_offset_seconds_ = 0.0;
+
+  std::optional<double> server_ttft_seconds_;
 
   void create_sequences_group();
 };

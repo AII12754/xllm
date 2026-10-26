@@ -331,6 +331,8 @@ class DelayedReservationService final : public proto::DisaggPDService {
 
   std::future<void> release_started() { return release_started_.get_future(); }
 
+  std::function<void()> before_first_generation_ack;
+
   void ReleaseReservation(google::protobuf::RpcController* /*controller*/,
                           const proto::ReleaseReservationRequest* request,
                           proto::ReleaseReservationResponse* response,
@@ -376,6 +378,9 @@ class DelayedReservationService final : public proto::DisaggPDService {
         /*source_mappings=*/{},
         gen.dp_size(),
         gen.dp_rank()));
+    if (before_first_generation_ack) {
+      before_first_generation_ack();
+    }
   }
 
   void resume_releases() {
@@ -1398,6 +1403,16 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
 
   auto local_healthy = make_request({11, 12}, "healthy");
   local_healthy->state().stream = true;
+  local_healthy->state().arrival_time =
+      std::chrono::steady_clock::now() - std::chrono::seconds(3);
+  const int64_t server_ttft_count =
+      HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
+  service.before_first_generation_ack = [&] {
+    EXPECT_FALSE(local_healthy->server_ttft_seconds().has_value());
+    EXPECT_FALSE(remote_healthy->server_ttft_seconds().has_value());
+    EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+              server_ttft_count);
+  };
   local_healthy->state().pd_reservation_id = "healthy-reservation";
   prefill.admit_prefill(local_healthy, &stub);
   auto batch = prefill.prepare_batch();
@@ -1416,6 +1431,13 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   EXPECT_EQ(status, std::future_status::ready);
   std::shared_ptr<Request> queued;
   if (status == std::future_status::ready) {
+    EXPECT_TRUE(local_healthy->server_ttft_seconds().has_value());
+    if (local_healthy->server_ttft_seconds().has_value()) {
+      EXPECT_GE(*local_healthy->server_ttft_seconds(), 3.0);
+    }
+    EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+              server_ttft_count + 1);
+    EXPECT_FALSE(remote_healthy->record_server_first_token());
     EXPECT_TRUE(decode.pop_decode_request_for_test(&queued));
     EXPECT_EQ(queued, remote_healthy);
     EXPECT_EQ(remote_healthy->sequences()[0]->num_generated_tokens(), 1u);
@@ -1432,6 +1454,48 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   }
   decode_engine.block_manager_pool()->deallocate_without_cache(
       remote_healthy->sequences()[0].get());
+  server.Stop(0);
+  server.Join();
+}
+
+TEST(DisaggPDSchedulerTest, FailedFirstGenerationDoesNotRecordServerTtft) {
+  FakeEngine decode_engine(/*num_blocks=*/4, /*block_size=*/2);
+  TestDisaggPDScheduler decode(&decode_engine, make_decode_options());
+  // The Decode side has no reservation, so it rejects FirstGeneration.
+  DelayedReservationService service(&decode);
+  service.resume_releases();
+  brpc::Server server;
+  ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
+  ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
+  const std::string address =
+      "127.0.0.1:" + std::to_string(server.listen_address().port);
+  brpc::Channel channel;
+  ASSERT_EQ(channel.Init(address.c_str(), nullptr), 0);
+  proto::DisaggPDService_Stub stub(&channel);
+
+  FakeEngine prefill_engine(/*num_blocks=*/4, /*block_size=*/2);
+  auto options = make_options();
+  options.enable_chunked_prefill(false).kv_cache_transfer_mode("PUSH");
+  TestDisaggPDScheduler prefill(&prefill_engine, options);
+  auto request = make_request({11, 12});
+  request->state().arrival_time =
+      std::chrono::steady_clock::now() - std::chrono::seconds(3);
+  request->state().pd_reservation_id = "missing-reservation";
+  request->state().decode_rpc_address = address;
+  request->state().output_func = [](const RequestOutput&) { return true; };
+  const int64_t server_ttft_count =
+      HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
+  prefill.admit_prefill(request, &stub);
+  ASSERT_FALSE(prefill.prepare_batch()[0].empty());
+  finish_prefill(request->sequences()[0].get());
+  request->sequences()[0]->first_token() = RemoteToken{.token_id = 999};
+  prefill.prefill_send_first_generation();
+  prefill.prefill_completion().get();
+  prefill.wait_notifications();
+  EXPECT_FALSE(request->server_ttft_seconds().has_value());
+  EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+            server_ttft_count);
+  EXPECT_EQ(prefill_engine.block_manager_pool()->num_used_blocks()[0], 0u);
   server.Stop(0);
   server.Join();
 }

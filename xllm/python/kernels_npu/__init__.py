@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 
 _EXPORTS = {
-    "activation": ("silu_and_mul",),
+    "activation": ("silu_and_mul", "fused_sigmoid_mul"),
     "attention": (
         "reshape_paged_cache",
         "update_decode_graph_metadata",
@@ -153,6 +153,7 @@ __all__ = [
     "POOL_KEY_INDEXER_MASK_MODE",
     "rms_norm_sigmoid_gated",
     "fused_eh_norm",
+    "fused_sigmoid_mul",
     "silu_and_mul",
     "dequant_swiglu_quant",
     "reshape_paged_cache",

@@ -215,6 +215,24 @@ TTFT 和输出吞吐，并说明输入 token 的统计口径。
 保留 `--stream`，才能观测 TTFT 和 token 到达间隔。这些指标反映客户端看到的服务性能；
 设备执行分析请参见[在线服务性能分析](/zh/dev_guide/online_profiling/)。
 
+### 服务端 TTFT 的统计边界
+
+客户端 benchmark 的 TTFT 与服务端指标有不同的计时边界，横向比较框架时应使用
+同一个客户端、接口和首个有效输出 chunk 的判定规则。
+
+| 服务端指标 | 起点与终点 | 统计粒度 |
+| --- | --- | --- |
+| `time_to_first_token_latency_milliseconds` | Sequence 创建至调度器处理首个真实 token；包含调度排队和全部 prefill，不包含此前的模板处理、tokenization 和请求线程池等待。 | 每个 Sequence；保留原有日志、心跳和调度使用的口径。 |
+| `server_time_to_first_token_latency_milliseconds` | LLM/VLM 请求进入预处理线程池之前至调度器处理首个真实 token；包含模板处理、tokenization、预处理排队和推理等待，终点早于输出分发和反分词。 | 每个 Request 一次，`n`/`best_of` 不会增加同一请求的样本数。 |
+
+两个指标均使用毫秒，非流式请求也可记录实际首 token 的服务端耗时。新指标使用
+单调时钟；没有接入计时标记的内部 warmup/profiling 请求不产生新指标样本。
+
+PD 模式的新指标由原始 Prefill 接入端在收到 Decode 的 `FirstGeneration` 成功确认后
+记录。它包含 handoff、必要的 KV 恢复和确认返回时间，使用同一接入端时钟，Decode
+不重复上报。该边界是接入端确认首输出已被接管的时刻，仍不包含外部 xllm-service
+网关和客户端网络的完整耗时，也不等于客户端收到首个可见文本的时刻。
+
 EvalScope 会打印 `RUN_DIR`下的实际结果路径，写入 `benchmark.log`，并为多档并发运行生成
 `performance_summary.txt`。保留各次运行的请求数据库 `benchmark_data.db`，便于在结果
 异常时检查请求内容、失败原因、实际长度和耗时。

@@ -122,4 +122,9 @@ jobs:
       timeout-minutes: 60
       run: |
         chmod +x ./cibuild/build_cuda.sh
-        bash cibuild/build_cuda.sh 'pip install pre-commit -i https://pypi.tuna.tsinghua.edu.cn/simple; python setup.py build --device cuda'
+        bash cibuild/build_cuda.sh '
+          pip install pre-commit -i https://pypi.tuna.tsinghua.edu.cn/simple
+          python setup.py build --device cuda
+          cmake --build "$(python -c "from scripts.build_support.utils import get_cmake_dir; print(get_cmake_dir())")" \
+            --target all_tests --parallel "${MAX_JOBS:-$(nproc)}"
+        '

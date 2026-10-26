@@ -851,7 +851,11 @@ TEST(ContinuousSchedulerTest, EmptyOverlapOutputPreservesLatencyClock) {
     ASSERT_EQ(sequence->stage(), SequenceStage::DECODE);
     ASSERT_EQ(sequence->generated_tokens_since_latency(), 0u);
     const absl::Time start = absl::Now() - absl::Seconds(10);
+    request->state().arrival_time =
+        std::chrono::steady_clock::now() - std::chrono::seconds(10);
     sequence->tbt_microseconds(start);
+    const int64_t server_ttft_count =
+        HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
     const int64_t ttft_count =
         HISTOGRAM_time_to_first_token_latency_milliseconds.count();
     const int64_t itl_count =
@@ -863,6 +867,9 @@ TEST(ContinuousSchedulerTest, EmptyOverlapOutputPreservesLatencyClock) {
     // consuming a delayed overlap output.
     scheduler.process_batch_output_test();
     scheduler.process_batch_output_test();
+    EXPECT_FALSE(request->server_ttft_seconds().has_value());
+    EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+              server_ttft_count);
     EXPECT_EQ(HISTOGRAM_time_to_first_token_latency_milliseconds.count(),
               ttft_count);
     EXPECT_EQ(HISTOGRAM_inter_token_latency_microseconds.count(), itl_count);
@@ -874,6 +881,10 @@ TEST(ContinuousSchedulerTest, EmptyOverlapOutputPreservesLatencyClock) {
     ASSERT_TRUE(sequence->is_first_token());
     ASSERT_EQ(sequence->generated_tokens_since_latency(), 1u);
     scheduler.process_batch_output_test();
+    ASSERT_TRUE(request->server_ttft_seconds().has_value());
+    EXPECT_GE(*request->server_ttft_seconds(), 10.0);
+    EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+              server_ttft_count + 1);
     EXPECT_EQ(HISTOGRAM_time_to_first_token_latency_milliseconds.count(),
               ttft_count + 1);
     EXPECT_EQ(HISTOGRAM_inter_token_latency_microseconds.count(), itl_count);
@@ -896,6 +907,8 @@ TEST(ContinuousSchedulerTest, EmptyOverlapOutputPreservesLatencyClock) {
               itl_count + 1);
     EXPECT_EQ(HISTOGRAM_inter_token_latency_milliseconds.count(),
               itl_ms_count + 1);
+    EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+              server_ttft_count + 1);
   }
 }
 

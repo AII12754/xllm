@@ -104,6 +104,33 @@ double Request::end_to_end_latency_seconds() const {
   return elapsed_seconds() + end_to_end_latency_offset_seconds_;
 }
 
+std::optional<double> Request::server_elapsed_seconds(
+    std::chrono::steady_clock::time_point now) const {
+  if (!state_.arrival_time.has_value()) {
+    return std::nullopt;
+  }
+  return std::chrono::duration<double>(now - *state_.arrival_time).count();
+}
+
+bool Request::record_server_first_token(
+    std::chrono::steady_clock::time_point now) {
+  if (server_ttft_seconds_.has_value() || !state_.arrival_time.has_value() ||
+      cancelled() || error_status().has_value()) {
+    return false;
+  }
+  const bool has_generated_token =
+      std::any_of(sequences().begin(), sequences().end(), [](const auto& seq) {
+        return seq->num_valid_generated_tokens() > 0;
+      });
+  if (!has_generated_token) {
+    return false;
+  }
+  server_ttft_seconds_ = server_elapsed_seconds(now);
+  HISTOGRAM_OBSERVE(server_time_to_first_token_latency_milliseconds,
+                    static_cast<int64_t>(*server_ttft_seconds_ * 1000.0 + 0.5));
+  return true;
+}
+
 void Request::log_statistic(double total_latency) {
   log_statistic(total_latency, speculative_token_stats_snapshot());
 }

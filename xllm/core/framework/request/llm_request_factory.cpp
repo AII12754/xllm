@@ -350,7 +350,8 @@ std::shared_ptr<Request> LLMRequestFactory::create(
     const RequestParams& sp,
     std::optional<Call*> call,
     OutputCallback callback,
-    std::optional<ChatTemplateGenerationMode> generation_mode) {
+    std::optional<ChatTemplateGenerationMode> generation_mode,
+    std::chrono::steady_clock::time_point arrival_time) {
   // The caller (service_impl) has already incremented the rate limiter's
   // slot via is_limited() returning false. This guard releases it on any
   // early return below; we dismiss it right before Request takes ownership.
@@ -512,6 +513,7 @@ std::shared_ptr<Request> LLMRequestFactory::create(
                          batch_callback_,
                          sp.decode_address,
                          call);
+  req_state.arrival_time = arrival_time;
   if (!sp.source_xservice_addr.empty()) {
     req_state.response_type = sp.response_type;
     req_state.response_model = sp.response_model;
@@ -543,7 +545,8 @@ std::shared_ptr<Request> LLMRequestFactory::create(
     std::optional<std::vector<int>> prompt_tokens,
     const RequestParams& sp,
     std::optional<Call*> call,
-    OutputCallback callback) {
+    OutputCallback callback,
+    std::chrono::steady_clock::time_point arrival_time) {
   // Guard the rate-limit slot the caller acquired via is_limited(). The
   // string-prompt overload installs its own guard once we forward there;
   // we dismiss ours right before that call so the slot is not released
@@ -573,22 +576,30 @@ std::shared_ptr<Request> LLMRequestFactory::create(
                 sp,
                 call,
                 std::move(callback),
-                render_result->generation_mode);
+                render_result->generation_mode,
+                arrival_time);
 }
 
 std::vector<std::shared_ptr<Request>> LLMRequestFactory::create_batch(
     std::vector<std::string> prompts,
     const std::vector<RequestParams>& params,
-    const BatchOutputCallback& callback) {
-  return create_batch(prompts.size(), params, callback, [&prompts](size_t i) {
-    return BatchPrompt{std::move(prompts[i]), std::nullopt};
-  });
+    const BatchOutputCallback& callback,
+    std::chrono::steady_clock::time_point arrival_time) {
+  return create_batch(
+      prompts.size(),
+      params,
+      callback,
+      [&prompts](size_t i) {
+        return BatchPrompt{std::move(prompts[i]), std::nullopt};
+      },
+      arrival_time);
 }
 
 std::vector<std::shared_ptr<Request>> LLMRequestFactory::create_batch(
     const std::vector<std::vector<Message>>& conversations,
     const std::vector<RequestParams>& params,
-    const BatchOutputCallback& callback) {
+    const BatchOutputCallback& callback,
+    std::chrono::steady_clock::time_point arrival_time) {
   return create_batch(
       conversations.size(),
       params,
@@ -604,14 +615,16 @@ std::vector<std::shared_ptr<Request>> LLMRequestFactory::create_batch(
         COUNTER_ADD(chat_template_latency_seconds, timer.elapsed_seconds());
         return BatchPrompt{std::move(rendered->prompt),
                            rendered->generation_mode};
-      });
+      },
+      arrival_time);
 }
 
 std::vector<std::shared_ptr<Request>> LLMRequestFactory::create_batch(
     size_t num_requests,
     const std::vector<RequestParams>& params,
     const BatchOutputCallback& batch_callback,
-    const std::function<std::optional<BatchPrompt>(size_t)>& prepare_prompt) {
+    const std::function<std::optional<BatchPrompt>(size_t)>& prepare_prompt,
+    std::chrono::steady_clock::time_point arrival_time) {
   CHECK(params.size() == num_requests || params.size() == 1);
   std::vector<std::shared_ptr<Request>> requests(num_requests);
   std::vector<OutputCallback> callbacks;
@@ -653,7 +666,8 @@ std::vector<std::shared_ptr<Request>> LLMRequestFactory::create_batch(
                            sp,
                            std::nullopt,
                            callback,
-                           prompt->generation_mode);
+                           prompt->generation_mode,
+                           arrival_time);
       continue;
     }
     modes[i] = prompt->generation_mode;
@@ -674,7 +688,8 @@ std::vector<std::shared_ptr<Request>> LLMRequestFactory::create_batch(
                                  params[params.size() == 1 ? 0 : first],
                                  std::nullopt,
                                  callbacks[first],
-                                 modes[first]);
+                                 modes[first],
+                                 arrival_time);
         break;
       }
       Timer timer;
@@ -692,7 +707,8 @@ std::vector<std::shared_ptr<Request>> LLMRequestFactory::create_batch(
                              params[params.size() == 1 ? 0 : i],
                              std::nullopt,
                              callbacks[i],
-                             modes[i]);
+                             modes[i],
+                             arrival_time);
       }
       if (encoded) {
         break;

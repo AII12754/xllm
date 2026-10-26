@@ -60,7 +60,6 @@ from scripts.build_support.utils import (
 )
 from scripts.logger import logger
 
-BUILD_TEST_FILE: bool = True
 BUILD_EXPORT: bool = True
 
 
@@ -323,12 +322,14 @@ class CMakeExtension(Extension):
 
 
 class ExtBuild(build_ext):
+    build_test_targets = False
+
     user_options = build_ext.user_options + [
         ("base-dir=", None, "base directory of xLLM project"),
         ("device=", None, "target device type (npu or mlu or cuda or ilu or musa or maca)"),
         ("arch=", None, "target arch type (x86 or arm)"),
         ("generate-so=", None, "generate so or binary"),
-        ("dev=", None, "build for fast iteration: -O1 and no unit tests"),
+        ("dev=", None, "build with -O1 for fast iteration"),
         ("tilelang-jobs=", None, "maximum parallel TileLang compile workers"),
     ]
 
@@ -439,8 +440,6 @@ class ExtBuild(build_ext):
                 "-DBUILD_TESTING=OFF",
             ]
             set_musa_envs()
-            global BUILD_TEST_FILE
-            BUILD_TEST_FILE = False
         elif self.device == "cuda":
             # Let CMake choose a compiler-compatible default when the caller
             # does not provide an explicit architecture list.
@@ -531,6 +530,9 @@ class ExtBuild(build_ext):
 
         env: dict[str, str] = os.environ.copy()
         env["VCPKG_MAX_CONCURRENCY"] = str(max_jobs)
+        # xllm_ops otherwise defaults to twice the host CPU count, ignoring
+        # Ninja's job budget during its configure-time build.
+        env.setdefault("OPS_CPU_NUMBER", max_jobs)
         configure_ccache(env)
         logger.info(f"CMake Args: {cmake_args}")
         logger.info(f"Env: {env}")
@@ -539,7 +541,12 @@ class ExtBuild(build_ext):
 
     def _configure_cmake(self, cmake_cmd: str, cmake_args: list[str], env: dict[str, str]) -> list[str]:
         cmake_dir = get_cmake_dir()
-        subprocess.check_call([cmake_cmd, self.base_dir] + cmake_args, cwd=cmake_dir, env=env)
+        if self.build_test_targets and self.device == "musa":
+            raise ValueError("Unit-test targets are not supported for the musa backend.")
+        # torch_npu_ops sets properties on its tests unconditionally, so keep
+        # registration enabled and select product/test targets at build time.
+        testing_option = f"-DBUILD_TESTING={'OFF' if self.device == 'musa' else 'ON'}"
+        subprocess.check_call([cmake_cmd, self.base_dir] + cmake_args + [testing_option], cwd=cmake_dir, env=env)
         with open(os.path.join(cmake_dir, "mooncake_ha_runtime_libraries.txt"), encoding="utf-8") as runtime_file:
             ha_libraries = runtime_file.read().splitlines()
         if ha_libraries:
@@ -564,6 +571,8 @@ class ExtBuild(build_ext):
         # Build every native executable shipped in the wheel so stale Mooncake
         # binaries cannot be reused from a previous build directory.
         build_targets = [ext.name, "mooncake_master", "mooncake_client", "stage_mooncake_ha_runtime"]
+        if BUILD_EXPORT:
+            build_targets.append("export_module")
         build_cmd = [cmake_cmd, "--build", ".", "--verbose"] + build_args + ["--target"]
         subprocess.check_call(build_cmd + build_targets, cwd=cmake_dir, env=env)
 
@@ -612,17 +621,11 @@ class ExtBuild(build_ext):
 
         _stage_auto_tuning_config(self.base_dir, extdir)
 
-        if BUILD_EXPORT:
-            # build export module
-            subprocess.check_call(build_cmd + ["export_module"], cwd=cmake_dir)
-
-        if BUILD_TEST_FILE:
-            # build tests target
-            subprocess.check_call(build_cmd + ["all_tests"], cwd=cmake_dir)
-
 
 class ExtBuildSingleTest(ExtBuild):
     """Inherit ExtBuild, used to build and run a single test"""
+
+    build_test_targets = True
 
     user_options = ExtBuild.user_options + [
         ("test-name=", None, "name of the test target to build and run"),
@@ -735,8 +738,6 @@ class BuildDistWheel(bdist_wheel):
         super().finalize_options()
 
     def run(self) -> None:
-        global BUILD_TEST_FILE
-
         build_ext_cmd = self.get_finalized_command("build_ext")
         build_ext_cmd.device = self.device
         build_ext_cmd.arch = self.arch
@@ -747,6 +748,8 @@ class BuildDistWheel(bdist_wheel):
 
         if "SKIP_TEST" in os.environ:
             logger.info("⏭️ skipping UT because SKIP_TEST is set")
+        elif self.device == "musa":
+            logger.info("Skipping UT because the musa backend does not provide test targets")
         else:
             logger.info("🧪 testing UT...")
             self.run_command("test")
@@ -764,8 +767,6 @@ class BuildDistWheel(bdist_wheel):
                 path = os.path.join(root, item)
                 if "_test" in item and os.path.isfile(path):
                     os.remove(path)
-        BUILD_TEST_FILE = False
-
         self.skip_build = True
         InstallWheel._building_wheel = True
         try:
@@ -838,9 +839,9 @@ class InstallWheel(install):
         return None
 
 
-class TestUT(Command):
-    description = "Run all testing binary."
-    user_options = []
+class TestUT(ExtBuild):
+    description = "Build and run all unit-test targets."
+    build_test_targets = True
 
     # Whitelist: tests that must run sequentially (not in parallel with others)
     # Add test names here if they use fork() or have device initialization conflicts
@@ -854,11 +855,29 @@ class TestUT(Command):
         "FusedMoEAll2AllMultiDeviceTest",
     ]
 
-    def initialize_options(self) -> None:
-        pass
-
-    def finalize_options(self) -> None:
-        pass
+    def build_cmake_targets(
+        self,
+        ext: CMakeExtension,
+        cmake_args: list[str],
+        build_args: list[str],
+        env: dict[str, str],
+        extdir: str,
+        product: str,
+    ) -> None:
+        cmake_cmd = "cmake_maca" if self.device == "maca" else "cmake"
+        self._configure_cmake(cmake_cmd, cmake_args, env)
+        subprocess.check_call(
+            [cmake_cmd, "--build", ".", "--verbose"] + build_args + ["--target", "all_tests"],
+            cwd=get_cmake_dir(),
+            env=env,
+        )
+        # Embedded MLU tests import these packages from the build directory,
+        # including when no product build has prepared that directory yet.
+        # Make xllm a regular package so an installed wheel cannot shadow it.
+        shutil.copy2(os.path.join(self.base_dir, "xllm", "__init__.py"), os.path.join(extdir, "__init__.py"))
+        _stage_mlu_triton_kernels(self.base_dir, extdir, self.device)
+        _stage_triton_compiler_package(self.base_dir, extdir)
+        self.run_ctest(get_cmake_dir())
 
     def run_ctest(self, cmake_dir: str) -> int:
         default_parallel: int = max(os.cpu_count() or 1, 8)
@@ -937,9 +956,6 @@ class TestUT(Command):
         except subprocess.CalledProcessError as e:
             logger.exception(f"ctest failed: {e.stderr}")
             exit(1)
-
-    def run(self) -> None:
-        self.run_ctest(get_cmake_dir())
 
 
 class SingleTest(Command):
@@ -1034,7 +1050,7 @@ def parse_arguments() -> dict[str, Any]:
     parser.add_argument(
         "--dev",
         action="store_true",
-        help="Build for fast iteration: -O1 and skip the unit-test targets; never ship the result",
+        help="Build with -O1 for fast iteration; never ship the result",
     )
 
     args = parser.parse_args()
@@ -1067,13 +1083,8 @@ if __name__ == "__main__":
     tilelang_jobs = config.get("tilelang_jobs")
     dev = config.get("dev", False)
 
-    if "SKIP_TEST" in os.environ:
-        BUILD_TEST_FILE = False
     if dev:
-        # Iterating on the main binary does not need the unit-test executables,
-        # which are a large share of a full build.
-        logger.warning("🛠️ dev mode: -O1, unit-test targets are not built; do not ship this build")
-        BUILD_TEST_FILE = False
+        logger.warning("🛠️ dev mode: -O1; do not ship this build")
     if "SKIP_EXPORT" in os.environ:
         BUILD_EXPORT = False
 
@@ -1098,6 +1109,7 @@ if __name__ == "__main__":
             "tilelang_jobs": tilelang_jobs,
         },
     }
+    options["test"] = options["build_ext"].copy()
     if test_name:
         options["test"] = {
             "device": device,
@@ -1136,7 +1148,12 @@ if __name__ == "__main__":
             "Topic :: Scientific/Engineering :: Artificial Intelligence",
         ],
         ext_modules=[CMakeExtension("xllm", "xllm/")],
-        cmdclass={"build_ext": ExtBuild, "test": test_cmd, "install": InstallWheel, "bdist_wheel": BuildDistWheel},
+        cmdclass={
+            "build_ext": ExtBuild,
+            "test": test_cmd,
+            "install": InstallWheel,
+            "bdist_wheel": BuildDistWheel,
+        },
         options=options,
         packages=find_namespace_packages(include=["scripts", "scripts.*"]) + find_packages(where="xllm-kernel/python"),
         package_dir={"xllm_kernel": "xllm-kernel/python/xllm_kernel"},

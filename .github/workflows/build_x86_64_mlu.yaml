@@ -119,4 +119,10 @@ jobs:
       timeout-minutes: 60
       run: |
         chmod +x ./cibuild/build_mlu.sh
-        bash cibuild/build_mlu.sh 'pip install pre-commit -i https://pypi.tuna.tsinghua.edu.cn/simple; XLLM_SKIP_MLU_TRITON_AOT=1 python setup.py build --device mlu'
+        bash cibuild/build_mlu.sh '
+          pip install pre-commit -i https://pypi.tuna.tsinghua.edu.cn/simple
+          export XLLM_SKIP_MLU_TRITON_AOT=1
+          python setup.py build --device mlu
+          cmake --build "$(python -c "from scripts.build_support.utils import get_cmake_dir; print(get_cmake_dir())")" \
+            --target all_tests --parallel "${MAX_JOBS:-$(nproc)}"
+        '

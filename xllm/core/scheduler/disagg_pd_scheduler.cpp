@@ -1002,6 +1002,10 @@ void DisaggPDScheduler::prefill_send_first_generation() {
                       "Failed to send first generation to decode instance"});
         continue;
       }
+      // Measure the handoff on the original ingress clock. Decode acknowledges
+      // only after restoring KV and accepting the first output; this includes
+      // the acknowledgement's return trip without comparing clocks on hosts.
+      request->record_server_first_token();
       request->state().decode_rpc_address.clear();
 
       {

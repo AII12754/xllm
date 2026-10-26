@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -58,25 +59,33 @@ class VLMRequestFactory final {
                     RateLimiter* rate_limiter);
 
   // completion: a text prompt plus already-decoded multimodal data.
-  std::shared_ptr<Request> create(std::string prompt,
-                                  MMData mm_data,
-                                  const RequestParams& sp,
-                                  OutputCallback callback);
+  std::shared_ptr<Request> create(
+      std::string prompt,
+      MMData mm_data,
+      const RequestParams& sp,
+      OutputCallback callback,
+      std::chrono::steady_clock::time_point arrival_time =
+          std::chrono::steady_clock::now());
 
   // chat: decodes the multimodal payload and renders messages into a prompt,
   // then delegates to the completion overload above.
-  std::shared_ptr<Request> create(std::vector<Message> messages,
-                                  const RequestParams& sp,
-                                  std::string payload,
-                                  OutputCallback callback,
-                                  bool use_prompt_as_is = false);
+  std::shared_ptr<Request> create(
+      std::vector<Message> messages,
+      const RequestParams& sp,
+      std::string payload,
+      OutputCallback callback,
+      bool use_prompt_as_is = false,
+      std::chrono::steady_clock::time_point arrival_time =
+          std::chrono::steady_clock::now());
 
  private:
-  std::shared_ptr<Request> build_request(std::string prompt,
-                                         std::vector<int32_t> prompt_tokens,
-                                         MMData mm_data,
-                                         const RequestParams& sp,
-                                         OutputCallback callback);
+  std::shared_ptr<Request> build_request(
+      std::string prompt,
+      std::vector<int32_t> prompt_tokens,
+      MMData mm_data,
+      const RequestParams& sp,
+      OutputCallback callback,
+      std::chrono::steady_clock::time_point arrival_time);
 
   // Builds the stopping checker, encoding any stop sequences. Returns
   // std::nullopt after firing an error callback when a stop sequence fails to

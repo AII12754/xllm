@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -74,15 +75,20 @@ class LLMRequestFactory final {
       const RequestParams& sp,
       std::optional<Call*> call,
       OutputCallback callback,
-      std::optional<ChatTemplateGenerationMode> generation_mode = std::nullopt);
+      std::optional<ChatTemplateGenerationMode> generation_mode = std::nullopt,
+      std::chrono::steady_clock::time_point arrival_time =
+          std::chrono::steady_clock::now());
 
   // chat: renders messages through the chat template, then delegates to the
   // text-prompt overload above.
-  std::shared_ptr<Request> create(const std::vector<Message>& messages,
-                                  std::optional<std::vector<int>> prompt_tokens,
-                                  const RequestParams& sp,
-                                  std::optional<Call*> call,
-                                  OutputCallback callback);
+  std::shared_ptr<Request> create(
+      const std::vector<Message>& messages,
+      std::optional<std::vector<int>> prompt_tokens,
+      const RequestParams& sp,
+      std::optional<Call*> call,
+      OutputCallback callback,
+      std::chrono::steady_clock::time_point arrival_time =
+          std::chrono::steady_clock::now());
 
   // Verify and build an explicit batch on a request worker. Results retain
   // input order, with nullptr for requests rejected through callback. Each
@@ -90,12 +96,16 @@ class LLMRequestFactory final {
   std::vector<std::shared_ptr<Request>> create_batch(
       std::vector<std::string> prompts,
       const std::vector<RequestParams>& params,
-      const BatchOutputCallback& callback);
+      const BatchOutputCallback& callback,
+      std::chrono::steady_clock::time_point arrival_time =
+          std::chrono::steady_clock::now());
 
   std::vector<std::shared_ptr<Request>> create_batch(
       const std::vector<std::vector<Message>>& conversations,
       const std::vector<RequestParams>& params,
-      const BatchOutputCallback& callback);
+      const BatchOutputCallback& callback,
+      std::chrono::steady_clock::time_point arrival_time =
+          std::chrono::steady_clock::now());
 
  private:
   struct BatchPrompt {
@@ -107,7 +117,8 @@ class LLMRequestFactory final {
       size_t num_requests,
       const std::vector<RequestParams>& params,
       const BatchOutputCallback& callback,
-      const std::function<std::optional<BatchPrompt>(size_t)>& prepare_prompt);
+      const std::function<std::optional<BatchPrompt>(size_t)>& prepare_prompt,
+      std::chrono::steady_clock::time_point arrival_time);
 
   // Encodes the prompt (or accepts pre-tokenized input) and validates it
   // against the vocabulary range and the context-length limit. Returns the

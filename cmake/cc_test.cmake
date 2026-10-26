@@ -114,11 +114,20 @@ function(cc_test)
   )
 
   if(USE_NPU AND NOT CC_TEST_NO_NPU_RUNTIME)
-    target_sources(${CC_TEST_NAME} PRIVATE
-      "${PROJECT_SOURCE_DIR}/tests/npu_test_environment.cpp"
-    )
-    set(COMMON_LIBS ascendcl Python::Python torch_npu torch_python)
-    target_link_libraries(${CC_TEST_NAME} PRIVATE ${COMMON_LIBS})
+    if(NOT TARGET xllm_npu_test_runtime)
+      # Reuse one object while retaining the global gtest Environment in each
+      # executable; a static archive could discard its registration initializer.
+      add_library(xllm_npu_test_runtime OBJECT
+        "${PROJECT_SOURCE_DIR}/tests/npu_test_environment.cpp"
+      )
+      target_include_directories(xllm_npu_test_runtime PRIVATE
+        "$<BUILD_INTERFACE:${COMMON_INCLUDE_DIRS}>"
+      )
+      target_link_libraries(xllm_npu_test_runtime PUBLIC
+        GTest::gtest ascendcl Python::Python torch_npu torch_python
+      )
+    endif()
+    target_link_libraries(${CC_TEST_NAME} PRIVATE xllm_npu_test_runtime)
   endif()
 
   add_dependencies(all_tests ${CC_TEST_NAME})
