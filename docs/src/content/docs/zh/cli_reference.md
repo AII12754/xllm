@@ -356,12 +356,6 @@ engine 从正常回收的结果统计逐位置前缀接受概率
 |:---------|:-----|:-------|:---------|
 | `extension_impl` | `string` | `""` | 为模型、执行器等注册组件选择原生扩展实现族；空值保留原有选择方式。所选实现族必须已注册；该实现族未注册的组件继续使用原有选择方式。 |
 | `enable_graph` | `bool` | `false` | 是否在 decode 阶段启用图执行以降低 kernel launch 开销和设备空闲时间；支持 CUDA Graph、ACL Graph（NPU）、MLU Graph 和 DCU Graph，详见 [图执行](/zh/features/graph_mode/)。 |
-| `enable_npu_batched_sampling` | `bool` | `false` | 在支持的 NPU 输入形状上使用批量分类抽样，最多支持 4096 行、262144 个词表项。seed/offset 请求与批次顺序无关；随机行全部带 seed 时不消耗全局 RNG。确定性随机序列与原采样实现不同。 |
-| `enable_npu_fused_logits_sampling` | `bool` | `false` | 融合 NPU logits 归一化与分类采样，避免物化完整概率张量。普通采样需要同时启用 `enable_npu_batched_sampling=true`。 |
-| `enable_npu_verification_sampling` | `bool` | `false` | 对至少 8 行的受支持批次，融合 NPU 验证阶段 bonus 与残差分布的分类采样。 |
-| `enable_npu_compact_normalization` | `bool` | `false` | 对大规模半精度 NPU 批次紧凑计算所选 token 的 logprob，并在足够大的验证步骤中复用行归一化结果。top-logprobs 继续使用完整 log-softmax 路径，保留舍入并列时的 token 排序。 |
-| `enable_npu_sparse_dflash2_sampling` | `bool` | `false` | 在 NPU 上将已有 DFlash2 候选分布以稀疏格式保留至拒绝采样，避免构造完整词表的 draft 分布。 |
-| `enable_npu_random_row_filter` | `bool` | `false` | 受支持的 NPU 混合批次中，随机行不超过一半且不要求返回处理后 logits 或 logprobs 时，仅过滤随机行；所有行仍执行惩罚和语法约束。 |
 | `enable_unified_mtp_graph` | `bool` | `false` | 将支持的 NPU speculative decode 请求交由统一 Python graph 执行。支持 GLM DSA MTP，以及以 GLM DSA 为目标模型的 `DFlash`/`DFlash2`/`DSpark`。要求 `enable_graph=true`；`DFlash`/`DFlash2`/`DSpark` 还要求 `enable_task_pipeline=true`。关闭此开关不影响普通模型的图执行。 |
 | `enable_graph_double_buffer` | `bool` | `true` | 是否为 NPU schedule-overlap decode 启用双缓冲 ACL graph 持久化参数与 graph 实例。 |
 | `enable_graph_mode_decode_no_padding` | `bool` | `false` | decode 阶段是否按实际 `num_tokens` 捕获 graph，而不是按 padding 后 shape 捕获。 |

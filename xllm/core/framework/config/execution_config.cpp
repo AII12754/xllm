@@ -37,35 +37,6 @@ DEFINE_bool(enable_task_pipeline,
             "unsupported.");
 
 DEFINE_bool(
-    enable_npu_batched_sampling,
-    false,
-    "Use batched request-seeded categorical sampling on supported NPUs.");
-
-DEFINE_bool(enable_npu_sparse_dflash2_sampling,
-            false,
-            "Keep DFlash2 candidate distributions sparse through NPU "
-            "rejection sampling.");
-
-DEFINE_bool(
-    enable_npu_compact_normalization,
-    false,
-    "Use compact normalization for selected NPU logprobs and verification; "
-    "top-logprob reporting retains the full log-softmax path.");
-
-DEFINE_bool(
-    enable_npu_verification_sampling,
-    false,
-    "Fuse NPU bonus and residual categorical selection during verification.");
-
-DEFINE_bool(enable_npu_fused_logits_sampling,
-            false,
-            "Fuse NPU logits normalization and categorical selection.");
-
-DEFINE_bool(enable_npu_random_row_filter,
-            false,
-            "Filter only random rows in supported mixed NPU sampling batches.");
-
-DEFINE_bool(
     enable_graph,
     false,
     "Whether to enable graph execution for decode phase. When enabled, "
@@ -174,12 +145,6 @@ void ExecutionConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_task_pipeline);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_unified_mtp_graph);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_npu_batched_sampling);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_npu_random_row_filter);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_npu_sparse_dflash2_sampling);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_npu_fused_logits_sampling);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_npu_verification_sampling);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_npu_compact_normalization);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(disable_graph_warmup);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_double_buffer);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_mode_decode_no_padding);
@@ -203,12 +168,6 @@ void ExecutionConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_task_pipeline);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_unified_mtp_graph);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_npu_batched_sampling);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_npu_random_row_filter);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_npu_sparse_dflash2_sampling);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_npu_fused_logits_sampling);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_npu_verification_sampling);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_npu_compact_normalization);
   XLLM_CONFIG_ASSIGN_FROM_JSON(disable_graph_warmup);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_double_buffer);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_mode_decode_no_padding);
@@ -238,18 +197,6 @@ void ExecutionConfig::append_config_json(
       config_json, default_config, enable_graph);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_unified_mtp_graph);
-  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_npu_batched_sampling);
-  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_npu_random_row_filter);
-  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_npu_sparse_dflash2_sampling);
-  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_npu_fused_logits_sampling);
-  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_npu_verification_sampling);
-  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_npu_compact_normalization);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, disable_graph_warmup);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

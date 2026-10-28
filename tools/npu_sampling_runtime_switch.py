@@ -14,9 +14,9 @@
 
 """Debugger-style ablation control for an owned, idle server process tree.
 
-No request may be in flight during switch(). This modifies only the six bool
-fields in ExecutionConfig, with every worker stopped, and reads them back before
-resuming. It adds no polling or control endpoint to the production sampling path.
+No request may be in flight during switch(). This changes the test-only bitmask
+with every worker stopped, and reads it back before resuming. It requires a
+BUILD_NPU_SAMPLING_ABLATION build; production builds contain no control symbol.
 The caller must be an ancestor of the server for Linux ptrace access checks.
 """
 
@@ -56,19 +56,15 @@ class RuntimeSwitch:
         self._binary = binary.resolve()
         with self._binary.open("rb") as executable:
             self._is_pie = int.from_bytes(executable.read(18)[16:18], "little") == 3
-        self._offsets = json.loads(
-            subprocess.check_output([str(benchmark_binary.resolve()), "--sampling-config-offsets"])
-        )
-        _require(set(self._offsets) == set(_BITS), "Benchmark must provide all six sampling flag offsets")
-        offsets = list(self._offsets.values())
-        _require(
-            all(type(offset) is int and offset >= 0 for offset in offsets) and len(set(offsets)) == len(offsets),
-            "Sampling flag offsets must be distinct nonnegative integers",
-        )
+        symbol = "xllm_npu_sampling_ablation_mask"
         symbols = subprocess.check_output(["nm", "-a", str(self._binary)], text=True)
-        symbol = "_ZZN4xllm15ExecutionConfig12get_instanceEvE6config"
-        matches = [line.split()[0] for line in symbols.splitlines() if line.endswith(symbol)]
-        _require(len(matches) == 1, matches)
+        matches = [line.split()[0] for line in symbols.splitlines() if line.split()[-1] == symbol]
+        _require(
+            len(matches) == 1,
+            "Service lacks the test-only control; rebuild with BUILD_NPU_SAMPLING_ABLATION=ON",
+        )
+        layout = json.loads(subprocess.check_output([str(benchmark_binary.resolve()), "--sampling-ablation-layout"]))
+        _require(layout == {"symbol": symbol, "bytes": 1}, "Unsupported sampling ablation layout")
         self._symbol = int(matches[0], 16)
         self._pids: list[int] | None = None
 
@@ -105,18 +101,15 @@ class RuntimeSwitch:
                 base = (starts[0] if self._is_pie else 0) + self._symbol
                 descriptor = os.open(f"/proc/{pid}/mem", os.O_RDWR)
                 try:
-                    before = {}
-                    after = {}
-                    for name, offset in self._offsets.items():
-                        current = os.pread(descriptor, 1, base + offset)
-                        _require(current in (b"\0", b"\1"), (pid, name, current))
-                        before[name] = int.from_bytes(current, "little")
-                        value = bytes([int(bool(mask & _BITS[name]))])
-                        written = os.pwrite(descriptor, value, base + offset)
-                        _require(written == 1, (pid, name, "Incomplete flag write", written))
-                        actual = os.pread(descriptor, 1, base + offset)
-                        _require(actual == value, (pid, name, actual, value))
-                        after[name] = int.from_bytes(actual, "little")
+                    current = os.pread(descriptor, 1, base)
+                    _require(len(current) == 1 and current[0] <= 63, (pid, current))
+                    before = {name: int(bool(current[0] & bit)) for name, bit in _BITS.items()}
+                    value = bytes([mask])
+                    written = os.pwrite(descriptor, value, base)
+                    _require(written == 1, (pid, "Incomplete ablation write", written))
+                    actual = os.pread(descriptor, 1, base)
+                    _require(actual == value, (pid, actual, value))
+                    after = {name: int(bool(actual[0] & bit)) for name, bit in _BITS.items()}
                     result.append({"pid": pid, "before": before, "after": after})
                 finally:
                     os.close(descriptor)

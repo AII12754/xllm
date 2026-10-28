@@ -29,7 +29,7 @@ limitations under the License.
 #include <nlohmann/json.hpp>
 #include <string_view>
 
-#include "core/framework/config/execution_config.h"
+#include "core/framework/sampling/npu_sampling_policy.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/framework/speculative/rejection_sampler.h"
 #include "core/platform/npu/startup.h"
@@ -37,31 +37,17 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-void dump_config_offsets() {
-  const ExecutionConfig config;
-  const auto* base = reinterpret_cast<const uint8_t*>(&config);
-  const auto offset = [&](const bool& flag) {
-    return static_cast<int64_t>(reinterpret_cast<const uint8_t*>(&flag) - base);
-  };
-  const nlohmann::ordered_json offsets = {
-      {"A", offset(config.enable_npu_batched_sampling())},
-      {"B", offset(config.enable_npu_random_row_filter())},
-      {"C", offset(config.enable_npu_fused_logits_sampling())},
-      {"D", offset(config.enable_npu_compact_normalization())},
-      {"E", offset(config.enable_npu_sparse_dflash2_sampling())},
-      {"G", offset(config.enable_npu_verification_sampling())}};
-  std::cout << offsets.dump() << '\n';
+void dump_ablation_layout() {
+  const nlohmann::ordered_json layout = {
+      {"symbol", "xllm_npu_sampling_ablation_mask"}, {"bytes", 1}};
+  std::cout << layout.dump() << '\n';
 }
 
 // Bits identify independent ablations: A=1, B=2, C=4, D=8, E=16, G=32.
 void configure(int64_t mask) {
-  auto& config = ExecutionConfig::get_instance();
-  config.enable_npu_batched_sampling((mask & 1) != 0);
-  config.enable_npu_random_row_filter((mask & 2) != 0);
-  config.enable_npu_fused_logits_sampling((mask & 4) != 0);
-  config.enable_npu_compact_normalization((mask & 8) != 0);
-  config.enable_npu_sparse_dflash2_sampling((mask & 16) != 0);
-  config.enable_npu_verification_sampling((mask & 32) != 0);
+  CHECK_GE(mask, 0);
+  CHECK_LE(mask, 63);
+  xllm_npu_sampling_ablation_mask = static_cast<uint8_t>(mask);
 }
 
 void synchronize() {
@@ -221,8 +207,8 @@ BENCHMARK(sparse_verification)
 }  // namespace xllm
 
 int main(int argc, char** argv) {
-  if (argc == 2 && std::string_view(argv[1]) == "--sampling-config-offsets") {
-    xllm::dump_config_offsets();
+  if (argc == 2 && std::string_view(argv[1]) == "--sampling-ablation-layout") {
+    xllm::dump_ablation_layout();
     return 0;
   }
   benchmark::Initialize(&argc, argv);

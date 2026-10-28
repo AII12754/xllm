@@ -316,52 +316,6 @@ inline constexpr std::string_view kMalformedConfig = R"json({
   "block_size":
 })json";
 
-TEST(ExecutionConfigTest, NpuSamplingOptionsReachFlagsHelpAndJsonRoundTrip) {
-  ExecutionConfig execution;
-  const std::array<std::pair<const char*, const bool*>, 6> fields = {{
-      {"enable_npu_batched_sampling", &execution.enable_npu_batched_sampling()},
-      {"enable_npu_random_row_filter",
-       &execution.enable_npu_random_row_filter()},
-      {"enable_npu_fused_logits_sampling",
-       &execution.enable_npu_fused_logits_sampling()},
-      {"enable_npu_compact_normalization",
-       &execution.enable_npu_compact_normalization()},
-      {"enable_npu_sparse_dflash2_sampling",
-       &execution.enable_npu_sparse_dflash2_sampling()},
-      {"enable_npu_verification_sampling",
-       &execution.enable_npu_verification_sampling()},
-  }};
-  const auto& names = ExecutionConfig::option_category().option_names;
-  for (const auto& [name, value] : fields) {
-    EXPECT_FALSE(*value);
-    EXPECT_NE(std::find(names.begin(), names.end(), name), names.end());
-  }
-  for (size_t selected = 0; selected < fields.size(); ++selected) {
-    nlohmann::ordered_json saved;
-    {
-      const google::FlagSaver flag_saver;
-      for (size_t index = 0; index < fields.size(); ++index) {
-        ASSERT_FALSE(
-            google::SetCommandLineOption(fields[index].first,
-                                         index == selected ? "true" : "false")
-                .empty());
-      }
-      execution.from_flags();
-      for (size_t index = 0; index < fields.size(); ++index) {
-        EXPECT_EQ(*fields[index].second, index == selected);
-      }
-      execution.append_config_json(saved);
-    }
-    EXPECT_EQ(saved[fields[selected].first], true);
-    const google::FlagSaver flag_saver;
-    ExecutionConfig restored;
-    restored.from_json(config::parse_json_string(saved.dump()));
-    nlohmann::ordered_json round_trip;
-    restored.append_config_json(round_trip);
-    EXPECT_EQ(round_trip, saved);
-  }
-}
-
 TEST(ExecutionConfigTest, EnablesDsaMultiStreamFromJson) {
   google::FlagSaver flag_saver;
   JsonReader json_config =

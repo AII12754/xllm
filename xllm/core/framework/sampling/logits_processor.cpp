@@ -25,7 +25,7 @@ limitations under the License.
 #include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 #endif
 
-#include "core/framework/config/execution_config.h"
+#include "core/framework/sampling/npu_sampling_policy.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/kernels/ops_api.h"
 
@@ -290,7 +290,7 @@ void process_logits(torch::Tensor& logits,
 #if defined(USE_NPU)
   // Compaction pays for itself only for large mixed batches with a minority
   // of random rows. Grammar and penalties above still apply to every row.
-  if (ExecutionConfig::get_instance().enable_npu_random_row_filter() &&
+  if (npu_sampling_enabled(NpuSamplingOptimization::RANDOM_ROW_FILTER) &&
       logits.device().type() == c10::DeviceType::PrivateUse1 &&
       params.sampling_mode == SamplingMode::MIXED && !params.logprobs &&
       !params.return_logits && !params.use_beam_search && logits.dim() == 2 &&

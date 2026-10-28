@@ -30,7 +30,7 @@ limitations under the License.
 #include <limits>
 #include <tuple>
 
-#include "core/framework/config/execution_config.h"
+#include "core/framework/sampling/npu_sampling_policy.h"
 #include "core/framework/sampling/sampler.h"
 #include "tests/core/framework/sampling/sampling_test_utils.h"
 
@@ -329,16 +329,18 @@ namespace {
 
 class SparseDraftTest
     : public testing::TestWithParam<std::tuple<torch::Device, bool, bool>> {
+#if defined(XLLM_NPU_SAMPLING_ABLATION)
  protected:
   void SetUp() override {
-    auto& config = ExecutionConfig::get_instance();
-    config.enable_npu_compact_normalization(std::get<1>(GetParam()));
-    config.enable_npu_verification_sampling(std::get<2>(GetParam()));
+    const uint8_t normalization = std::get<1>(GetParam()) ? 8 : 0;
+    const uint8_t verification = std::get<2>(GetParam()) ? 32 : 0;
+    xllm_npu_sampling_ablation_mask = 23 | normalization | verification;
   }
-  void TearDown() override { ExecutionConfig::get_instance() = saved_; }
+  void TearDown() override { xllm_npu_sampling_ablation_mask = saved_mask_; }
 
  private:
-  ExecutionConfig saved_ = ExecutionConfig::get_instance();
+  uint8_t saved_mask_ = xllm_npu_sampling_ablation_mask;
+#endif
 };
 
 torch::Tensor sample_sparse_draft(const DraftProposal& proposal,
@@ -367,16 +369,14 @@ TEST_P(SparseDraftTest, PreservesRoundedTopLogprobTieIds) {
   params.sampling_mode = SamplingMode::GREEDY;
   params.logprobs = true;
   params.max_top_logprobs = 5;
-  auto& config = ExecutionConfig::get_instance();
-  config.enable_npu_compact_normalization(false);
-  torch::Tensor baseline_logits = logits.clone();
-  const SampleOutput expected =
-      rejection_sample(params, DraftProposal(tokens), baseline_logits);
-  config.enable_npu_compact_normalization(true);
+  const auto [expected_values, expected_tokens] =
+      torch::log_softmax(
+          logits.view({64, 3, 65536}), /*dim=*/-1, /*dtype=*/torch::kFloat32)
+          .topk(/*k=*/5, /*dim=*/-1);
   const SampleOutput actual =
       rejection_sample(params, DraftProposal(tokens), logits);
-  EXPECT_TRUE(torch::equal(actual.top_tokens, expected.top_tokens));
-  EXPECT_TRUE(torch::equal(actual.top_logprobs, expected.top_logprobs));
+  EXPECT_TRUE(torch::equal(actual.top_tokens, expected_tokens));
+  EXPECT_TRUE(torch::equal(actual.top_logprobs, expected_values));
 }
 
 TEST_P(SparseDraftTest, MatchesDenseWideVocabularyVerification) {
@@ -530,11 +530,19 @@ const std::array<torch::Device, 1> kSparseDevices = {
     torch::Device(torch::kCPU)};
 #endif
 
+#if defined(XLLM_NPU_SAMPLING_ABLATION)
 INSTANTIATE_TEST_SUITE_P(Devices,
                          SparseDraftTest,
                          testing::Combine(testing::ValuesIn(kSparseDevices),
                                           testing::Bool(),
                                           testing::Bool()));
+#else
+INSTANTIATE_TEST_SUITE_P(Devices,
+                         SparseDraftTest,
+                         testing::Combine(testing::ValuesIn(kSparseDevices),
+                                          testing::Values(true),
+                                          testing::Values(true)));
+#endif
 
 }  // namespace
 

@@ -23,8 +23,8 @@ limitations under the License.
 #include <optional>
 #include <utility>
 
-#include "core/framework/config/execution_config.h"
 #include "core/framework/sampling/logits_processor.h"
+#include "core/framework/sampling/npu_sampling_policy.h"
 #include "core/framework/sampling/sampler.h"
 #if defined(USE_NPU)
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
@@ -39,7 +39,7 @@ namespace {
 torch::Tensor sample_verification_logits(const torch::Tensor& logits) {
 #if defined(USE_NPU)
   const bool supported =
-      ExecutionConfig::get_instance().enable_npu_verification_sampling() &&
+      npu_sampling_enabled(NpuSamplingOptimization::VERIFICATION) &&
       logits.size(0) >= 8 &&
       kernel::npu::tilelang::supports_sampling_logits(logits);
   if (supported) {
@@ -206,7 +206,7 @@ SampleOutput rejection_sample(const SamplingParameters& params,
   }
   torch::Tensor compact_lse;
 #if defined(USE_NPU)
-  if (ExecutionConfig::get_instance().enable_npu_compact_normalization() &&
+  if (npu_sampling_enabled(NpuSamplingOptimization::COMPACT_NORMALIZATION) &&
       kernel::npu::tilelang::supports_sampling_logits(target_logits) &&
       target_logits.numel() >= 8 * 1024 * 1024 &&
       (params.sampling_mode != SamplingMode::GREEDY || params.logprobs)) {

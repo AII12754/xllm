@@ -20,22 +20,12 @@ limitations under the License.
 #include <array>
 #include <limits>
 
-#include "core/framework/config/execution_config.h"
 #include "core/framework/sampling/logits_processor.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 
 namespace xllm {
 namespace {
-
-class ScopedSamplingConfig final {
- public:
-  ScopedSamplingConfig() : saved_(ExecutionConfig::get_instance()) {}
-  ~ScopedSamplingConfig() { ExecutionConfig::get_instance() = saved_; }
-
- private:
-  ExecutionConfig saved_;
-};
 
 SamplingParameters make_seeded_params(const torch::Tensor& seeds,
                                       const torch::Tensor& offsets) {
@@ -49,8 +39,6 @@ SamplingParameters make_seeded_params(const torch::Tensor& seeds,
 }
 
 TEST(SeededSamplerTest, NpuRequestsAreReproducibleAndIsolated) {
-  const ScopedSamplingConfig config;
-  ExecutionConfig::get_instance().enable_npu_batched_sampling(true);
   const torch::Device device(torch::kPrivateUse1, 0);
   const auto& global_generator = at_npu::detail::getDefaultNPUGenerator(0);
   const torch::Tensor before = global_generator.get_state().clone();
@@ -198,8 +186,6 @@ TEST(SeededSamplerTest,
 }
 
 TEST(SeededSamplerTest, NpuCompactLogprobsPreserveRawModelDistribution) {
-  const ScopedSamplingConfig config;
-  auto& execution = ExecutionConfig::get_instance();
   const torch::Device device(torch::kPrivateUse1, 0);
   for (const torch::ScalarType dtype : {torch::kBFloat16, torch::kFloat16}) {
     SamplingParameters params = make_seeded_params(
@@ -210,26 +196,26 @@ TEST(SeededSamplerTest, NpuCompactLogprobsPreserveRawModelDistribution) {
         torch::full({128}, 0.7, torch::TensorOptions().device(device));
     params.top_k = torch::full({128}, 20, params.seeds.options());
     params.top_p = torch::full({128}, 0.95, params.temperatures.options());
-    execution.enable_npu_batched_sampling(true);
-    execution.enable_npu_fused_logits_sampling(true);
     const torch::Tensor logits = torch::randn(
         {128, 65536}, torch::TensorOptions().dtype(dtype).device(device));
-    torch::Tensor baseline_logits = logits.clone();
-    execution.enable_npu_compact_normalization(false);
-    const SampleOutput expected = sample(baseline_logits, params);
     torch::Tensor compact_logits = logits.clone();
-    execution.enable_npu_compact_normalization(true);
     const SampleOutput actual = sample(compact_logits, params);
-    EXPECT_TRUE(torch::equal(actual.next_tokens, expected.next_tokens));
+    const torch::Tensor expected_logprobs =
+        torch::log_softmax(logits, /*dim=*/-1, /*dtype=*/torch::kFloat32)
+            .gather(/*dim=*/-1, actual.next_tokens.view({-1, 1}))
+            .view({-1});
+    params.logprobs = false;
+    torch::Tensor sampling_logits = logits.clone();
+    const SampleOutput sampled = sample(sampling_logits, params);
+    EXPECT_TRUE(torch::equal(actual.next_tokens, sampled.next_tokens));
     EXPECT_TRUE(torch::allclose(actual.logprobs,
-                                expected.logprobs,
+                                expected_logprobs,
                                 /*rtol=*/1e-5,
                                 /*atol=*/5e-6));
   }
 }
 
 TEST(SeededSamplerTest, NpuCompactNormalizationPreservesRoundedTopLogprobTies) {
-  const ScopedSamplingConfig config;
   const torch::Device device(torch::kPrivateUse1, 0);
   const auto options =
       torch::TensorOptions().device(device).dtype(torch::kBFloat16);
@@ -240,19 +226,15 @@ TEST(SeededSamplerTest, NpuCompactNormalizationPreservesRoundedTopLogprobTies) {
   params.sampling_mode = SamplingMode::GREEDY;
   params.logprobs = true;
   params.max_top_logprobs = 5;
-  auto& execution = ExecutionConfig::get_instance();
-  execution.enable_npu_compact_normalization(false);
-  torch::Tensor baseline_logits = logits.clone();
-  const SampleOutput expected = sample(baseline_logits, params);
-  execution.enable_npu_compact_normalization(true);
+  const auto [expected_values, expected_tokens] =
+      torch::log_softmax(logits, /*dim=*/-1, /*dtype=*/torch::kFloat32)
+          .topk(/*k=*/5, /*dim=*/-1);
   const SampleOutput actual = sample(logits, params);
-  EXPECT_TRUE(torch::equal(actual.top_tokens, expected.top_tokens));
-  EXPECT_TRUE(torch::equal(actual.top_logprobs, expected.top_logprobs));
+  EXPECT_TRUE(torch::equal(actual.top_tokens, expected_tokens));
+  EXPECT_TRUE(torch::equal(actual.top_logprobs, expected_values));
 }
 
 TEST(SeededSamplerTest, NpuMixedSamplingKeepsGreedyRowsAndAdvancesUnseededRng) {
-  const ScopedSamplingConfig config;
-  ExecutionConfig::get_instance().enable_npu_batched_sampling(true);
   const torch::Device device(torch::kPrivateUse1, 0);
   SamplingParameters params =
       make_seeded_params(torch::tensor({42, -1, 7, -1}, torch::kLong),
@@ -273,7 +255,6 @@ TEST(SeededSamplerTest, NpuMixedSamplingKeepsGreedyRowsAndAdvancesUnseededRng) {
 }
 
 TEST(SeededSamplerTest, NpuMixedFilteringPreservesTieMasks) {
-  const ScopedSamplingConfig config;
   const torch::Device device(torch::kPrivateUse1, 0);
   constexpr int64_t kVocab = 49152;
   for (const int64_t rows : {int64_t{2}, int64_t{8}, int64_t{32}}) {
@@ -298,10 +279,10 @@ TEST(SeededSamplerTest, NpuMixedFilteringPreservesTieMasks) {
                 .expand({rows, kVocab})
                 .clone();
         torch::Tensor reference = original.clone();
-        ExecutionConfig::get_instance().enable_npu_random_row_filter(false);
-        process_logits(reference, params);
+        SamplingParameters reference_params = params;
+        reference_params.sampling_mode = SamplingMode::RANDOM;
+        process_logits(reference, reference_params);
         torch::Tensor compacted = original.clone();
-        ExecutionConfig::get_instance().enable_npu_random_row_filter(true);
         process_logits(compacted, params);
         EXPECT_TRUE(
             torch::equal(compacted.narrow(0, 0, params.num_random_rows),
@@ -314,7 +295,6 @@ TEST(SeededSamplerTest, NpuMixedFilteringPreservesTieMasks) {
 }
 
 TEST(SeededSamplerTest, NpuMixedFilterMatchesRandomRowsAndSkipsGreedyRows) {
-  const ScopedSamplingConfig config;
   const torch::Device device(torch::kPrivateUse1, 0);
   constexpr int64_t kRows = 128;
   constexpr int64_t kVocab = 65536;
@@ -329,10 +309,10 @@ TEST(SeededSamplerTest, NpuMixedFilterMatchesRandomRowsAndSkipsGreedyRows) {
                                .expand({kRows, kVocab})
                                .clone();
   torch::Tensor reference = original.clone();
-  ExecutionConfig::get_instance().enable_npu_random_row_filter(false);
-  process_logits(reference, params);
+  SamplingParameters reference_params = params;
+  reference_params.sampling_mode = SamplingMode::RANDOM;
+  process_logits(reference, reference_params);
   torch::Tensor compacted = original.clone();
-  ExecutionConfig::get_instance().enable_npu_random_row_filter(true);
   process_logits(compacted, params);
   EXPECT_TRUE(
       torch::equal(compacted.narrow(0, 0, 32), reference.narrow(0, 0, 32)));

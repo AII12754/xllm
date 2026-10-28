@@ -29,9 +29,9 @@ limitations under the License.
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #endif
 
-#include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/sampling/logits_processor.h"
+#include "core/framework/sampling/npu_sampling_policy.h"
 #include "core/framework/sampling/sampling_params.h"
 
 namespace xllm {
@@ -109,7 +109,7 @@ SampleOutput sample(torch::Tensor& logits,
   bool compact_logprobs = false;
 #if defined(USE_NPU)
   compact_logprobs =
-      ExecutionConfig::get_instance().enable_npu_compact_normalization() &&
+      npu_sampling_enabled(NpuSamplingOptimization::COMPACT_NORMALIZATION) &&
       params.logprobs && params.max_top_logprobs == 0 &&
       !params.use_beam_search &&
       !ModelConfig::get_instance().enable_qwen3_reranker() &&
@@ -150,7 +150,7 @@ SampleOutput sample(torch::Tensor& logits,
   torch::Tensor samples;
 #if defined(USE_NPU)
   const bool batched_seed_sampling =
-      ExecutionConfig::get_instance().enable_npu_batched_sampling() &&
+      npu_sampling_enabled(NpuSamplingOptimization::BATCHED) &&
       params.sampling_mode != SamplingMode::GREEDY &&
       kernel::npu::tilelang::supports_sampling_logits(logits) &&
       (!params.seeds.defined() ||
@@ -163,7 +163,7 @@ SampleOutput sample(torch::Tensor& logits,
         (!params.seeds.defined() || params.has_unseeded_sample)
             ? torch::rand({logits.size(0)}, uniform_options)
             : torch::Tensor();
-    if (ExecutionConfig::get_instance().enable_npu_fused_logits_sampling()) {
+    if (npu_sampling_enabled(NpuSamplingOptimization::FUSED_LOGITS)) {
       samples = kernel::npu::tilelang::sampling_logits(
           logits, params.seeds, params.seed_offsets, uniforms);
     } else {

@@ -11,22 +11,36 @@ ablations, same-process serving measurements and trace exports are complete.**
 Real-weight task-pipeline E2E is excluded from this 910B2 acceptance scope
 by user direction on 2026-10-28, because its current custom operator package
 registers the required Varlen operator only for 910C. It is not a remaining
-acceptance blocker for this task. All features remain opt-in; performance
-claims are scoped to the measured shapes and model pair.
+acceptance blocker for this task. Supported inputs select the optimizations
+automatically; performance claims are scoped to the measured shapes and model pair.
 
 ## Changes and boundaries
 
-All six options default to `false`. They are independent of the CUDA changes
-in #2542 and #2550. The benchmark uses the following bit masks:
+Production has no sampling optimization switches: existing shape, batch and
+request guards select the applicable paths automatically. These NPU changes
+are independent of the CUDA changes in #2542 and #2550.
 
-| ID | Bit | ExecutionConfig / CLI option | Implementation |
+Only a dedicated `BUILD_NPU_SAMPLING_ABLATION=ON` build contains the offline
+ablation control and native benchmark. Its mask defaults to 63 (all features);
+mask 0 selects the legacy reference. Normal builds compile each feature check
+to `true` and contain no mutable control symbol, CLI option or JSON setting.
+
+The performance tables retain the original measured executable identities.
+The complete 400-workload serving matrix has not been rerun after removing
+the production switches; current validation adds native cross-checks and
+real-model functional smoke tests. Those original executables used six
+ExecutionConfig bools for ablation. Removing the
+production options does not change the kernels or their input guards; those
+measurements are not relabeled as timings of the new production executable.
+
+| ID | Test bit | Optimization | Implementation |
 | --- | ---: | --- | --- |
-| A | 1 | `enable_npu_batched_sampling` | Batch seeded categorical draws on device; avoid copying seed/offset controls back to the host and constructing a generator per sampled request. |
-| B | 2 | `enable_npu_random_row_filter` | Compact random rows before temperature/min-p/top-k/top-p processing in supported ordinary mixed batches; scatter results back. Penalties and grammar still run for every row. |
-| C | 4 | `enable_npu_fused_logits_sampling` | Fuse normalization and categorical selection, avoiding a vocabulary-sized FP32 probability tensor. Requires A for ordinary sampling. Existing filtering stays separate. |
-| D | 8 | `enable_npu_compact_normalization` | Row log-sum-exp plus selected-score gathering; reuse normalization in verification. Preserve the full log-softmax path for top-logprob requests. |
-| E | 16 | `enable_npu_sparse_dflash2_sampling` | Preserve the DFlash2 selector's existing candidate support through proposal construction, transport, acceptance and exact residual recovery. |
-| G | 32 | `enable_npu_verification_sampling` | Use the shared fused categorical kernel for bonus/recovery tokens in supported verifier batches. Acceptance/prefix handling stays in the existing verifier. |
+| A | 1 | Batched sampling | Batch seeded categorical draws on device; avoid copying seed/offset controls back to the host and constructing a generator per sampled request. |
+| B | 2 | Random-row filtering | Compact random rows before temperature/min-p/top-k/top-p processing in supported ordinary mixed batches; scatter results back. Penalties and grammar still run for every row. |
+| C | 4 | Fused logits sampling | Fuse normalization and categorical selection, avoiding a vocabulary-sized FP32 probability tensor. Requires A for ordinary sampling. Existing filtering stays separate. |
+| D | 8 | Compact normalization | Row log-sum-exp plus selected-score gathering; reuse normalization in verification. Preserve the full log-softmax path for top-logprob requests. |
+| E | 16 | Sparse DFlash2 | Preserve the DFlash2 selector's existing candidate support through proposal construction, transport, acceptance and exact residual recovery. |
+| G | 32 | Verification sampling | Use the shared fused categorical kernel for bonus/recovery tokens in supported verifier batches. Acceptance/prefix handling stays in the existing verifier. |
 
 The implementation follows the batching, on-chip normalization and compact
 sampling-state ideas in DeepInfer's
@@ -85,10 +99,11 @@ workspace allocations and is **not total device HBM usage**.
 
 Serving comparisons keep the same executable, resident target/draft models,
 four worker PIDs and graph settings within each run. The controller waits for
-running/pending requests to drain, stops all owned ranks, writes the six
-ExecutionConfig bools, verifies their values, resumes the ranks, and warms the
-next workload. Variant order is shuffled independently for each paired repeat.
-No production control endpoint or polling is added.
+running/pending requests to drain, stops all owned ranks, writes and verifies
+the ablation state, resumes the ranks, and warms the next workload. Variant
+order is shuffled independently for each paired repeat. Historical datasets
+used the six ExecutionConfig bools; the current test build uses one volatile
+byte with the same feature bits. Production contains neither mechanism.
 
 Serving uses TORCH backend, ACL graphs, chunked prefill, prefix cache disabled,
 schedule overlap disabled, a 16 GiB KV cache, and explicit linear-state capacity
@@ -144,6 +159,8 @@ only a launch event and is excluded from performance summaries.
 
 ## Correctness and regression checks
 
+The original measured build passed the following checks:
+
 - `sampler_test`: 65 tests pass, including NPU categorical support/distribution,
   vocabulary tails and padding, FP32/BF16/FP16, fixed-seed isolation, mixed
   unseeded RNG, greedy preservation, native filter ties, raw selected logprobs,
@@ -169,15 +186,60 @@ identities. Copies are also saved under `local/npu_sampling/validation/`.
 Source formatting uses clang-format 20.1.6 and Python lint uses
 the repository's Ruff configuration.
 
-The submission review passes 164 regression cases: the original 161 plus
+The original submission review passed 164 regression cases: the original 161 plus
 three additional block-worker option cases. Its combined log is
 `local/npu_sampling/validation/npu_sampling_review_regression.log`.
 It also checks the benchmark controller against a live owned child process
 under normal Python and `python -O`.
-The latter exercises real process stopping, all six memory writes/readbacks,
+That historical probe exercises real process stopping, all six memory writes/readbacks,
 PID preservation and invalid-mask rejection without using an NPU. Controller
 writes and measurement checks use explicit runtime validation, so Python's
 optimization mode cannot remove them.
+
+### Automatic-dispatch follow-up validation
+
+The revised production build passes 160 targeted tests: sampler 35, sampling
+controls 24, filter masks 3, slot buffers 51, packed/shared inputs 18,
+execution config 6 and recurrent/block-worker pipeline 23. Production runs only
+the automatic verifier policy; the test-only build retains the normalization
+and verification factorial combinations. The old configuration round-trip
+case is removed with the six options. Independent Torch references check
+raw selected logprobs and rounded top-token ties.
+
+The production executable has no ablation symbol, and its help has none of the
+six removed options. Four-device Qwen3.8-27B smoke coverage passes random B=8,
+mixed B=32, selected logprobs B=128, top-5 B=8 and greedy B=8: all 184 requests
+return the requested 16 completion tokens. This is a functional smoke test,
+not a new end-to-end performance acceptance dataset.
+
+Logs, command lines and production hashes are retained under
+`local/npu_sampling/automatic_validation/`. The controller also passes real
+PIE executable symbol lookup and memory-write/readback tests under normal
+Python and `python -O`; production executables reject that controller.
+
+The instrumented build passes all 65 sampler cases, including the D/G
+factorial combinations. A new three-repeat, interleaved native cross-check
+confirms the revised test control selects the measured paths:
+
+| Workload | Baseline us | Optimized us | Speedup |
+| --- | ---: | ---: | ---: |
+| Ordinary random, BF16, B=32, V=248320, A+B+C | 4435.83 | 1151.78 | 3.85x |
+| Ordinary mixed 25% random, BF16, B=32, V=248320, A+B+C | 44659.83 | 986.73 | 45.26x |
+| Verification, FP32, B=32, S=7, K=16, D+E+G | 7265.51 | 2684.52 | 2.71x |
+
+The new test controller also passes a real-weight DFlash2 smoke in one
+resident four-rank group: masks 63 and 0, random B=1, 32 completion tokens.
+All four PID/readback checks pass. This verifies switching and sparse proposal
+transport; these two short windows are not added to the 400-workload performance
+acceptance dataset. The build is restored to production afterward; the sampler
+binary matches its validated production SHA, and the relinked service is
+checked with the same functional smoke.
+
+The verification allocator peak remains 636.57 MiB versus 424.43 MiB
+(-33.3%). Its complete eight-way D/E/G factorial and raw samples are in
+local/npu_sampling/automatic_validation/instrument_native.json. These are
+new measurements of the test build; the original tables below keep their
+original build identities.
 
 ## Native ablations
 
@@ -398,14 +460,15 @@ worse. Raw data: `local/npu_sampling/same_process_dflash_greedy_long.jsonl`.
   speedup is claimed.
 - F (synthetic full-vocabulary top-k in top-p-only filtering) is rejected
   because it changes tie behavior. Full filtering fusion is excluded.
-- All six options remain opt-in/default-off. Real-weight task-pipeline E2E
+- All six optimizations apply automatically behind the existing input guards;
+  production exposes no feature switches. Real-weight task-pipeline E2E
   is outside this user-approved 910B2 acceptance scope and does not block
   completion. No performance claim is made for that mode.
 
 The accepted serving datasets contain 400 measured workloads in total:
 168 ordinary, 189 short DFlash2, 28 long random DFlash2, and 15 long greedy
 controls. Earlier restart-per-variant runs and the overlapping-build pilot
-are excluded. Changes remain local on the feature branch; no PR was opened.
+are excluded. The implementation is submitted in [PR #2603](https://github.com/xLLM-AI/xllm/pull/2603).
 
 ## Device trace evidence
 
@@ -463,8 +526,9 @@ tables. No browser/Perfetto UI inspection was performed for either set.
 
 ## Reproduction and artifacts
 
-Build the native `npu_sampling_benchmark` target with the same NPU build
-configuration as xLLM. AOT Python source changes must first regenerate the
+Build a dedicated instrumented service and native `npu_sampling_benchmark`
+with `BUILD_NPU_SAMPLING_ABLATION=ON`. This build is for tests only; production
+builds leave that CMake setting off and have no runtime ablation controls. AOT Python source changes must first regenerate the
 affected kernels through `xllm/compiler/tilelang_launcher.py compile-kernels`;
 a direct CMake rebuild alone does not regenerate them.
 
@@ -475,6 +539,8 @@ python3 xllm/compiler/tilelang_launcher.py compile-kernels \
   --target ascend --device a2 \
   --output-root build/cmake.linux-aarch64-cpython-311/xllm/compiler/tilelang \
   --kernels seeded_sample sampling_logits --jobs 6
+cmake -S . -B build/cmake.linux-aarch64-cpython-311 \
+  -DBUILD_NPU_SAMPLING_ABLATION=ON
 cmake --build build/cmake.linux-aarch64-cpython-311 \
   --target xllm npu_sampling_benchmark sampler_test -j16
 
@@ -512,13 +578,15 @@ python3 tools/benchmark_npu_sampling.py dflash \
 ```
 
 Run inside the matching CANN/PyTorch build environment. The controller must own
-the service process tree and use the matching benchmark binary to obtain
-ExecutionConfig member offsets. Each run saves the actual command, executable
+the service process tree and use an instrumented service plus matching
+benchmark binary. The controller resolves only the test-specific mask symbol;
+it refuses a production executable that lacks that symbol. Each run saves the actual command, executable
 SHA, controller/source copies, PID readback, per-request usage, response hashes,
 timing samples and speculative counters. `--task-pipeline` selects that mode;
 `--profile-only` captures warmed windows without running the timing matrix.
-The bit mask is only a benchmark control; normal deployments use the six
-documented flags.
+The bit mask is only a test-build control. Reconfigure with
+`-DBUILD_NPU_SAMPLING_ABLATION=OFF` and rebuild before deployment; normal
+serving enables supported paths automatically.
 
 Native raw files are under `local/npu_sampling/`:
 
