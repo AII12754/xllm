@@ -24,6 +24,14 @@ limitations under the License.
 
 namespace xllm {
 
+// Existing candidate support, without materializing the rest of the vocabulary.
+// IDs are unique within each [K] row and index the target vocabulary. Logits
+// may be unnormalized. Producers retain independent storage until verification.
+struct SparseDraftDistribution {
+  torch::Tensor token_ids;
+  torch::Tensor logits;
+};
+
 // Rejection-sampling input: drafted tokens plus the draft distribution q
 // for probabilistic drafts (greedy drafts carry tokens only, q = 1). -1
 // sentinels in token_ids are force-rejected.
@@ -41,6 +49,20 @@ class DraftProposal final {
 
   const std::optional<torch::Tensor>& logits() const { return logits_; }
 
+  static DraftProposal from_sparse(torch::Tensor token_ids,
+                                   torch::Tensor candidate_ids,
+                                   torch::Tensor candidate_logits);
+
+  const std::optional<SparseDraftDistribution>& sparse_distribution() const {
+    return sparse_distribution_;
+  }
+
+  DraftProposal with_token_ids(torch::Tensor token_ids) const {
+    DraftProposal proposal = *this;
+    proposal.token_ids_ = std::move(token_ids);
+    return proposal;
+  }
+
   // Lifetime owner for no-sync draft inputs that must outlive the verify
   // step's stream sync; never read by the rejection sampler.
   std::vector<std::shared_ptr<const void>>& keep_alive() { return keep_alive_; }
@@ -55,6 +77,20 @@ class DraftProposal final {
     CHECK_EQ(token_ids_.size(1), expected_num_speculative_tokens)
         << "draft proposal speculative length mismatch";
 
+    if (sparse_distribution_.has_value()) {
+      CHECK(!logits_.has_value());
+      const auto& distribution = *sparse_distribution_;
+      CHECK_EQ(distribution.token_ids.dim(), 3);
+      CHECK_EQ(distribution.logits.dim(), 3);
+      CHECK_EQ(distribution.token_ids.sizes(), distribution.logits.sizes());
+      CHECK_EQ(distribution.token_ids.size(0), token_ids_.size(0));
+      CHECK_EQ(distribution.token_ids.size(1), token_ids_.size(1));
+      CHECK_GT(distribution.token_ids.size(2), 0);
+      CHECK_EQ(distribution.token_ids.scalar_type(), torch::kInt64);
+      CHECK_EQ(distribution.token_ids.device(), token_ids_.device());
+      CHECK_EQ(distribution.logits.device(), token_ids_.device());
+      CHECK(distribution.logits.is_floating_point());
+    }
     if (!logits_.has_value()) {
       return;
     }
@@ -96,6 +132,7 @@ class DraftProposal final {
  private:
   torch::Tensor token_ids_;
   std::optional<torch::Tensor> logits_;
+  std::optional<SparseDraftDistribution> sparse_distribution_;
   std::vector<std::shared_ptr<const void>> keep_alive_;
 };
 

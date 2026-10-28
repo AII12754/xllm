@@ -50,6 +50,7 @@ cc_library(
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
     :common
+    :config
     :util
     :sampler
     :json_object_grammar

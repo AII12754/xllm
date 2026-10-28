@@ -3208,8 +3208,13 @@ void TaskExecutionPipeline::finish_fixed_verify(SpeculativeSlot& slot) {
   // buffer.
   DraftProposal proposal = DraftProposal(slot.proposal);
   if (block_draft()) {
-    proposal =
-        DraftProposal(slot.proposal, slot.drafts.front()->sampled.draft_logits);
+    if (speculative_capacity_->kind == SpeculativeTaskKind::DFLASH2) {
+      CHECK(slot.block_proposal.has_value());
+      proposal = *slot.block_proposal;
+    } else {
+      proposal = DraftProposal(slot.proposal,
+                               slot.drafts.front()->sampled.draft_logits);
+    }
   } else if (speculative_capacity_->is_probabilistic_draft &&
              base.sampling_mode != SamplingMode::GREEDY) {
     const torch::Tensor& first_step_logits =
@@ -3354,14 +3359,14 @@ void TaskExecutionPipeline::launch_block_draft(SpeculativeSlot& slot) {
         invocation.logits.view(
             {slot.rows, steps, speculative_capacity_->common.vocab_size}),
         slot.state->tokens_);
-    invocation.sampled.draft_logits =
+    slot.block_proposal =
         sample_dflash2_path(candidates,
                             selector_sampling,
                             slot.block_gumbel,
                             speculative_capacity_->common.vocab_size,
-                            slot.proposal)
-            .logits()
-            .value_or(torch::Tensor());
+                            slot.proposal);
+    invocation.sampled.draft_logits =
+        slot.block_proposal->logits().value_or(torch::Tensor());
   } else if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK) {
     if (adaptive_verify_) {
       generate_adaptive_dspark_proposals(slot, slot.state->tokens_);
@@ -3874,6 +3879,7 @@ void TaskExecutionPipeline::release_outputs(SpeculativeSlot& slot) {
     slot.prefix_refresh->output = ModelOutput();
   }
   slot.host_validate_sampling = SamplingParameters();
+  slot.block_proposal.reset();
   slot.block_gumbel = torch::Tensor();
 }
 

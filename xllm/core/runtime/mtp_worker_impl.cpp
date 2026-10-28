@@ -3738,9 +3738,9 @@ SampleOutput MTPWorkerImpl<TargetInput>::validate(
   }
   SampleOutput sample_output = spec_verify::run_rejection_sampling(
       std::move(sampling_params),
-      DraftProposal(validation_token_ids.defined() ? validation_token_ids
-                                                   : draft_proposal.token_ids(),
-                    draft_proposal.logits()),
+      draft_proposal.with_token_ids(validation_token_ids.defined()
+                                        ? validation_token_ids
+                                        : draft_proposal.token_ids()),
       target_logits,
       target_hidden_states);
 

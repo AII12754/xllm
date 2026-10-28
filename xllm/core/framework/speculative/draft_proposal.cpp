@@ -19,6 +19,15 @@ limitations under the License.
 
 namespace xllm {
 
+DraftProposal DraftProposal::from_sparse(torch::Tensor token_ids,
+                                         torch::Tensor candidate_ids,
+                                         torch::Tensor candidate_logits) {
+  DraftProposal proposal(std::move(token_ids));
+  proposal.sparse_distribution_ = SparseDraftDistribution{
+      std::move(candidate_ids), std::move(candidate_logits)};
+  return proposal;
+}
+
 DraftProposal DraftProposal::from_token_buffer(
     torch::Tensor token_ids,
     int64_t vocab_size,

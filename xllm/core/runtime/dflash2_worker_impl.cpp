@@ -25,6 +25,7 @@ limitations under the License.
 #include <utility>
 
 #include "common/metrics.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/sampling/logits_processor.h"
@@ -75,8 +76,13 @@ DraftProposal sample_dflash2_path(const DFlash2CandidateOutput& candidates,
   } else {
     CHECK_EQ(token_ids.sizes(), torch::IntArrayRef({batch_size, num_steps}));
   }
+  const bool sparse_distribution =
+      ExecutionConfig::get_instance().enable_npu_sparse_dflash2_sampling() &&
+      is_probabilistic_draft && device.type() == c10::DeviceType::PrivateUse1;
   torch::Tensor draft_logits;
-  if (is_probabilistic_draft) {
+  if (sparse_distribution) {
+    draft_logits = torch::empty({batch_size, num_steps, top_k}, float_options);
+  } else if (is_probabilistic_draft) {
     draft_logits = torch::full({batch_size, num_steps, vocab_size},
                                -std::numeric_limits<float>::infinity(),
                                float_options);
@@ -123,13 +129,22 @@ DraftProposal sample_dflash2_path(const DFlash2CandidateOutput& candidates,
             /*dim=*/1, sampled_indices.view({batch_size, 1}), zero_log_probs);
         step_log_probs = torch::where(greedy_rows, one_hot, step_log_probs);
       }
-      draft_logits.select(/*dim=*/1, step)
-          .scatter_(/*dim=*/1, step_candidates, step_log_probs);
+      if (sparse_distribution) {
+        draft_logits.select(/*dim=*/1, step).copy_(step_log_probs);
+      } else {
+        draft_logits.select(/*dim=*/1, step)
+            .scatter_(/*dim=*/1, step_candidates, step_log_probs);
+      }
     }
     token_ids.select(/*dim=*/1, step).copy_(sampled_tokens);
     previous_indices = sampled_indices;
   }
 
+  if (sparse_distribution) {
+    return DraftProposal::from_sparse(std::move(token_ids),
+                                      candidates.candidate_ids.clone(),
+                                      std::move(draft_logits));
+  }
   return DraftProposal(std::move(token_ids), std::move(draft_logits));
 }
 

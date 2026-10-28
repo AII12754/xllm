@@ -209,6 +209,11 @@ struct SamplingParameters {
   // for beam search
   bool use_beam_search = false;
 
+  // Derived on the host before H2D, so device sampling never reads controls
+  // back just to decide whether the default generator is needed.
+  bool has_unseeded_sample = false;
+  int64_t num_random_rows = 0;
+
   int64_t num_sample_seqs() const {
     return selected_token_idxes.defined() ? selected_token_idxes.numel() : 0;
   }

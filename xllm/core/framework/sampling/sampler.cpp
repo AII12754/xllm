@@ -25,8 +25,11 @@ limitations under the License.
 
 #if defined(USE_NPU)
 #include <torch_npu/csrc/aten/NPUGeneratorImpl.h>
+
+#include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #endif
 
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/sampling/logits_processor.h"
 #include "core/framework/sampling/sampling_params.h"
@@ -103,8 +106,28 @@ SampleOutput sample(torch::Tensor& logits,
                     const torch::Tensor& filter_mask) {
   SampleOutput output;
   // vLLM reports probabilities from the unmodified model distribution.
+  bool compact_logprobs = false;
+#if defined(USE_NPU)
+  compact_logprobs =
+      ExecutionConfig::get_instance().enable_npu_compact_normalization() &&
+      params.logprobs && params.max_top_logprobs == 0 &&
+      !params.use_beam_search &&
+      !ModelConfig::get_instance().enable_qwen3_reranker() &&
+      kernel::npu::tilelang::supports_sampling_logits(logits) &&
+      logits.size(0) >= 128 && logits.size(1) >= 65536 &&
+      (logits.scalar_type() == torch::kBFloat16 ||
+       logits.scalar_type() == torch::kFloat16);
+#endif
+  const torch::Tensor raw_logits =
+      compact_logprobs ? logits.clone() : torch::Tensor();
+  torch::Tensor raw_lse;
+#if defined(USE_NPU)
+  if (compact_logprobs) {
+    raw_lse = kernel::npu::tilelang::row_logsumexp(logits);
+  }
+#endif
   const torch::Tensor raw_logprobs =
-      params.logprobs && !params.use_beam_search
+      params.logprobs && !params.use_beam_search && !compact_logprobs
           ? torch::log_softmax(logits, /*dim=*/-1, torch::kFloat32)
           : torch::Tensor();
 
@@ -125,7 +148,37 @@ SampleOutput sample(torch::Tensor& logits,
   const bool seed_sampling =
       params.seeds.defined() && params.sampling_mode != SamplingMode::GREEDY;
   torch::Tensor samples;
-  if (seed_sampling) {
+#if defined(USE_NPU)
+  const bool batched_seed_sampling =
+      ExecutionConfig::get_instance().enable_npu_batched_sampling() &&
+      params.sampling_mode != SamplingMode::GREEDY &&
+      kernel::npu::tilelang::supports_sampling_logits(logits) &&
+      (!params.seeds.defined() ||
+       (params.seeds.dim() == 1 && params.seed_offsets.defined() &&
+        params.seed_offsets.dim() == 1 && params.seeds.is_contiguous() &&
+        params.seed_offsets.is_contiguous()));
+  if (batched_seed_sampling) {
+    const auto uniform_options = logits.options().dtype(torch::kFloat32);
+    const torch::Tensor uniforms =
+        (!params.seeds.defined() || params.has_unseeded_sample)
+            ? torch::rand({logits.size(0)}, uniform_options)
+            : torch::Tensor();
+    if (ExecutionConfig::get_instance().enable_npu_fused_logits_sampling()) {
+      samples = kernel::npu::tilelang::sampling_logits(
+          logits, params.seeds, params.seed_offsets, uniforms);
+    } else {
+      const torch::Tensor weights =
+          torch::softmax(logits, /*dim=*/-1, torch::kFloat32);
+      samples = kernel::npu::tilelang::seeded_sample(
+          weights, params.seeds, params.seed_offsets, uniforms);
+    }
+    if (params.sampling_mode == SamplingMode::MIXED) {
+      samples = torch::where(
+          params.require_do_sample(), samples, greedy_sample(logits));
+    }
+  } else
+#endif
+      if (seed_sampling) {
     const torch::Tensor seeds = params.seeds.to(torch::kCPU);
     const torch::Tensor offsets = params.seed_offsets.to(torch::kCPU);
     const torch::Tensor do_sample =
@@ -171,6 +224,13 @@ SampleOutput sample(torch::Tensor& logits,
   output.next_tokens = samples;
 
   if (params.logprobs) {
+    if (compact_logprobs) {
+      output.logprobs = raw_logits.gather(/*dim=*/-1, samples.view({-1, 1}))
+                            .to(torch::kFloat32)
+                            .view({-1})
+                            .sub(raw_lse);
+      return output;
+    }
     if (::xllm::ModelConfig::get_instance().enable_qwen3_reranker()) {
       int32_t false_id = 2152;  // "no"
       int32_t true_id = 9693;   // "yes"

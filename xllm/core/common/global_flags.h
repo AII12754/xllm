@@ -161,6 +161,13 @@ DECLARE_string(rank_tablefile);
 
 constexpr int32_t kGraphExecutorLogVerboseLevel = 50;
 
+DECLARE_bool(enable_npu_batched_sampling);
+DECLARE_bool(enable_npu_fused_logits_sampling);
+DECLARE_bool(enable_npu_verification_sampling);
+DECLARE_bool(enable_npu_compact_normalization);
+DECLARE_bool(enable_npu_random_row_filter);
+DECLARE_bool(enable_npu_sparse_dflash2_sampling);
+
 DECLARE_bool(enable_graph);
 
 DECLARE_bool(enable_unified_mtp_graph);

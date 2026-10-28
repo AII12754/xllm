@@ -70,6 +70,12 @@ class ExecutionConfig final {
          "enable_task_pipeline",
          "enable_graph",
          "enable_unified_mtp_graph",
+         "enable_npu_batched_sampling",
+         "enable_npu_random_row_filter",
+         "enable_npu_sparse_dflash2_sampling",
+         "enable_npu_fused_logits_sampling",
+         "enable_npu_verification_sampling",
+         "enable_npu_compact_normalization",
          "disable_graph_warmup",
          "enable_graph_double_buffer",
          "enable_graph_mode_decode_no_padding",
@@ -101,6 +107,13 @@ class ExecutionConfig final {
   // Disabling this keeps the legacy ACL graph/decode route available for
   // comparison and fallback without disabling ordinary graph execution.
   PROPERTY(bool, enable_unified_mtp_graph) = false;
+
+  PROPERTY(bool, enable_npu_batched_sampling) = false;
+  PROPERTY(bool, enable_npu_random_row_filter) = false;
+  PROPERTY(bool, enable_npu_sparse_dflash2_sampling) = false;
+  PROPERTY(bool, enable_npu_fused_logits_sampling) = false;
+  PROPERTY(bool, enable_npu_verification_sampling) = false;
+  PROPERTY(bool, enable_npu_compact_normalization) = false;
 
   PROPERTY(bool, disable_graph_warmup) = false;
 

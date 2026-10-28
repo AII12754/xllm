@@ -133,6 +133,16 @@ tilelang_register_runtime_kernel(
 )
 
 tilelang_register_runtime_kernel(
+  NAME seeded_sample
+  WRAPPER_SRCS seeded_sample_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
+  NAME sampling_logits
+  WRAPPER_SRCS sampling_logits_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
   NAME greedy_prefix_verify
   WRAPPER_SRCS greedy_prefix_verify_wrapper.cpp
 )
