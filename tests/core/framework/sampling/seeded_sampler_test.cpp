@@ -38,6 +38,24 @@ SamplingParameters make_seeded_params(const torch::Tensor& seeds,
   return params.to(torch::Device(torch::kPrivateUse1, 0), torch::kFloat32);
 }
 
+TEST(SeededSamplerTest, CategoricalEntryPreservesMaskedSupportAcrossLayouts) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  for (const int64_t rows : {int64_t{1}, int64_t{8}}) {
+    torch::Tensor storage = torch::full({rows, 14},
+                                        -std::numeric_limits<float>::infinity(),
+                                        torch::TensorOptions().device(device));
+    storage.select(/*dim=*/1, /*index=*/4).fill_(0.0F);
+    const torch::Tensor contiguous_inner = storage.narrow(/*dim=*/1, 0, 7);
+    const torch::Tensor strided_inner = storage.slice(/*dim=*/1, 0, 14, 2);
+    EXPECT_TRUE(torch::equal(
+        categorical_sample(contiguous_inner),
+        torch::full({rows}, 4, storage.options().dtype(torch::kInt64))));
+    EXPECT_TRUE(torch::equal(
+        categorical_sample(strided_inner),
+        torch::full({rows}, 2, storage.options().dtype(torch::kInt64))));
+  }
+}
+
 TEST(SeededSamplerTest, NpuRequestsAreReproducibleAndIsolated) {
   const torch::Device device(torch::kPrivateUse1, 0);
   const auto& global_generator = at_npu::detail::getDefaultNPUGenerator(0);

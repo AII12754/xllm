@@ -3365,8 +3365,7 @@ void TaskExecutionPipeline::launch_block_draft(SpeculativeSlot& slot) {
                             slot.block_gumbel,
                             speculative_capacity_->common.vocab_size,
                             slot.proposal);
-    invocation.sampled.draft_logits =
-        slot.block_proposal->logits().value_or(torch::Tensor());
+    invocation.sampled.draft_logits = slot.block_proposal->logits();
   } else if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK) {
     if (adaptive_verify_) {
       generate_adaptive_dspark_proposals(slot, slot.state->tokens_);
@@ -3387,8 +3386,7 @@ void TaskExecutionPipeline::launch_block_draft(SpeculativeSlot& slot) {
             },
             speculative_capacity_->is_probabilistic_draft,
             /*token_ids_out=*/slot.proposal)
-            .logits()
-            .value_or(torch::Tensor());
+            .logits();
   } else {
     invocation.sampled = sample(*invocation.sampling, invocation.logits);
     slot.proposal.copy_(

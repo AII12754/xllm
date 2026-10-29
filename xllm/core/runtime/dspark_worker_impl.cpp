@@ -138,7 +138,7 @@ DraftProposal sample_dspark_markov_block(const DSparkMarkovBias& markov_bias,
     CHECK_EQ(bias.sizes(), torch::IntArrayRef({rows, vocab}))
         << "DSpark reduced vocabulary requires draft-to-target remapping.";
     torch::Tensor step_logits;
-    if (proposal.logits().has_value()) {
+    if (proposal.logits().defined()) {
       // add_out into the logits page lets the sampler mutate it in place;
       // draft_logits aliases the page directly.
       torch::Tensor page = proposal.logits_at(step);

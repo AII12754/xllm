@@ -15,22 +15,18 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <torch/types.h>
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
-namespace xllm {
+#include "core/framework/speculative/draft_distribution.h"
 
-// Existing candidate support, without materializing the rest of the vocabulary.
-// IDs are unique within each [K] row and index the target vocabulary. Logits
-// may be unnormalized. Producers retain independent storage until verification.
-struct SparseDraftDistribution {
-  torch::Tensor token_ids;
-  torch::Tensor logits;
-};
+namespace xllm {
 
 // Rejection-sampling input: drafted tokens plus the draft distribution q
 // for probabilistic drafts (greedy drafts carry tokens only, q = 1). -1
@@ -42,25 +38,24 @@ class DraftProposal final {
   explicit DraftProposal(torch::Tensor token_ids,
                          std::optional<torch::Tensor> logits = std::nullopt)
       : token_ids_(std::move(token_ids)),
-        logits_(logits.has_value() && logits->defined() ? std::move(logits)
-                                                        : std::nullopt) {}
+        distribution_(logits.has_value() && logits->defined()
+                          ? DraftDistribution(std::move(*logits))
+                          : DraftDistribution()) {}
 
   const torch::Tensor& token_ids() const { return token_ids_; }
-
-  const std::optional<torch::Tensor>& logits() const { return logits_; }
+  const DraftDistribution& distribution() const { return distribution_; }
+  torch::Tensor logits() const { return distribution_.dense_logits(); }
 
   static DraftProposal from_sparse(torch::Tensor token_ids,
                                    torch::Tensor candidate_ids,
                                    torch::Tensor candidate_logits);
 
-  const std::optional<SparseDraftDistribution>& sparse_distribution() const {
-    return sparse_distribution_;
-  }
-
-  DraftProposal with_token_ids(torch::Tensor token_ids) const {
-    DraftProposal proposal = *this;
-    proposal.token_ids_ = std::move(token_ids);
-    return proposal;
+  void set_token_ids(torch::Tensor token_ids) {
+    CHECK(token_ids.defined());
+    CHECK_EQ(token_ids.sizes(), token_ids_.sizes());
+    CHECK_EQ(token_ids.device(), token_ids_.device());
+    CHECK_EQ(token_ids.scalar_type(), token_ids_.scalar_type());
+    token_ids_ = std::move(token_ids);
   }
 
   // Lifetime owner for no-sync draft inputs that must outlive the verify
@@ -77,33 +72,7 @@ class DraftProposal final {
     CHECK_EQ(token_ids_.size(1), expected_num_speculative_tokens)
         << "draft proposal speculative length mismatch";
 
-    if (sparse_distribution_.has_value()) {
-      CHECK(!logits_.has_value());
-      const auto& distribution = *sparse_distribution_;
-      CHECK_EQ(distribution.token_ids.dim(), 3);
-      CHECK_EQ(distribution.logits.dim(), 3);
-      CHECK_EQ(distribution.token_ids.sizes(), distribution.logits.sizes());
-      CHECK_EQ(distribution.token_ids.size(0), token_ids_.size(0));
-      CHECK_EQ(distribution.token_ids.size(1), token_ids_.size(1));
-      CHECK_GT(distribution.token_ids.size(2), 0);
-      CHECK_EQ(distribution.token_ids.scalar_type(), torch::kInt64);
-      CHECK_EQ(distribution.token_ids.device(), token_ids_.device());
-      CHECK_EQ(distribution.logits.device(), token_ids_.device());
-      CHECK(distribution.logits.is_floating_point());
-    }
-    if (!logits_.has_value()) {
-      return;
-    }
-    // The logits' vocab is the DRAFT model's own (an EAGLE3-style small head
-    // differs from the target's), so it is intentionally NOT compared to the
-    // target vocab: the rejection sampler only gathers at draft_token_ids,
-    // which index the draft domain.
-    CHECK_EQ(logits_->dim(), 3)
-        << "proposal logits must be [batch, n_spec, draft_vocab]";
-    CHECK_EQ(logits_->size(0), token_ids_.size(0))
-        << "logits and token_ids must share the batch dim";
-    CHECK_EQ(logits_->size(1), token_ids_.size(1))
-        << "logits and token_ids must share the speculative length";
+    distribution_.validate(token_ids_);
   }
 
   // Preallocates token_ids [batch, n_spec] plus the q buffer when
@@ -125,14 +94,14 @@ class DraftProposal final {
     return token_ids_.select(/*dim=*/1, /*index=*/step);
   }
   torch::Tensor logits_at(int64_t step) {
-    CHECK(logits_.has_value()) << "greedy proposal carries no logits buffer";
-    return logits_->select(/*dim=*/1, /*index=*/step);
+    torch::Tensor logits = distribution_.dense_logits();
+    CHECK(logits.defined()) << "proposal carries no dense logits buffer";
+    return logits.select(/*dim=*/1, /*index=*/step);
   }
 
  private:
   torch::Tensor token_ids_;
-  std::optional<torch::Tensor> logits_;
-  std::optional<SparseDraftDistribution> sparse_distribution_;
+  DraftDistribution distribution_;
   std::vector<std::shared_ptr<const void>> keep_alive_;
 };
 

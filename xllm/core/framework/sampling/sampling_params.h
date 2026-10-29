@@ -212,6 +212,8 @@ struct SamplingParameters {
   // Derived on the host before H2D, so device sampling never reads controls
   // back just to decide whether the default generator is needed.
   bool has_unseeded_sample = false;
+  // Host-known compaction size: deriving it from the device mask would need
+  // a scalar readback or a dynamic-length index.
   int64_t num_random_rows = 0;
 
   int64_t num_sample_seqs() const {

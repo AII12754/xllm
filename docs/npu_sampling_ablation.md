@@ -241,6 +241,55 @@ local/npu_sampling/automatic_validation/instrument_native.json. These are
 new measurements of the test build; the original tables below keep their
 original build identities.
 
+### Distribution abstraction validation
+
+Draft distributions now encapsulate deterministic, dense and sparse q behind
+one value type. The verifier depends on normalization, acceptance correction
+and residual recovery operations; representation validation stays with the
+distribution. Preallocated logits are normalized at verification time, and
+proposal token replacement retains distribution storage and input owners.
+Unseeded verifier sampling uses the public categorical entry point, retaining
+the NPU inverse-CDF dispatch and the existing Gumbel primitive.
+
+The refactor passes 92 production regression cases (37 sampling, 29 CPU
+controls/distribution, three masks and 23 pipeline cases) and 67 instrumented
+sampling cases. Production has no ablation symbol. A four-device production
+model smoke passes all 184 requests across random, mixed, selected-logprob,
+top-5 and greedy modes.
+
+Five-repeat native checks preserve the optimized B=32 results: ordinary
+random 1150.92 us, ordinary mixed 981.14 us, and D+E+G verification 2680.74 us.
+Against the published implementation retested in the same session, these
+change by -0.07%, +0.44% and +0.32%, respectively; allocator peaks are unchanged.
+Each executable interleaves its ablation masks in one process. A separate
+published/refactored/refactored/published B=1 check collects 14 samples per
+version and mask: D+E changes by -0.45%, and D+E+G by -2.29%. It does not
+reproduce the initial small-batch slowdown seen in separate-process medians.
+
+The serving check switches masks in one resident four-rank group per model,
+using physical devices 4–7, three repeats and 64 output tokens. Ordinary uses
+masks 0/7; DFlash2 uses 0/24/56/63. All 576 ordinary and 864 DFlash2 requests
+complete successfully. The table shows medians for baseline versus all
+applicable optimizations, without replacing the historical acceptance matrix.
+
+| Workload | Baseline tokens/s | Optimized tokens/s | TPOT ms, baseline → optimized |
+| --- | ---: | ---: | ---: |
+| Ordinary random, B=32 | 836.51 | 932.04 | 35.15 → 31.35 |
+| Ordinary mixed, B=32 | 410.22 | 946.55 | 75.09 → 30.87 |
+| Ordinary greedy, B=32 | 975.41 | 975.70 | 29.94 → 29.91 |
+| DFlash2 random, B=32 | 570.62 | 587.18 | 45.68 → 43.81 |
+| DFlash2 mixed, B=32 | 208.32 | 213.74 | 141.40 → 138.38 |
+| DFlash2 greedy, B=8 | 228.70 | 227.65 | 26.71 → 25.55 |
+
+DFlash2 combinations remain sensitive to acceptance and scheduling variation:
+D+E random throughput is 614.03 tokens/s, exceeding all-on in this short run.
+Greedy is a control, not a claimed speedup: its D+E+G-only TPOT is 31.22 ms
+versus baseline 26.71 ms, although throughput changes by -1.19%; all-on TPOT
+is 25.55 ms. These variable control results are retained in the raw records.
+
+Build logs, binary hashes, native repeats, switching readbacks and all serving
+results are under local/npu_sampling/review_followup/.
+
 ## Native ablations
 
 Representative ordinary BF16 mixed batches, V=248320, 25% random rows:

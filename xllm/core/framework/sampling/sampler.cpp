@@ -79,6 +79,19 @@ torch::Tensor gumbel_noise(const SamplingParameters& params,
   return noise;
 }
 
+torch::Tensor categorical_sample(const torch::Tensor& logits) {
+#if defined(USE_NPU)
+  if (npu_sampling_enabled(NpuSamplingOptimization::VERIFICATION) &&
+      kernel::npu::tilelang::supports_sampling_logits(logits) &&
+      logits.size(0) >= 8) {
+    const torch::Tensor uniforms =
+        torch::rand({logits.size(0)}, logits.options().dtype(torch::kFloat32));
+    return kernel::npu::tilelang::sampling_logits(logits, {}, {}, uniforms);
+  }
+#endif
+  return gumbel_sample(logits);
+}
+
 torch::Tensor gumbel_sample(const torch::Tensor& logits) {
   // clamp_min_ before log_: an exact 0.0 Exp draw would become -inf noise.
   return gumbel_argmax(

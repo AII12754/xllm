@@ -449,10 +449,6 @@ TEST_P(SparseDraftTest, MatchesDenseSupportAndSentinelRecovery) {
   EXPECT_TRUE(torch::equal(sparse_result, dense_result));
   EXPECT_TRUE(torch::equal(
       sparse_result, torch::tensor({{1, 0, -1}, {4, -1, -1}}, ids_options)));
-  const DraftProposal replaced = sparse.with_token_ids(tokens.clone());
-  ASSERT_TRUE(replaced.sparse_distribution().has_value());
-  EXPECT_TRUE(
-      torch::equal(replaced.sparse_distribution()->token_ids, candidates));
 }
 
 TEST_P(SparseDraftTest, MatchesDenseRandomRejection) {

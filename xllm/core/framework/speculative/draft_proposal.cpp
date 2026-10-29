@@ -23,8 +23,9 @@ DraftProposal DraftProposal::from_sparse(torch::Tensor token_ids,
                                          torch::Tensor candidate_ids,
                                          torch::Tensor candidate_logits) {
   DraftProposal proposal(std::move(token_ids));
-  proposal.sparse_distribution_ = SparseDraftDistribution{
-      std::move(candidate_ids), std::move(candidate_logits)};
+  proposal.distribution_ = DraftDistribution::from_sparse(
+      std::move(candidate_ids), std::move(candidate_logits));
+  proposal.distribution_.validate(proposal.token_ids_);
   return proposal;
 }
 
@@ -41,9 +42,9 @@ DraftProposal DraftProposal::from_token_buffer(
   DraftProposal proposal(std::move(token_ids));
   if (is_probabilistic_draft) {
     CHECK_GT(vocab_size, 0);
-    proposal.logits_ = torch::empty(
+    proposal.distribution_ = DraftDistribution(torch::empty(
         {proposal.token_ids_.size(0), proposal.token_ids_.size(1), vocab_size},
-        logits_options);
+        logits_options));
   }
   return proposal;
 }

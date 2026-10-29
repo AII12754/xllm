@@ -3736,11 +3736,15 @@ SampleOutput MTPWorkerImpl<TargetInput>::validate(
     validation_token_ids =
         draft_proposal.token_ids().masked_fill(invalid_mask, /*sentinel=*/-1);
   }
+  // Copy proposal handles only when grammar validation replaces IDs.
+  std::optional<DraftProposal> validation_proposal;
+  if (validation_token_ids.defined()) {
+    validation_proposal = draft_proposal;
+    validation_proposal->set_token_ids(std::move(validation_token_ids));
+  }
   SampleOutput sample_output = spec_verify::run_rejection_sampling(
       std::move(sampling_params),
-      draft_proposal.with_token_ids(validation_token_ids.defined()
-                                        ? validation_token_ids
-                                        : draft_proposal.token_ids()),
+      validation_proposal.has_value() ? *validation_proposal : draft_proposal,
       target_logits,
       target_hidden_states);
 

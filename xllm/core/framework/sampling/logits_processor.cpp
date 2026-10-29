@@ -293,9 +293,8 @@ void process_logits(torch::Tensor& logits,
   if (npu_sampling_enabled(NpuSamplingOptimization::RANDOM_ROW_FILTER) &&
       logits.device().type() == c10::DeviceType::PrivateUse1 &&
       params.sampling_mode == SamplingMode::MIXED && !params.logprobs &&
-      !params.return_logits && !params.use_beam_search && logits.dim() == 2 &&
-      logits.size(0) >= 2 && logits.size(1) >= 32768 &&
-      params.num_random_rows > 0 &&
+      !params.return_logits && !params.use_beam_search && logits.size(0) >= 2 &&
+      logits.size(1) >= 32768 && params.num_random_rows > 0 &&
       params.num_random_rows <= logits.size(0) / 2 &&
       params.require_do_sample().numel() == logits.size(0) &&
       (params.top_k.defined() || params.top_p.defined())) {
