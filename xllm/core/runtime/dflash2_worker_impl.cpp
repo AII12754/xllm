@@ -61,8 +61,8 @@ DraftProposal sample_dflash2_path(const DFlash2CandidateOutput& candidates,
       torch::TensorOptions().dtype(torch::kFloat32).device(device);
 
   torch::Tensor edge_logits = candidates.edge_logits.to(torch::kFloat32);
-  if (sampling_params.temperatures.defined()) {
-    apply_temperatures(edge_logits, sampling_params.temperatures);
+  if (sampling_params.temperatures().defined()) {
+    apply_temperatures(edge_logits, sampling_params.temperatures());
   }
   // log_softmax is monotone per row, so argmax(log_probs + noise) matches
   // argmax(logits + noise); normalize only when q is reported.
@@ -94,7 +94,7 @@ DraftProposal sample_dflash2_path(const DFlash2CandidateOutput& candidates,
   torch::Tensor greedy_rows;
   torch::Tensor zero_log_probs;
   if (is_probabilistic_draft &&
-      sampling_params.sampling_mode == SamplingMode::MIXED) {
+      sampling_params.sampling_mode() == SamplingMode::MIXED) {
     greedy_rows = greedy_mask(sampling_params, device);
     zero_log_probs = torch::zeros({batch_size, 1}, float_options);
   }
@@ -120,7 +120,7 @@ DraftProposal sample_dflash2_path(const DFlash2CandidateOutput& candidates,
         index_select_2d(step_candidates, /*dim=*/1, sampled_indices);
     if (is_probabilistic_draft) {
       torch::Tensor step_log_probs = row_log_probs;
-      if (sampling_params.sampling_mode == SamplingMode::MIXED) {
+      if (sampling_params.sampling_mode() == SamplingMode::MIXED) {
         // Greedy rows embed a log-space one-hot (q = 1).
         torch::Tensor one_hot =
             torch::full({batch_size, top_k},
@@ -156,7 +156,7 @@ torch::Tensor broadcast_gumbel_noise(int64_t batch_size,
                                      int64_t num_classes,
                                      const torch::Device& device,
                                      ProcessGroup* sampling_group) {
-  if (sampling.sampling_mode == SamplingMode::GREEDY) {
+  if (sampling.sampling_mode() == SamplingMode::GREEDY) {
     return torch::Tensor();
   }
   CHECK_GT(batch_size, 0);

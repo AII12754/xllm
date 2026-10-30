@@ -691,12 +691,14 @@ class TestModelExecutorConstruction:
                 max_seqs_per_batch=4,
             )
 
+    @pytest.mark.parametrize("is_draft_engine", [False, True])
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
     @patch("xllm.python.model_executor.executor._create_attention_backend")
     def test_acl_graph_capacity_respects_decode_batch_limit(
         self,
         mock_create,
         mock_graph_runner,
+        is_draft_engine: bool,
     ):
         mock_create.return_value = StubAttentionBackend()
         model = _FakeModel(num_layers=1)
@@ -706,6 +708,7 @@ class TestModelExecutorConstruction:
             {
                 "max_position_embeddings": 128,
                 "python_graph_backend": "aclgraph",
+                "is_draft_engine": is_draft_engine,
             },
             max_seqs_per_batch=256,
             num_decoding_tokens=4,
@@ -721,7 +724,7 @@ class TestModelExecutorConstruction:
             1,
             0,
             num_decoding_tokens=4,
-            is_spec_draft=False,
+            is_spec_draft=is_draft_engine,
             enable_mega_moe_token_mask=False,
             enable_graph_mode_decode_no_padding=False,
             spec_verify_width=1,
@@ -1055,6 +1058,7 @@ class TestDecodeAclGraphSpeculativeMetadata:
                 None,
                 graph_key=graph_key,
                 eplb=None,
+                input_batch=None,
                 expanded=ANY,
             )
             expanded = prepare.call_args.kwargs["expanded"]
@@ -1897,7 +1901,7 @@ class TestExecuteRouting:
         executor.eager_runner = MagicMock()
         grad_enabled = None
 
-        def execute(*_args, eplb=None):
+        def execute(*_args: object, eplb: object = None, input_batch: object = None) -> torch.Tensor:
             nonlocal grad_enabled
             grad_enabled = torch.is_grad_enabled()
             return torch.ones(5)
@@ -1970,7 +1974,7 @@ class TestExecuteRouting:
         input_ids = torch.zeros(4, dtype=torch.int32)
         positions = torch.arange(4, dtype=torch.int32)
         metadata = MagicMock(spec=AttentionMetadata)
-        graph_runner = MagicMock()
+        graph_runner = create_autospec(DecodeAclGraphRunner, instance=True)
         graph_runner.can_execute.return_value = True
         graph_runner.execute.return_value = torch.ones(4)
         executor.decode_graph_runner = graph_runner
@@ -1978,19 +1982,18 @@ class TestExecuteRouting:
         result = executor.execute(input_ids, positions, metadata)
 
         graph_runner.warmup.assert_called_once_with(
-            input_ids,
-            positions,
-            metadata,
-            None,
-            eplb=None,
+            input_ids, positions, metadata, None, None, eplb=None, input_batch=None
         )
         graph_runner.execute.assert_called_once_with(
             input_ids,
             positions,
             metadata,
             None,
+            None,
             graph_key=graph_runner.warmup.return_value,
             eplb=None,
+            decode_metadata=None,
+            input_batch=None,
         )
         assert torch.equal(result, torch.ones(4))
 
@@ -2060,6 +2063,8 @@ def test_mtp_topk_routes_to_acl_graph(mock_create):
         mtp_topk_indices=topk,
         graph_key=graph_runner.warmup.return_value,
         eplb=None,
+        decode_metadata=None,
+        input_batch=None,
     )
     assert result is graph_runner.execute.return_value
     executor.eager_runner.execute.assert_not_called()
@@ -2231,6 +2236,30 @@ def test_executor_prepares_qwen_mtp_with_logical_accepted_state(draft_tokens: in
     assert metadata.prepared_attention_state.device_kv_lengths
     assert metadata.linear_state_indices.numel() == metadata.num_accepted_tokens.numel() == 2
     metadata.num_accepted_tokens = metadata.num_accepted_tokens.to(torch.int64)
+    with pytest.raises(ValueError, match="accepted token counts"):
+        executor.prepare_metadata(metadata)
+
+
+def test_executor_rejects_token_row_scoped_accepted_counts() -> None:
+    backend = _PreparedStubAttentionBackend()
+    config = {
+        "model_type": "qwen3_5_text",
+        "is_mtp_algorithm": True,
+        "num_speculative_tokens": 3,
+        "enable_task_pipeline": True,
+    }
+    with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend):
+        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=2, num_decoding_tokens=4)
+    cache = torch.empty(2, 4, 2, 64)
+    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
+    metadata = _prepared_qwen_metadata()
+    rows = 2 * 4
+    metadata.slot_mapping = torch.arange(rows, dtype=torch.int32)
+    metadata.q_seq_lens = torch.ones(rows, dtype=torch.int32)
+    metadata.q_cu_seq_lens = torch.arange(rows + 1, dtype=torch.int32)
+    metadata.q_cu_seq_lens_host_values = list(range(rows + 1))
+    metadata.is_spec_verify = True
+    metadata.num_accepted_tokens = torch.ones(rows, dtype=torch.int32)
     with pytest.raises(ValueError, match="accepted token counts"):
         executor.prepare_metadata(metadata)
 
@@ -2677,7 +2706,7 @@ def test_kv_transfer_uses_eager_and_preserves_step_inputs(prepared: bool, is_mtp
     executor.eager_runner = MagicMock()
     executor.decode_graph_runner = MagicMock(spec=DecodeAclGraphRunner)
     executor.decode_graph_runner.can_execute.return_value = True
-    executor.prepared_graph_runner = MagicMock()
+    executor.prepared_graph_runner = MagicMock(execution_metadata_builders=())
     executor.inductor_runner = MagicMock()
 
     for _ in range(2):
@@ -2686,7 +2715,7 @@ def test_kv_transfer_uses_eager_and_preserves_step_inputs(prepared: bool, is_mtp
         expected_args = (tokens, positions, metadata, hidden, synchronizer)
         if not prepared or is_mtp:
             expected_args += (topk,)
-        executor.eager_runner.execute.assert_called_with(*expected_args, eplb=None)
+        executor.eager_runner.execute.assert_called_with(*expected_args, eplb=None, input_batch=None)
         assert result is executor.eager_runner.execute.return_value
     assert executor.eager_runner.execute.call_count == 2
     executor.decode_graph_runner.can_execute.assert_not_called()
@@ -2708,7 +2737,7 @@ def test_layerwise_load_prefill_keeps_following_prepared_decode_on_graph() -> No
     )
     executor.prepare_metadata(metadata)
     executor.eager_runner = MagicMock()
-    executor.prepared_graph_runner = MagicMock()
+    executor.prepared_graph_runner = MagicMock(execution_metadata_builders=())
     tokens = torch.tensor([1, 2], dtype=torch.int32)
     positions = torch.tensor([9, 11], dtype=torch.int32)
     load = MagicMock()
@@ -2792,7 +2821,7 @@ def test_prepared_block_graph_keeps_query_width_and_explicit_capacity_admission(
     assert executor.prepared_graph_runner.max_batch == query_width
     assert executor.prepared_graph_runner._block_draft
     executor._kv_bound = True
-    executor.prepared_graph_runner = MagicMock()
+    executor.prepared_graph_runner = MagicMock(execution_metadata_builders=())
     executor.context_kv_graph_runner = MagicMock()
     executor.eager_runner = MagicMock()
     metadata = SimpleNamespace(prepared_attention_state=object(), is_prefill=False, is_chunked_prefill=True)
@@ -2801,7 +2830,7 @@ def test_prepared_block_graph_keeps_query_width_and_explicit_capacity_admission(
     output = executor.execute(tokens, positions, metadata, enable_graph=True, is_graph_warmup=True)
     assert output is executor.prepared_graph_runner.execute_block.return_value
     executor.prepared_graph_runner.execute_block.assert_called_once_with(
-        tokens, positions, metadata, None, None, None, eplb=None
+        tokens, positions, metadata, None, None, None, eplb=None, input_batch=None
     )
     executor.prepared_graph_runner.can_execute_block.assert_not_called()
     executor.prepared_graph_runner.execute.assert_not_called()
@@ -2814,7 +2843,7 @@ def test_prepared_block_graph_keeps_query_width_and_explicit_capacity_admission(
         executor.prepared_graph_runner.execute_block.side_effect = error
         with pytest.raises(type(error), match=str(error)):
             executor.execute(tokens, positions, metadata, enable_graph=True)
-    executor.eager_runner.execute.assert_called_once_with(tokens, positions, metadata, eplb=None)
+    executor.eager_runner.execute.assert_called_once_with(tokens, positions, metadata, eplb=None, input_batch=None)
 
 
 @pytest.mark.parametrize("dp_size,cp_size", [(1, 1), (2, 1), (1, 2), (1, 4)])
@@ -2846,7 +2875,9 @@ def test_prepared_mtp_preserves_hidden_and_topk(dp_size: int, cp_size: int) -> N
     topk = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
     executor.eager_runner = MagicMock()
     result = executor.execute(tokens, positions, metadata, hidden, mtp_topk_indices=topk)
-    executor.eager_runner.execute.assert_called_once_with(tokens, positions, metadata, hidden, None, topk, eplb=None)
+    executor.eager_runner.execute.assert_called_once_with(
+        tokens, positions, metadata, hidden, None, topk, eplb=None, input_batch=None
+    )
     assert result is executor.eager_runner.execute.return_value
     with pytest.raises(RuntimeError, match="runner is not enabled"):
         executor.execute(tokens, positions, metadata, hidden, mtp_topk_indices=topk, enable_graph=True)
@@ -2899,7 +2930,7 @@ def test_prepared_mtp_graph_receives_bound_hidden_and_topk(dp_size: int, cp_size
     assert executor.prepared_graph_runner.max_batch == min((5 + dp_size - 1) // dp_size, 4) * 2
     assert executor.decode_graph_runner is None
     executor._kv_bound = True
-    executor.prepared_graph_runner = MagicMock()
+    executor.prepared_graph_runner = MagicMock(execution_metadata_builders=())
     tokens = torch.tensor([13, 17], dtype=torch.int32)
     positions = torch.tensor([7, 19], dtype=torch.int32)
     hidden = torch.zeros(2, 4)
@@ -2907,11 +2938,11 @@ def test_prepared_mtp_graph_receives_bound_hidden_and_topk(dp_size: int, cp_size
     metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False, prepared_attention_state=object())
     executor.warmup_prepared_graph(tokens, positions, metadata, hidden, topk)
     executor.prepared_graph_runner.warmup_prepared.assert_called_once_with(
-        tokens, positions, metadata, hidden, topk, eplb=None, pre_capture_kv_buckets=True
+        tokens, positions, metadata, hidden, topk, eplb=None, pre_capture_kv_buckets=True, input_batch=None
     )
     executor.execute(tokens, positions, metadata, hidden, mtp_topk_indices=topk, enable_graph=True)
     executor.prepared_graph_runner.execute.assert_called_once_with(
-        tokens, positions, metadata, hidden, None, topk, eplb=None
+        tokens, positions, metadata, hidden, None, topk, eplb=None, input_batch=None
     )
 
 
@@ -3101,9 +3132,13 @@ def test_executor_preserves_block_draft_admission_and_runner_arguments() -> None
     output = executor.execute(tokens, tokens, metadata)
 
     runner.prepare_execution.assert_not_called()
-    runner.can_execute.assert_called_once_with(tokens, metadata, None)
-    runner.warmup.assert_called_once_with(tokens, tokens, metadata, None, eplb=None, pre_capture_kv_buckets=False)
-    runner.execute.assert_called_once_with(tokens, tokens, metadata, None, graph_key="block-key", eplb=None)
+    runner.can_execute.assert_called_once_with(tokens, metadata, None, None)
+    runner.warmup.assert_called_once_with(
+        tokens, tokens, metadata, None, None, eplb=None, pre_capture_kv_buckets=False, input_batch=None
+    )
+    runner.execute.assert_called_once_with(
+        tokens, tokens, metadata, None, None, graph_key="block-key", eplb=None, decode_metadata=None, input_batch=None
+    )
     assert output is runner.execute.return_value
 
 
@@ -3184,3 +3219,38 @@ def test_eager_runner_skips_cp_for_empty_rank() -> None:
     build_context.assert_not_called()
     assert runner.attention_backend._prepared
     runner.model.assert_called_once()
+
+
+class TestDecodeAclGraphWidthKeying:
+    def test_graph_key_identifies_uniform_span_width_not_sequence_count(self) -> None:
+        runner = DecodeAclGraphRunner(
+            nn.Identity(),
+            _PagedStubAttentionBackend(),
+            torch.device("cpu"),
+            max_batch=16,
+            max_model_len=8,
+            num_decoding_tokens=4,
+        )
+        runner._has_linear_cache = True
+        runner._spec_verify_width = 1
+        runner._enable_decode_no_padding = False
+        runner._uses_compressed_kpool_tail = False
+
+        two = SimpleNamespace(kpool_query_lens=(4, 4))
+        four = SimpleNamespace(kpool_query_lens=(4, 4, 4, 4))
+
+        assert runner._padded_kpool_query_lens(two, 8, 16) == runner._padded_kpool_query_lens(four, 16, 16)
+        assert DecodeAclGraphRunner._graph_key(
+            16, False, None, kpool_query_lens=runner._padded_kpool_query_lens(two, 8, 16)
+        ) == DecodeAclGraphRunner._graph_key(
+            16, False, None, kpool_query_lens=runner._padded_kpool_query_lens(four, 16, 16)
+        )
+        assert DecodeAclGraphRunner._graph_key(
+            16, False, None, kpool_query_lens=(8, 8)
+        ) != DecodeAclGraphRunner._graph_key(
+            16, False, None, kpool_query_lens=runner._padded_kpool_query_lens(four, 16, 16)
+        )
+        with pytest.raises(ValueError, match="complete fixed-width requests"):
+            runner._padded_batch_size(6, SimpleNamespace(is_spec_verify=True))
+        with pytest.raises(ValueError, match="exceeds ACL graph capacity"):
+            runner._padded_batch_size(20, SimpleNamespace(is_spec_verify=True))

@@ -17,9 +17,12 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <utility>
 #include <vector>
 
+#include "core/framework/config/model_config.h"
 #include "core/framework/model/mtp_topk_state.h"
+#include "core/util/scope_guard.h"
 #include "core/util/tensor_helper.h"
 #include "framework/model/model_params_view.h"
 #include "models/llm/mlu/mtp_topk_state.h"
@@ -111,7 +114,51 @@ TEST(SpecDecodeInputBuilderTest, DraftInputsSingleRowPerSeq) {
   EXPECT_EQ(buf.out_kv_seq_lens, to_layout_seq_lens({6, 10}));
 }
 
+TEST(SpecDecodeInputBuilderTest, PreservesRequestGroupsAndAbsoluteHistory) {
+  auto& model_config = ModelConfig::get_instance();
+  const auto model_impl = model_config.model_impl();
+  ScopeGuard restore_model_impl([&] { model_config.model_impl(model_impl); });
+  model_config.model_impl("python");
+  auto input =
+      make_forward_input(torch::Tensor(),
+                         torch::tensor({40, 80}, torch::kInt),
+                         torch::tensor({{0, 1, 2}, {3, 4, 5}}, torch::kInt),
+                         to_layout_seq_lens({5, 9}));
+  const auto context = make_decode_row_context(input);
+  DecodeBuildBuffers buffers;
+  for (const auto& [sequence, offset] :
+       {std::pair{0, 0}, std::pair{0, 1}, std::pair{1, 0}}) {
+    RowSpec row;
+    row.seq_id = sequence;
+    row.position_offset = offset;
+    row.append_token = false;
+    row.append_q_len_one = true;
+    append_decode_row(context, row, 4, buffers);
+  }
+  auto params = ModelInputSnapshot(LlmModelParams()).view();
+  params.meta.num_sequences = 3;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  update_input_params(params,
+                      buffers,
+                      1,
+                      std::move(buffers.out_q_seq_lens),
+                      std::move(buffers.out_q_cu_seq_lens),
+                      buffers.meta.kv_max_seq_len,
+                      std::move(buffers.out_kv_seq_lens),
+                      false);
+  const auto& batch = params.meta.execution_batch;
+  EXPECT_EQ(batch.num_reqs, 2);
+  EXPECT_EQ(batch.num_tokens, 3);
+  EXPECT_EQ(batch.num_scheduled_tokens, std::vector<int32_t>({2, 1}));
+  EXPECT_EQ(batch.num_computed_tokens, std::vector<int32_t>({40, 80}));
+  EXPECT_EQ(batch.query_start_loc, std::vector<int32_t>({0, 2, 3}));
+}
+
 TEST(SpecDecodeInputBuilderTest, EmptyBlockDraftMaterializesWholeQuery) {
+  auto& model_config = ModelConfig::get_instance();
+  const auto model_impl = model_config.model_impl();
+  ScopeGuard restore_model_impl([&] { model_config.model_impl(model_impl); });
+  model_config.model_impl("python");
   LlmForwardInput input;
   input.input_params.parallel.dp_global_token_nums = {0, 21};
   input.input_params.parallel.raw_dp_global_token_nums = {0, 21};
@@ -122,6 +169,10 @@ TEST(SpecDecodeInputBuilderTest, EmptyBlockDraftMaterializesWholeQuery) {
   const auto& params = input.input_params;
   EXPECT_EQ(params.meta.num_sequences, 1);
   EXPECT_EQ(params.meta.actual_num_sequences, 0);
+  EXPECT_EQ(params.meta.execution_batch.num_reqs, 0);
+  EXPECT_EQ(params.meta.execution_batch.num_tokens, 7);
+  EXPECT_EQ(params.meta.execution_batch.query_start_loc,
+            std::vector<int32_t>({0}));
   EXPECT_EQ(params.meta.q_max_seq_len, 7);
   EXPECT_EQ(params.meta.kv_max_seq_len, 1);
   EXPECT_EQ(tensor_to_vector<int32_t>(input.token_ids_host),
@@ -740,7 +791,7 @@ TEST(SpecMtpTopkInputBuilderTest, SelectsSampledRowsForNextDraftStep) {
       torch::tensor({{0, 1}, {2, 3}, {4, 5}, {6, 7}}, torch::kInt32);
   const MtpTopkStatePtr state = MtpTopkState::from_tensor(topk_indices);
   SamplingParameters sampling_params;
-  sampling_params.selected_token_idxes = torch::tensor({1, 3}, torch::kInt32);
+  sampling_params.selected_token_idxes() = torch::tensor({1, 3}, torch::kInt32);
 
   const MtpTopkStatePtr selected =
       select_mtp_topk_state_for_next_step(state, sampling_params);
@@ -755,7 +806,7 @@ TEST(SpecMtpTopkInputBuilderTest, KeepsRowsWhenAlreadyMatchedToDraftBatch) {
       torch::tensor({{0, 1}, {2, 3}}, torch::kInt32);
   const MtpTopkStatePtr state = MtpTopkState::from_tensor(topk_indices);
   SamplingParameters sampling_params;
-  sampling_params.selected_token_idxes = torch::tensor({0, 1}, torch::kInt32);
+  sampling_params.selected_token_idxes() = torch::tensor({0, 1}, torch::kInt32);
 
   const MtpTopkStatePtr selected =
       select_mtp_topk_state_for_next_step(state, sampling_params);
@@ -789,7 +840,7 @@ TEST(SpecMtpTopkInputBuilderTest, TensorBindingKeepsStorageAcrossUpdates) {
 
 TEST(SpecMtpTopkInputBuilderTest, KeepsUndefinedStateUndefined) {
   SamplingParameters sampling_params;
-  sampling_params.selected_token_idxes = torch::tensor({0}, torch::kInt32);
+  sampling_params.selected_token_idxes() = torch::tensor({0}, torch::kInt32);
 
   const MtpTopkStatePtr selected =
       select_mtp_topk_state_for_next_step(nullptr, sampling_params);
@@ -810,7 +861,7 @@ TEST(SpecMtpTopkInputBuilderTest, SelectsMluRowsWithoutMixingLayerState) {
       std::make_shared<mlu::model::MluMtpTopkState>(std::move(states));
   EXPECT_FALSE(state->as_tensor().has_value());
   SamplingParameters sampling_params;
-  sampling_params.selected_token_idxes = torch::tensor({2, 0}, torch::kInt32);
+  sampling_params.selected_token_idxes() = torch::tensor({2, 0}, torch::kInt32);
 
   const MtpTopkStatePtr selected =
       select_mtp_topk_state_for_next_step(state, sampling_params);
@@ -842,7 +893,7 @@ TEST(SpecMtpTopkInputBuilderTest, KeepsMluStateWhenRowsAlreadyMatchDraftBatch) {
   const MtpTopkStatePtr state =
       std::make_shared<mlu::model::MluMtpTopkState>(std::move(states));
   SamplingParameters sampling_params;
-  sampling_params.selected_token_idxes = torch::tensor({0, 1}, torch::kInt32);
+  sampling_params.selected_token_idxes() = torch::tensor({0, 1}, torch::kInt32);
 
   const MtpTopkStatePtr selected =
       select_mtp_topk_state_for_next_step(state, sampling_params);

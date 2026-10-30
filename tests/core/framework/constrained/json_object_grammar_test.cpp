@@ -300,7 +300,7 @@ TEST(JsonObjectGrammarTest, BitmaskMatchesFloatMaskAndCaches) {
   torch::Tensor logits =
       torch::zeros({1, static_cast<int64_t>(grammar.vocab_size())});
   SamplingParameters params;
-  params.filter_bitmask = packed.unsqueeze(0);
+  params.filter_bitmask() = packed.unsqueeze(0);
   process_logits(logits, params);
   for (int64_t token_id = 0;
        token_id < static_cast<int64_t>(grammar.vocab_size());
@@ -393,7 +393,7 @@ TEST(JsonObjectGrammarTest, BuildsMaskWithMixedReasoningDefinitions) {
   ASSERT_EQ(bitmask.sizes(), torch::IntArrayRef({5, 1}));
   torch::Tensor masked_logits = torch::zeros({5, 5});
   SamplingParameters params;
-  params.filter_bitmask = bitmask;
+  params.filter_bitmask() = bitmask;
   process_logits(masked_logits, params);
   EXPECT_TRUE(torch::equal(masked_logits, mask));
 }

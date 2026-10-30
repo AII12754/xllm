@@ -167,12 +167,15 @@ class FakeEngine final : public RecEngine {
   FakeEngine(int32_t num_blocks,
              int32_t block_size,
              bool enable_storage_prefetch = false,
-             int32_t dp_size = 1)
+             int32_t dp_size = 1,
+             bool linear_state = false)
       : RecEngine(make_options()) {
     BlockManagerPool::Options opt;
     opt.num_blocks_ = num_blocks;
     opt.block_size_ = block_size;
     opt.enable_prefix_cache_ = false;
+    opt.enable_linear_state_ = linear_state;
+    opt.linear_state_num_slots_ = linear_state ? 8 : 0;
     fake_tokenizer_ = std::make_unique<FakeTokenizer>();
     fake_block_manager_ =
         std::make_unique<ControllablePrefetchBlockManagerPool>(
@@ -181,6 +184,13 @@ class FakeEngine final : public RecEngine {
   ForwardOutput step(RecBatchGroup& batch) override {
     if (step_hook_) {
       step_hook_();
+    }
+    for (const RecBatch& rec_batch : batch) {
+      for (Sequence* sequence : rec_batch.get_sequences()) {
+        if (sequence->has_linear_state_slot()) {
+          EXPECT_EQ(sequence->kv_state().num_blocks(BlockType::LINEAR), 1u);
+        }
+      }
     }
     last_step_had_request_.store(std::any_of(batch.begin(),
                                              batch.end(),
@@ -590,14 +600,25 @@ TEST(FixedStepsSchedulerTest, StepExecutesRecBatch) {
       SchedulerConfig::get_instance()
           .prefill_scheduling_memory_usage_threshold(),
       1.0);
-  auto engine = std::make_unique<FakeEngine>(64, 32);
-  auto opt = CreateOptions(10000, 256);
-  FixedStepsScheduler scheduler(engine.get(), opt);
-  auto requests = GenRequests({32}, {10}, RecType::kOneRec);
-  ASSERT_TRUE(scheduler.add_request(requests[0]));
-  scheduler.step(absl::Milliseconds(500));
-  EXPECT_EQ(engine->step_calls(), 1u);
-  EXPECT_TRUE(engine->last_step_had_request());
+  for (const RecType rec_type : {RecType::kOneRec, RecType::kLlmRec}) {
+    SCOPED_TRACE(rec_type == RecType::kLlmRec ? "llm-rec" : "one-rec");
+    const bool linear_state = rec_type == RecType::kLlmRec;
+    auto engine =
+        std::make_unique<FakeEngine>(64,
+                                     32,
+                                     /*enable_storage_prefetch=*/false,
+                                     /*dp_size=*/1,
+                                     /*linear_state=*/linear_state);
+    auto opt = CreateOptions(10000, 256);
+    FixedStepsScheduler scheduler(engine.get(), opt);
+    auto requests = GenRequests({32}, {10}, rec_type);
+    ASSERT_TRUE(scheduler.add_request(requests[0]));
+    scheduler.step(absl::Milliseconds(500));
+    EXPECT_EQ(engine->step_calls(), 1u);
+    EXPECT_TRUE(engine->last_step_had_request());
+    EXPECT_EQ(requests[0]->sequences()[0]->has_linear_state_slot(),
+              linear_state);
+  }
 }
 
 TEST(FixedStepsSchedulerTest, IdleStepWaitsWithoutRepeatedScansUntilAdmission) {

@@ -25,8 +25,8 @@ namespace xllm::mtp_async {
 enum class TargetSpecVerifyMode {
   GENERIC,
   CAUSAL_CHUNKED_PREFILL,
-  QWEN3_5_EXPANDED_VERIFY,
-  DEEPSEEK_V32_EXPANDED_VERIFY,
+  EXPANDED_VERIFY,
+  PYTHON_EXPANDED_VERIFY,
 };
 
 // Keep target verification policy closed over model types with validated

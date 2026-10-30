@@ -65,13 +65,13 @@ torch::Tensor gumbel_noise(const SamplingParameters& params,
                            const torch::Device& device) {
   torch::Tensor noise = torch::empty(
       sizes, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-  if (params.seeds.defined()) {
+  if (params.seeds().defined()) {
     CHECK(sizes.size() == 2 || sizes.size() == 3);
-    const torch::Tensor seeds = params.seeds.to(torch::kCPU);
-    const torch::Tensor offsets = params.seed_offsets.to(torch::kCPU);
+    const torch::Tensor seeds = params.seeds().to(torch::kCPU);
+    const torch::Tensor offsets = params.seed_offsets().to(torch::kCPU);
     const torch::Tensor seeded = seeds.ne(-1);
     const torch::Tensor random_rows =
-        params.sampling_mode == SamplingMode::MIXED
+        params.sampling_mode() == SamplingMode::MIXED
             ? params.require_do_sample().to(torch::kCPU)
             : torch::ones({sizes[0]}, torch::kBool);
     torch::Generator generator = make_sampling_generator(device);
@@ -100,7 +100,7 @@ torch::Tensor gumbel_noise(const SamplingParameters& params,
   noise.clamp_min_(std::numeric_limits<float>::min()).log_();
   // Fill after the log_: masking first would turn the sentinel into
   // log(0) = -inf.
-  if (params.sampling_mode == SamplingMode::MIXED) {
+  if (params.sampling_mode() == SamplingMode::MIXED) {
     noise.masked_fill_(
         greedy_mask(params, device)
             .view(batch_broadcast_shape(noise.size(0), noise.dim())),
@@ -153,8 +153,8 @@ SampleOutput sample(torch::Tensor& logits,
 #if defined(USE_NPU)
   compact_logprobs =
       npu_sampling_enabled(NpuSamplingOptimization::COMPACT_NORMALIZATION) &&
-      params.logprobs && params.max_top_logprobs == 0 &&
-      !params.use_beam_search &&
+      params.logprobs() && params.max_top_logprobs() == 0 &&
+      !params.use_beam_search() &&
       !ModelConfig::get_instance().enable_qwen3_reranker() &&
       kernel::npu::tilelang::supports_sampling_logits(logits) &&
       logits.size(0) >= 128 && logits.size(1) >= 65536 &&
@@ -172,21 +172,22 @@ SampleOutput sample(torch::Tensor& logits,
   }
 #endif
   const torch::Tensor raw_logprobs =
-      params.logprobs && !params.use_beam_search && !compact_logprobs
+      params.logprobs() && !params.use_beam_search() && !compact_logprobs
           ? torch::log_softmax(logits, /*dim=*/-1, torch::kFloat32)
           : torch::Tensor();
 
   process_logits(logits, params, filter_mask);
 
   // Keep the model dtype; consumers upcast where the reduction needs fp32.
-  if (params.return_logits) {
+  if (params.return_logits()) {
     output.draft_logits = logits;
   }
 
-  if (params.sampling_mode == SamplingMode::MIXED) {
+  if (params.sampling_mode() == SamplingMode::MIXED) {
     const torch::Tensor& do_sample = params.require_do_sample();
     CHECK_EQ(do_sample.dim(), 1)
-        << "params.do_sample must be 1D [num_seqs], got " << do_sample.sizes();
+        << "params.do_sample() must be 1D [num_seqs], got "
+        << do_sample.sizes();
     CHECK_EQ(logits.size(0), do_sample.size(0));
   }
 
@@ -194,16 +195,16 @@ SampleOutput sample(torch::Tensor& logits,
 #if defined(USE_NPU)
   const bool batched_seed_sampling =
       npu_sampling_enabled(NpuSamplingOptimization::BATCHED) &&
-      params.sampling_mode != SamplingMode::GREEDY &&
+      params.sampling_mode() != SamplingMode::GREEDY &&
       kernel::npu::tilelang::supports_sampling_logits(logits) &&
-      (!params.seeds.defined() ||
-       (params.seeds.dim() == 1 && params.seed_offsets.defined() &&
-        params.seed_offsets.dim() == 1 && params.seeds.is_contiguous() &&
-        params.seed_offsets.is_contiguous()));
+      (!params.seeds().defined() ||
+       (params.seeds().dim() == 1 && params.seed_offsets().defined() &&
+        params.seed_offsets().dim() == 1 && params.seeds().is_contiguous() &&
+        params.seed_offsets().is_contiguous()));
   if (batched_seed_sampling) {
     const auto uniform_options = logits.options().dtype(torch::kFloat32);
     const torch::Tensor uniforms =
-        (!params.seeds.defined() || params.has_unseeded_sample)
+        (!params.seeds().defined() || params.has_unseeded_sample())
             ? torch::rand({logits.size(0)}, uniform_options)
             : torch::Tensor();
 #if defined(XLLM_NPU_SAMPLING_ABLATION)
@@ -211,26 +212,26 @@ SampleOutput sample(torch::Tensor& logits,
       const torch::Tensor weights =
           torch::softmax(logits, /*dim=*/-1, torch::kFloat32);
       samples = kernel::npu::tilelang::seeded_sample(
-          weights, params.seeds, params.seed_offsets, uniforms);
+          weights, params.seeds(), params.seed_offsets(), uniforms);
     } else
 #endif
     {
       samples = kernel::npu::tilelang::sampling_logits(
-          logits, params.seeds, params.seed_offsets, uniforms);
+          logits, params.seeds(), params.seed_offsets(), uniforms);
     }
-    if (params.sampling_mode == SamplingMode::MIXED) {
+    if (params.sampling_mode() == SamplingMode::MIXED) {
       samples = torch::where(
           params.require_do_sample(), samples, greedy_sample(logits));
     }
   } else
 #endif
-      if (params.seeds.defined() &&
-          params.sampling_mode != SamplingMode::GREEDY) {
+      if (params.seeds().defined() &&
+          params.sampling_mode() != SamplingMode::GREEDY) {
     samples = gumbel_argmax(
         logits, gumbel_noise(params, logits.sizes(), logits.device()));
-  } else if (params.sampling_mode == SamplingMode::RANDOM) {
+  } else if (params.sampling_mode() == SamplingMode::RANDOM) {
     samples = gumbel_sample(logits);
-  } else if (params.sampling_mode == SamplingMode::GREEDY) {
+  } else if (params.sampling_mode() == SamplingMode::GREEDY) {
     samples = greedy_sample(logits);
   } else {
     torch::Tensor noise = gumbel_noise(params, logits.sizes(), logits.device());
@@ -238,7 +239,7 @@ SampleOutput sample(torch::Tensor& logits,
   }
   output.next_tokens = samples;
 
-  if (params.logprobs) {
+  if (params.logprobs()) {
     if (compact_logprobs) {
       output.logprobs = raw_logits.gather(/*dim=*/-1, samples.view({-1, 1}))
                             .to(torch::kFloat32)
@@ -267,13 +268,13 @@ SampleOutput sample(torch::Tensor& logits,
     auto selected_logprobs = logprobs.gather(/*dim=*/-1, samples.view({-1, 1}));
     output.logprobs = selected_logprobs.view({-1});
 
-    if (params.max_top_logprobs > 0) {
+    if (params.max_top_logprobs() > 0) {
       // max_top_logprobs is the batch-wide max, so one request asking for
       // more than the vocabulary would fail every request in the batch. The
       // factories reject this up front; clamp as a last line of defense —
       // every consumer sizes by the returned row width.
       const int64_t k =
-          std::min<int64_t>(params.max_top_logprobs, logprobs.size(-1));
+          std::min<int64_t>(params.max_top_logprobs(), logprobs.size(-1));
       auto [values, indices] = logprobs.topk(k, /*dim=*/-1);
       output.top_logprobs = values;
       output.top_tokens = indices;

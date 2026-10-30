@@ -59,7 +59,7 @@ Important boundaries:
   permutation/global RNG. The random sequence differs from the legacy
   multinomial generator. Unseeded draws use the normal NPU generator.
 - Sampling metadata is propagated through device copies, reusable slots and
-  packed inputs. The packed-input schema moves from 9 to 10; ranks must use the
+  packed inputs. The packed-input schema moves from 10 to 11; ranks must use the
   same version.
 - A separate shutdown fix avoids synchronizing the TLS ACL top-k/top-p
   workspace after torch_npu has finalized the NPU runtime.
@@ -116,11 +116,11 @@ clamp the full-acceptance count to a valid draft index and convert it to int64.
 The integration also fixes an upstream calibration-loop variable rename that
 otherwise prevents the task-pipeline runtime from compiling.
 
-The integrated production build passes 309 cases: 46 sampler, 37 CPU controls,
+The `ca6272e9` checkpoint passes 309 cases: 46 sampler, 37 CPU controls,
 150 speculative pipeline, 51 slot-buffer, 18 packed-input, and seven
 speculative-metrics cases. Two new NPU regressions cover ordinary/verification
-seed alignment in random and mixed batches, zero-length drafts, grammar rejection, full
-acceptance counts, and raw logprobs under bias/top-k for both compact and
+seed alignment in random and mixed batches, zero-length drafts, grammar
+rejection, full acceptance counts, and raw logprobs under bias/top-k for both compact and
 full top-logprob reporting. Clang-format 20.1.6 and repository pre-commit
 checks pass. Commands, logs, and source/binary identities are recorded under
 `local/npu_sampling/review_revision/main_integration/`.
@@ -129,6 +129,19 @@ The runtime's updated `dspark_greedy_verify_commit` TileLang kernel is
 regenerated from the integrated source. Native performance, instrumented
 ablation tests, and real-model E2E have not been rerun on this integration;
 the timings elsewhere in this report retain their stated earlier versions.
+
+Integration with the newer `main` at `ca9f8e63` adapts sampling controls to its
+grouped property accessors. Host random-row counts belong to the selection
+group; the unseeded-request flag belongs to the random group. Both retain
+their device-copy, slot-reuse, and packed-input propagation. Main now uses
+packed-input schema 10, so the additional sampling metadata uses schema 11
+and rejects schema 10 inputs. This production integration passes 315 cases:
+49 sampler, 37 CPU controls, 150 speculative pipeline, 54 slot-buffer,
+18 packed-input, and seven speculative-metrics cases. The instrumented
+benchmark, sampler, and conditional sampler-test sources also compile with
+the ablation macro enabled; instrumented runtime tests and performance
+measurements have not been rerun. Logs and source/binary identities are under
+`local/npu_sampling/review_revision/property_integration/`.
 
 ## Native performance
 

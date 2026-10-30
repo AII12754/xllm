@@ -167,8 +167,8 @@ UnifiedMtpExecutionResult UnifiedMtpExecutor::execute(
       vocab_size,
       block_size,
       target_step_major_layout,
-      input.sampling_params.logprobs,
-      input.sampling_params.max_top_logprobs);
+      input.sampling_params.logprobs(),
+      input.sampling_params.max_top_logprobs());
 
 #if defined(USE_NPU)
   const torch::Tensor& destination = graph_output.draft_embedding_destination;

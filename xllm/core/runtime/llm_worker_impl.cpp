@@ -291,7 +291,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   torch::Tensor selected_hidden;
   if (sampling_params.num_sample_seqs() > 0) {
     torch::Tensor selected_token_idxes = remap_selected_token_idxes_for_lm_head(
-        sampling_params.selected_token_idxes,
+        sampling_params.selected_token_idxes(),
         execution_params.parallel,
         model_output.hidden_states);
     if (model_output.hidden_states.defined() &&
@@ -356,27 +356,28 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   // driver prepare model output
   if (sampling_params.num_sample_seqs() > 0) {
     output.selected_hidden = selected_hidden;
-    output.logprobs = sampling_params.logprobs;
-    output.max_top_logprobs = sampling_params.max_top_logprobs;
+    output.logprobs = sampling_params.logprobs();
+    output.max_top_logprobs = sampling_params.max_top_logprobs();
     if (!input.skip_sampling_for_logits_only) {
       auto sample_output = [&]() {
-        if (!sampling_params.min_token_positions.defined()) {
+        if (!sampling_params.min_token_positions().defined()) {
           return sample(logits, sampling_params);
         }
         SamplingParameters target_sampling = sampling_params;
         const auto selected_positions = input.positions.index_select(
-            /*dim=*/0, sampling_params.selected_token_idxes.to(torch::kInt64));
-        target_sampling.min_tokens_remaining =
-            sampling_params.min_token_positions - selected_positions;
+            /*dim=*/0,
+            sampling_params.selected_token_idxes().to(torch::kInt64));
+        target_sampling.min_tokens_remaining() =
+            sampling_params.min_token_positions() - selected_positions;
         return sample(logits, target_sampling);
       }();
       // beam search kernel
       BeamSearchOutput beam_search_output;
-      if (sampling_params.use_beam_search &&
-          sampling_params.acc_logprob.defined() &&
-          sampling_params.acc_logprob.numel() > 0) {
+      if (sampling_params.use_beam_search() &&
+          sampling_params.acc_logprob().defined() &&
+          sampling_params.acc_logprob().numel() > 0) {
         beam_search_output =
-            beam_searcher_->forward(sampling_params.acc_logprob,
+            beam_searcher_->forward(sampling_params.acc_logprob(),
                                     sample_output.top_tokens,
                                     sample_output.top_logprobs);
       }

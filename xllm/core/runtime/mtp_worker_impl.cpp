@@ -949,9 +949,9 @@ bool MTPWorkerImpl<TargetInput>::init_model(
   draft_prefix_policy_ = mtp_async::classify_draft_prefix_policy(
       target_spec_verify_mode_, combined_draft_execution_path_);
 #if defined(USE_NPU)
-  if (result && supports_explicit_spec_verify_replay_update()) {
+  if (result && supports_expanded_spec_verify()) {
     CHECK_EQ(::xllm::KernelConfig::get_instance().npu_kernel_backend(), "TORCH")
-        << "Qwen3.5 MTP only supports NPU Torch backend";
+        << "Expanded MTP verify requires the NPU Torch backend";
   }
 #endif
   return result;
@@ -1042,18 +1042,15 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_worker_no_sync(
 }
 
 template <typename TargetInput>
-bool MTPWorkerImpl<TargetInput>::supports_explicit_spec_verify_replay_update()
-    const {
-  if (target_spec_verify_mode_ ==
-      mtp_async::TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY) {
-    return true;
+bool MTPWorkerImpl<TargetInput>::supports_expanded_spec_verify() const {
+  switch (target_spec_verify_mode_) {
+    case mtp_async::TargetSpecVerifyMode::EXPANDED_VERIFY:
+      return true;
+    case mtp_async::TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY:
+      return ModelConfig::is_python_model_impl(context_.get_model_impl());
+    default:
+      return false;
   }
-  // The Python NPU paged-attention runner consumes expanded metadata and can
-  // replay its ACL graph for DeepSeek MLA. The native target executor has no
-  // corresponding MLA spec-verify graph path yet, so it remains generic.
-  return target_spec_verify_mode_ ==
-             mtp_async::TargetSpecVerifyMode::DEEPSEEK_V32_EXPANDED_VERIFY &&
-         ModelConfig::is_python_model_impl(context_.get_model_impl());
 }
 
 template <typename TargetInput>
@@ -1066,8 +1063,11 @@ bool MTPWorkerImpl<TargetInput>::should_use_explicit_spec_verify_replay_update(
   if (!::xllm::ExecutionConfig::get_instance().enable_graph() ||
       !::xllm::ExecutionConfig::get_instance()
            .enable_graph_mode_decode_no_padding() ||
-      !supports_explicit_spec_verify_replay_update() || impl_ == nullptr ||
-      options_.num_speculative_tokens() <= 0 || options_.block_size() <= 0 ||
+      target_spec_verify_mode_ !=
+          mtp_async::TargetSpecVerifyMode::EXPANDED_VERIFY ||
+      ModelConfig::is_python_model_impl(context_.get_model_impl()) ||
+      impl_ == nullptr || options_.num_speculative_tokens() <= 0 ||
+      options_.block_size() <= 0 ||
       !spec_verify::has_speculative_verify_block_table_layout(
           block_tables, input.input_params.multi_block_tables, num_sequences)) {
     return false;
@@ -1147,7 +1147,7 @@ template <typename TargetInput>
 bool MTPWorkerImpl<TargetInput>::use_chunked_prefill_spec_verify_path() const {
   if (target_spec_verify_mode_ ==
           mtp_async::TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL ||
-      supports_explicit_spec_verify_replay_update()) {
+      supports_expanded_spec_verify()) {
     return true;
   }
 #if defined(USE_NPU) || defined(USE_MLU)
@@ -1300,7 +1300,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_prefill(
     if (should_broadcast_spec_tokens(
             parallel_args_,
             get_optimization_config().enable_spec_token_broadcast,
-            input.sampling_params.sampling_mode == SamplingMode::GREEDY)) {
+            input.sampling_params.sampling_mode() == SamplingMode::GREEDY)) {
       broadcast_spec_tokens(output.sample_output.next_tokens, parallel_args_);
     }
     if (embeddings.defined()) {
@@ -1695,7 +1695,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
       if (should_broadcast_spec_tokens(
               parallel_args_,
               get_optimization_config().enable_spec_token_broadcast,
-              draft_sampling_params.sampling_mode == SamplingMode::GREEDY)) {
+              draft_sampling_params.sampling_mode() == SamplingMode::GREEDY)) {
         broadcast_spec_tokens(draft_outputs.back().sample_output.next_tokens,
                               parallel_args_);
       }
@@ -1777,12 +1777,12 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
         }
         break;
       }
-      current_draft_input.sampling_params.filter_bitmask =
+      current_draft_input.sampling_params.filter_bitmask() =
           build_json_object_filter_bitmask(
               current_draft_input.json_object_states,
               device_,
               JsonObjectMaskBuildPhase::DRAFT);
-      current_draft_input.sampling_params.filter_mask = torch::Tensor();
+      current_draft_input.sampling_params.filter_mask() = torch::Tensor();
     }
     record_current_metadata_ready_event(current_draft_input, *compute_stream_);
   }
@@ -1828,11 +1828,11 @@ void MTPWorkerImpl<TargetInput>::fill_validate_input_from_draft_outputs(
         input.json_object_states,
         *json_scratch,
         validate_input.json_object_invalid_draft);
-    validate_input.sampling_params.filter_bitmask =
+    validate_input.sampling_params.filter_bitmask() =
         build_json_object_filter_bitmask(validate_input.json_object_states,
                                          device_,
                                          JsonObjectMaskBuildPhase::TARGET);
-    validate_input.sampling_params.filter_mask = torch::Tensor();
+    validate_input.sampling_params.filter_mask() = torch::Tensor();
   }
 
   validate_input.runtime.device_tensors_ready = false;
@@ -1843,7 +1843,9 @@ void MTPWorkerImpl<TargetInput>::fill_validate_input_from_draft_outputs(
   const bool use_fused_verify_token_update =
       validate_input.input_params.graph.spec_verify_source_addresses_stable &&
       validate_input.input_params.graph.input_tokens_override.defined() &&
-      supports_explicit_spec_verify_replay_update() &&
+      target_spec_verify_mode_ ==
+          mtp_async::TargetSpecVerifyMode::EXPANDED_VERIFY &&
+      !ModelConfig::is_python_model_impl(context_.get_model_impl()) &&
       kernel::npu::tilelang::has_spec_verify_graph_update_specialization(
           num_val_tokens, options_.block_size());
   if (use_fused_verify_token_update) {
@@ -1954,7 +1956,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
     // the verify transforms in rejection_sample), because its
     // per-sequence grammar state advances with each speculative token.
     SamplingParameters verify_params = input.sampling_params;
-    if (verify_params.min_token_positions.defined()) {
+    if (verify_params.min_token_positions().defined()) {
       // Overlap can leave the scheduler's generated count behind accepted
       // tokens. Use the corrected target positions; rejection sampling applies
       // the candidate and bonus offsets within each verify row.
@@ -1962,13 +1964,13 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
           validate_input.positions
               .view({batch_size, num_speculative_tokens + 1})
               .select(/*dim=*/1, /*index=*/0);
-      verify_params.min_tokens_remaining =
-          verify_params.min_token_positions - first_positions;
+      verify_params.min_tokens_remaining() =
+          verify_params.min_token_positions() - first_positions;
     }
-    if (validate_input.sampling_params.filter_bitmask.defined()) {
-      verify_params.filter_bitmask =
-          validate_input.sampling_params.filter_bitmask;
-      verify_params.filter_mask = torch::Tensor();
+    if (validate_input.sampling_params.filter_bitmask().defined()) {
+      verify_params.filter_bitmask() =
+          validate_input.sampling_params.filter_bitmask();
+      verify_params.filter_mask() = torch::Tensor();
     }
     val_output = validate(std::move(verify_params),
                           draft_outputs,
@@ -1982,7 +1984,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
     if (should_broadcast_spec_tokens(
             parallel_args_,
             get_optimization_config().enable_spec_token_broadcast,
-            input.sampling_params.sampling_mode == SamplingMode::GREEDY)) {
+            input.sampling_params.sampling_mode() == SamplingMode::GREEDY)) {
       c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
       broadcast_spec_tokens(val_output.next_tokens, parallel_args_);
     }
@@ -2024,7 +2026,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
     if (should_broadcast_spec_tokens(
             parallel_args_,
             get_optimization_config().enable_spec_token_broadcast,
-            input.sampling_params.sampling_mode == SamplingMode::GREEDY)) {
+            input.sampling_params.sampling_mode() == SamplingMode::GREEDY)) {
       broadcast_spec_tokens(val_output.next_tokens, parallel_args_);
     }
 
@@ -2943,7 +2945,7 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
       should_use_explicit_spec_verify_replay_update(input);
   const bool qwen_logical_state =
       target_spec_verify_mode_ ==
-      mtp_async::TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY;
+      mtp_async::TargetSpecVerifyMode::EXPANDED_VERIFY;
   const bool expand_python_mtp_linear_state_ids =
       num_val_tokens > 1 &&
       ModelConfig::is_python_model_impl(context_.get_model_impl()) &&
@@ -3086,8 +3088,8 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
   if (!input.json_object_states.empty()) {
     // Validation installs exact per-position JSON masks after the draft
     // tokens are known. Do not repeat the inherited one-row mask here.
-    validate_input.sampling_params.filter_mask = torch::Tensor();
-    validate_input.sampling_params.filter_bitmask = torch::Tensor();
+    validate_input.sampling_params.filter_mask() = torch::Tensor();
+    validate_input.sampling_params.filter_bitmask() = torch::Tensor();
   }
   // The validate forward is logits-only (see
   // expand_sampling_params_for_verify); the JSON bitmask installs later, from
@@ -3099,7 +3101,7 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
   // overhead on the final-draft -> target dependency chain.
   const bool use_stable_greedy_validate_sampling =
       use_explicit_spec_verify_replay_update &&
-      validate_sampling_params.sampling_mode == SamplingMode::GREEDY &&
+      validate_sampling_params.sampling_mode() == SamplingMode::GREEDY &&
       validate_sampling_params.num_sample_seqs() == 1;
   if (use_stable_greedy_validate_sampling &&
       (!mtp_validate_greedy_indices_.defined() ||
@@ -3215,6 +3217,14 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
           {&python_linear_state_ids,
            nullptr,
            &input_params.embedding.linear_state_indices});
+      if (input_params.embedding.linear_state_read_ids.empty()) {
+        input_params.embedding.linear_state_read_ids =
+            input_params.embedding.linear_state_ids;
+      }
+      extra_int_inputs.push_back(
+          {&input_params.embedding.linear_state_read_ids,
+           nullptr,
+           &input_params.embedding.linear_state_read_indices});
     }
     if (!input_params.num_accepted_tokens_host.empty()) {
       extra_int_inputs.push_back({&accepted_prefix_lengths,
@@ -3267,7 +3277,7 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
     input_params.graph.input_tokens_override = validate_input.token_ids;
     input_params.graph.spec_verify_source_addresses_stable = true;
   } else {
-    if (supports_explicit_spec_verify_replay_update()) {
+    if (supports_expanded_spec_verify()) {
       ensure_spec_verify_control_block_table(input_params, num_sequences);
     }
     std::vector<PackedAttentionIntInput> extra_int_inputs;
@@ -3279,7 +3289,7 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
     }
     AttentionInputView(input_params.attention)
         .rebuild_device_buffer(device_, extra_int_inputs);
-    if (supports_explicit_spec_verify_replay_update()) {
+    if (supports_expanded_spec_verify()) {
       build_expanded_spec_verify_graph_input(
           input_params, device_, logical_block_size);
     }
@@ -3551,7 +3561,7 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_extend_inputs(
                                      std::move(buf.out_kv_seq_lens),
                                      /*update_block_tables=*/true);
   }
-  if (supports_explicit_spec_verify_replay_update()) {
+  if (supports_expanded_spec_verify()) {
     specBuilder::rebuild_q_cu_seq_lens(input_params);
   }
   input_params.attention.rebuild_device_buffer(device_);
@@ -3582,21 +3592,21 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_extend_inputs(
 
   auto& params = extend_input.sampling_params;
   torch::TensorOptions idx_options =
-      params.selected_token_idxes.defined()
-          ? params.selected_token_idxes.options()
+      params.selected_token_idxes().defined()
+          ? params.selected_token_idxes().options()
           : torch::dtype(torch::kInt).device(device_);
   if (use_chunked_prefill || use_uniform_two_rows) {
     // These layouts always append two rows per sequence and select the second
     // row.  Build the tiny control tensor directly on device; copying a
     // temporary pinned CPU tensor forces its allocator to synchronize before
     // the asynchronous H2D has completed.
-    params.selected_token_idxes = torch::arange(
+    params.selected_token_idxes() = torch::arange(
         /*start=*/1,
         /*end=*/2 * num_sequences,
         /*step=*/2,
         idx_options);
   } else {
-    params.selected_token_idxes =
+    params.selected_token_idxes() =
         async_h2d_tensor(selected_row_idx, idx_options);
   }
   extend_input.runtime.device_tensors_ready = true;
@@ -3622,11 +3632,10 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_inputs(
     input_params.is_spec_verify = false;
     // The first draft already restored its request slot. Subsequent drafts
     // append to that live state instead of replaying a prefix restore.
-    for (auto& op : input_params.linear_state_cache_ops) {
-      op.reset_requested = false;
-      op.restore_requested = false;
-      op.restore_src_slot_id = -1;
-    }
+    input_params.embedding.linear_state_read_ids =
+        input_params.embedding.linear_state_ids;
+    input_params.embedding.linear_state_read_indices =
+        input_params.embedding.linear_state_indices;
   }
   const int32_t logical_block_size = this->logical_block_size();
   specBuilder::DecodeRowContext row_ctx =
@@ -3659,7 +3668,7 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_inputs(
       std::move(input_params.attention.host.q_cu_seq_lens),
       buf.meta.kv_max_seq_len,
       std::move(buf.out_kv_seq_lens));
-  if (supports_explicit_spec_verify_replay_update()) {
+  if (supports_expanded_spec_verify()) {
     specBuilder::rebuild_q_cu_seq_lens(input_params);
   }
   input_params.attention.rebuild_device_buffer(device_);

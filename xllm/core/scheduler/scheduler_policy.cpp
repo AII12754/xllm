@@ -29,6 +29,8 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/scheduler/request_output_dispatcher.h"
+#include "framework/batch/batch_factory.h"
+#include "framework/model/model_args.h"
 #include "framework/request/priority_comparator.h"
 #include "util/timer.h"
 #include "util/utils.h"
@@ -180,6 +182,11 @@ void SchedulerPolicy::drain_request_queue(
   }
 
   for (std::shared_ptr<Request>& queued : incoming) {
+    if (queued->finished() || queued->cancelled()) {
+      // collect_finished() owns terminal cleanup.
+      state.running_requests.emplace_back(std::move(queued));
+      continue;
+    }
     if (!state.enable_prefix_cache &&
         !(state.options.enable_disagg_pd() &&
           state.options.instance_role().has_value() &&
@@ -189,12 +196,38 @@ void SchedulerPolicy::drain_request_queue(
 
     if (queued->sequences()[0]->kv_state().kv_cache_tokens_num() == 0) {
       // New request goes to waiting queue (back = FIFO from MPMC).
-      state.prefill_queue.push(queued, /*if_back=*/true);
+      state.prefill_queue.push(std::move(queued), /*if_back=*/true);
+      continue;
+    }
+    // Request from prefill instance in disagg PD mode -- already has KV.
+    if (batch_mode_.priority_strategy == "fcfs") {
+      // Staged until the requeue phase ends, so a new handoff stays behind
+      // older waiters; the rest of the loop has no ordering guarantee.
+      pending_decode_handoffs_.emplace_back(std::move(queued));
     } else {
-      // Request from prefill instance in disagg PD mode -- already has KV.
-      state.running_requests.emplace_back(queued);
+      state.running_requests.emplace_back(std::move(queued));
     }
   }
+}
+
+bool SchedulerPolicy::collect_terminal(
+    std::shared_ptr<Request>& request,
+    SchedulerState& state,
+    std::vector<std::shared_ptr<Request>>& finished) {
+  if (request == nullptr) {
+    return false;
+  }
+  request->update_connection_status();
+  if (!request->finished() && !request->cancelled()) {
+    return false;
+  }
+  if (request->cancelled() && state.release_failed_request) {
+    state.release_failed_request(request);
+  }
+  clear_mtp_bootstrap(request.get(), state);
+  state.kv_cache_manager->deallocate(request.get());
+  finished.emplace_back(std::move(request));
+  return true;
 }
 
 std::vector<std::shared_ptr<Request>> SchedulerPolicy::collect_finished(
@@ -203,20 +236,40 @@ std::vector<std::shared_ptr<Request>> SchedulerPolicy::collect_finished(
   for (auto it = state.running_requests.rbegin();
        it != state.running_requests.rend();
        ++it) {
-    if (*it == nullptr) {
-      continue;
-    }
-    const std::shared_ptr<Request>& request = *it;
+    collect_terminal(*it, state, finished_requests);
+  }
+  for (auto it = pending_decode_handoffs_.rbegin();
+       it != pending_decode_handoffs_.rend();
+       ++it) {
+    collect_terminal(*it, state, finished_requests);
+  }
+
+  // FCFS decode waiters can terminate before any budget admits them; rotate
+  // once, bounded by the current waiter count, and re-append live waiters to
+  // keep their order. Other strategies lack order-preserving back insertion.
+  if (batch_mode_.priority_strategy != "fcfs") {
+    return finished_requests;
+  }
+  bool has_terminal_waiter = false;
+  for (const auto& request : state.decode_queue) {
     request->update_connection_status();
     if (request->finished() || request->cancelled()) {
-      if (request->cancelled() && state.release_failed_request) {
-        state.release_failed_request(request);
-      }
-      clear_mtp_bootstrap(request.get(), state);
-      state.kv_cache_manager->deallocate(request.get());
-      finished_requests.emplace_back(request);
-      *it = nullptr;
+      has_terminal_waiter = true;
+      break;
     }
+  }
+  if (!has_terminal_waiter) {
+    return finished_requests;
+  }
+  const size_t num_decode_waiters = state.decode_queue.size();
+  for (size_t i = 0; i < num_decode_waiters; ++i) {
+    std::shared_ptr<Request> request = state.decode_queue.top();
+    state.decode_queue.pop_top();
+    if (request == nullptr ||
+        collect_terminal(request, state, finished_requests)) {
+      continue;
+    }
+    state.decode_queue.push(std::move(request), /*if_back=*/true);
   }
   return finished_requests;
 }
@@ -226,6 +279,15 @@ void SchedulerPolicy::reset_batch_state(SchedulerState& state) {
   state.running_requests.clear();
   state.running_sequences.clear();
   state.running_sequences_budgets.clear();
+  // New FCFS handoffs join the decode queue behind requeued requests.
+  for (std::shared_ptr<Request>& request : pending_decode_handoffs_) {
+    if (request == nullptr) {
+      continue;
+    }
+    handle_running_requests(request, state);
+    state.decode_queue.push(std::move(request), /*if_back=*/true);
+  }
+  pending_decode_handoffs_.clear();
 }
 
 // =============================================================================
@@ -263,13 +325,7 @@ void SchedulerPolicy::schedule_prefill_from_queue(
     }
 
     std::shared_ptr<Request> request(queue->top());
-    if (request->finished() || request->cancelled()) {
-      if (request->cancelled() && state.release_failed_request) {
-        state.release_failed_request(request);
-      }
-      clear_mtp_bootstrap(request.get(), state);
-      state.kv_cache_manager->deallocate(request.get());
-      finished.emplace_back(request);
+    if (collect_terminal(request, state, finished)) {
       queue->pop_top();
       continue;
     }
@@ -516,25 +572,12 @@ bool SchedulerPolicy::allocate_for_prefill(Sequence* seq,
   const size_t kv_cache_tokens_num = seq->kv_cache_tokens_num();
   size_t max_handle_num_tokens =
       std::min(kv_cache_tokens_num + token_budget, seq->num_tokens());
-
-  // Linear-state block alignment: for models with linear attention layers +
-  // prefix cache, chunk boundaries must align to chunk_stride so linear-state
-  // checkpoints land at recoverable positions.
-  if (state.has_linear_attention_layers && state.enable_prefix_cache &&
-      seq->is_prefill_stage()) {
-    const size_t chunk_stride =
-        static_cast<size_t>(::xllm::SchedulerConfig::get_instance()
-                                .max_tokens_per_chunk_for_prefill());
-    const size_t aligned =
-        (max_handle_num_tokens / chunk_stride) * chunk_stride;
-    if (aligned <= kv_cache_tokens_num) {
-      if (max_handle_num_tokens == seq->num_tokens()) {
-        // Final chunk: allow unaligned to complete the sequence.
-      } else {
-        *actual_tokens = 0;
-        return false;
-      }
-    } else {
+  if (has_linear_attention_layers(state.model_args) &&
+      state.enable_prefix_cache && seq->is_prefill_stage()) {
+    const size_t chunk_stride = static_cast<size_t>(
+        SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill());
+    const size_t aligned = max_handle_num_tokens / chunk_stride * chunk_stride;
+    if (aligned > kv_cache_tokens_num) {
       max_handle_num_tokens = aligned;
     }
   }
@@ -559,7 +602,8 @@ void SchedulerPolicy::allocate_shared_blocks_for(Sequence* seq,
     return;
   }
   if (seq->is_chunked_prefill_stage()) {
-    if (state.has_linear_attention_layers && state.enable_prefix_cache) {
+    if (has_linear_attention_layers(state.model_args) &&
+        state.enable_prefix_cache) {
       // Linear-state prefix cache can only resume at saved state checkpoints.
       // Re-match at every chunk boundary.
       state.kv_cache_manager->allocate_shared(seq);
@@ -758,12 +802,32 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
         if (sequence->finished()) {
           continue;
         }
+        const bool is_prefill = sequence->is_prefill_stage();
+        const size_t remaining_tokens =
+            budget.remaining_token_budget - allocated_tokens;
+        size_t num_tokens = state.min_speculative_tokens_required + 1;
+        if (is_prefill) {
+          allocate_shared_blocks_for(sequence.get(), state);
+          num_tokens = std::min(
+              compute_prefill_tokens(sequence.get(), remaining_tokens, state),
+              sequence->num_need_compute_tokens());
+        }
+        if (num_tokens == 0 || num_tokens > remaining_tokens ||
+            allocated_seqs >= budget.remaining_seq_budget) {
+          has_enough_budget = false;
+          break;
+        }
         double seq_estimate_latency = 0;
         if (options_.enable_latency_aware_schedule() &&
             !(options_.instance_role().has_value() &&
               options_.instance_role().value() == InstanceRole::PREFILL)) {
           seq_estimate_latency =
-              state.profile_manager->predict_step_time(sequence.get(), false);
+              is_prefill ? state.profile_manager->predict_step_time(
+                               sequence->kv_cache_tokens_num() + num_tokens,
+                               sequence->kv_cache_tokens_num(),
+                               false)
+                         : state.profile_manager->predict_step_time(
+                               sequence.get(), false);
           if (budget.estimate_latency + allocated_estimate_latency +
                   seq_estimate_latency >
               budget.latency_budget) {
@@ -771,28 +835,28 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
             break;
           }
         }
-        if (allocated_tokens + state.min_speculative_tokens_required >=
-                budget.remaining_token_budget ||
-            allocated_seqs >= budget.remaining_seq_budget) {
-          has_enough_budget = false;
-          break;
-        }
-        size_t updated_num_tokens =
-            sequence->num_tokens() + state.min_speculative_tokens_required;
-        if (!state.kv_cache_manager->allocate(sequence.get(),
-                                              updated_num_tokens)) {
+        const bool allocated =
+            is_prefill ? allocate_for_prefill(sequence.get(),
+                                              num_tokens,
+                                              &num_tokens,
+                                              state,
+                                              /*skip_shared=*/true)
+                       : state.kv_cache_manager->allocate(
+                             sequence.get(),
+                             sequence->num_tokens() +
+                                 state.min_speculative_tokens_required);
+        if (!allocated) {
           has_enough_blocks = false;
           break;
         }
         if (sequence->if_cache_block_for_prefill()) {
           state.kv_cache_manager->cache(sequence.get());
         }
-        allocated_tokens += state.min_speculative_tokens_required + 1;
+        allocated_tokens += num_tokens;
         allocated_seqs += 1;
         allocated_estimate_latency += seq_estimate_latency;
         candidate_sequences.emplace_back(sequence.get());
-        candidate_token_budgets.emplace_back(
-            state.min_speculative_tokens_required + 1);
+        candidate_token_budgets.emplace_back(num_tokens);
       }
     }
 
@@ -966,6 +1030,10 @@ void SchedulerPolicy::handle_unschedulable_head(
     std::vector<std::shared_ptr<Request>>& finished,
     bool budget_exhausted,
     bool blocks_exhausted) {
+  if (blocks_exhausted &&
+      state.kv_cache_manager->has_pending_async_block_release()) {
+    return;
+  }
   if (state.running_sequences.empty() && !queue->empty() &&
       state.decode_queue.empty()) {
     std::shared_ptr<Request> request(queue->top());

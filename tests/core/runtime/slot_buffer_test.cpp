@@ -23,6 +23,7 @@ limitations under the License.
 #include <mutex>
 #include <numeric>
 
+#include "core/framework/config/model_config.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/runtime/forward_params.h"
@@ -87,19 +88,40 @@ LlmForwardInput make_forward_input(const InputData& input,
   meta.num_sequences = static_cast<int32_t>(input.query.size());
   meta.batch_id = batch_id;
   meta.is_graph_warmup = is_warmup;
+  auto& execution = meta.execution_batch;
+  execution.query_start_loc.emplace_back(0);
+  execution.num_reqs = static_cast<int32_t>(input.query.size());
+  execution.num_tokens = input.tokens.size();
+  execution.num_scheduled_tokens = input.query;
+  execution.num_computed_tokens.resize(input.query.size());
+  execution.is_prefilling.assign(
+      input.query.size(), type.is_prefill() || type.is_chunked_prefill());
+  for (size_t row = 0; row < input.query.size(); ++row) {
+    const int32_t begin = execution.query_start_loc.back();
+    if (static_cast<size_t>(begin) < input.positions.size()) {
+      execution.num_computed_tokens[row] = input.positions[begin];
+    }
+    execution.query_start_loc.emplace_back(begin + input.query[row]);
+  }
   return forward;
 }
 
 class SlotBufferTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    ModelConfig::get_instance().model_impl("python");
     ASSERT_TRUE(SlotBuffer::create(capacity_, device_, binding_).ok());
     transfer_ = std::make_unique<Stream>(device_);
     consumer_ = std::make_unique<Stream>(device_);
     ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
   }
 
-  void TearDown() override { EXPECT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS); }
+  void TearDown() override {
+    ModelConfig::get_instance().model_impl(model_impl_);
+    EXPECT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
+  }
+
+  const std::string model_impl_ = ModelConfig::get_instance().model_impl();
 
   Status prepare_model(const LlmForwardInput& input, const Stream& stream) {
     Status status = binding_->validate(input, 0, stream);
@@ -186,11 +208,11 @@ class RecurrentSlotBufferTest : public SlotBufferTest {
     params.embedding.linear_state_ids = {2, 3};
     params.embedding.linear_state_indices =
         torch::tensor({2, 3}, torch::kInt32);
-    params.linear_state_cache_ops.resize(2);
-    params.linear_state_cache_ops[0].linear_state_id = 2;
-    params.linear_state_cache_ops[0].restore_src_slot_id = 1;
-    params.linear_state_cache_ops[1].linear_state_id = 3;
-    params.linear_state_cache_ops[1].reset_requested = true;
+    params.embedding.linear_state_read_ids = {1, 3};
+    params.embedding.linear_state_read_indices =
+        torch::tensor({1, 3}, torch::kInt32);
+    // Row 0 restores a warm checkpoint; row 1 resets cold state.
+    params.linear_state_validity_mask = {1, 0};
     return input;
   }
 };
@@ -212,15 +234,15 @@ TEST_F(RecurrentSlotBufferTest, OwnsStateInputsAndKeepsSlotsIndependent) {
   input.input_params.embedding.linear_state_ids = {4, 2};
   input.input_params.embedding.linear_state_indices.copy_(
       torch::tensor({4, 2}, torch::kInt32));
-  input.input_params.linear_state_cache_ops[0].linear_state_id = 4;
-  input.input_params.linear_state_cache_ops[0].restore_src_slot_id = 3;
-  input.input_params.linear_state_cache_ops[1].linear_state_id = 2;
+  input.input_params.embedding.linear_state_read_ids = {3, 2};
+  input.input_params.embedding.linear_state_read_indices.copy_(
+      torch::tensor({3, 2}, torch::kInt32));
   ASSERT_TRUE(second->validate(input, /*previous_rows=*/0, *transfer_).ok());
   second->prepare(input, *transfer_);
   ASSERT_EQ(transfer_->synchronize(), 0);
   EXPECT_EQ(params.embedding.linear_state_ids, (std::vector<int32_t>{2, 3}));
-  EXPECT_EQ(params.linear_state_cache_ops[0].restore_src_slot_id, 1);
-  EXPECT_EQ(params.linear_state_cache_ops[1].linear_state_id, 3);
+  EXPECT_EQ(params.embedding.linear_state_read_ids,
+            (std::vector<int32_t>{1, 3}));
   EXPECT_TRUE(torch::equal(params.embedding.linear_state_indices.cpu(),
                            torch::tensor({2, 3}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(metadata.linear_state_read_indices.cpu(),
@@ -254,6 +276,60 @@ TEST_F(RecurrentSlotBufferTest, OwnsStateInputsAndKeepsSlotsIndependent) {
   EXPECT_EQ(binding_->device_bytes(), device_bytes);
 }
 
+TEST_F(RecurrentSlotBufferTest, AbsentReadSourceFallsBackToWriteIds) {
+  auto input = direct_input();
+  input.input_params.embedding.linear_state_read_ids.clear();
+  input.input_params.embedding.linear_state_read_indices = torch::Tensor();
+  ASSERT_TRUE(prepare_model(input, *transfer_).ok());
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  const auto& params = binding_->model_params();
+  const auto& metadata = *params.attn_metadata;
+  EXPECT_EQ(params.embedding.linear_state_ids, (std::vector<int32_t>{2, 3}));
+  EXPECT_EQ(params.embedding.linear_state_read_ids,
+            (std::vector<int32_t>{2, 3}));
+  EXPECT_TRUE(torch::equal(params.embedding.linear_state_read_indices.cpu(),
+                           torch::tensor({2, 3}, torch::kInt32)));
+  EXPECT_FALSE(metadata.linear_state_read_indices.defined());
+}
+
+TEST_F(RecurrentSlotBufferTest, RejectsMismatchedReadIndicesMirror) {
+  auto input = direct_input();
+  ASSERT_TRUE(prepare_model(input, *transfer_).ok());
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  input.input_params.embedding.linear_state_read_indices =
+      torch::tensor({1, 4}, torch::kInt32);
+  expect_rejected(input);
+  input = direct_input();
+  input.input_params.embedding.linear_state_read_indices =
+      torch::tensor({1}, torch::kInt32);
+  expect_rejected(input);
+  input = direct_input();
+  input.input_params.embedding.linear_state_read_indices =
+      torch::tensor({1, 3}, torch::kInt32);
+  ASSERT_TRUE(prepare_model(input, *transfer_).ok());
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  EXPECT_TRUE(torch::equal(
+      binding_->model_params().attn_metadata->linear_state_read_indices.cpu(),
+      torch::tensor({1, 3}, torch::kInt32)));
+}
+
+TEST_F(RecurrentSlotBufferTest, TensorOnlyReadMirrorPreparesDirectRead) {
+  auto input = direct_input();
+  input.input_params.embedding.linear_state_read_ids.clear();
+  input.input_params.embedding.linear_state_read_indices =
+      torch::tensor({1, 3}, torch::kInt32);
+  ASSERT_TRUE(prepare_model(input, *transfer_).ok());
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  const auto& params = binding_->model_params();
+  const auto& metadata = *params.attn_metadata;
+  EXPECT_EQ(params.embedding.linear_state_read_ids,
+            (std::vector<int32_t>{1, 3}));
+  EXPECT_TRUE(torch::equal(metadata.linear_state_read_indices.cpu(),
+                           torch::tensor({1, 3}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(metadata.has_initial_states.cpu(),
+                           torch::tensor({true, false}, torch::kBool)));
+}
+
 TEST_F(RecurrentSlotBufferTest,
        PaddedAndEmptyDecodeClearPreviousDirectReadState) {
   ASSERT_TRUE(prepare_model(direct_input(), *transfer_).ok());
@@ -267,6 +343,10 @@ TEST_F(RecurrentSlotBufferTest,
   ASSERT_TRUE(binding_->validate(decode, /*previous_rows=*/0, *transfer_).ok());
   binding_->prepare(decode, *transfer_, /*padded_batch_size=*/4);
   ASSERT_EQ(transfer_->synchronize(), 0);
+  EXPECT_EQ(binding_->model_params().meta.execution_batch.num_reqs, 1);
+  EXPECT_EQ(binding_->model_params().meta.execution_batch.num_tokens, 4);
+  EXPECT_EQ(binding_->model_params().meta.execution_batch.num_scheduled_tokens,
+            (std::vector<int32_t>{1}));
   const auto& params = binding_->model_params();
   const auto& metadata = *params.attn_metadata;
   const void* indices_storage =
@@ -274,7 +354,10 @@ TEST_F(RecurrentSlotBufferTest,
   const void* warm_storage = metadata.has_initial_states.data_ptr();
   const void* query_storage = metadata.q_cu_seq_lens.data_ptr();
   EXPECT_FALSE(metadata.linear_state_read_indices.defined());
-  EXPECT_TRUE(params.linear_state_cache_ops.empty());
+  EXPECT_EQ(params.embedding.linear_state_read_ids,
+            (std::vector<int32_t>{2, 0, 0, 0}));
+  EXPECT_EQ(params.linear_state_validity_mask,
+            (std::vector<int64_t>{1, 0, 0, 0}));
   EXPECT_TRUE(torch::equal(params.embedding.linear_state_indices.cpu(),
                            torch::tensor({2, 0, 0, 0}, torch::kInt32)));
   EXPECT_TRUE(
@@ -300,8 +383,9 @@ TEST_F(RecurrentSlotBufferTest,
 
 TEST_F(SlotBufferTest, PrefillUsesFixedInputsAndUncachedLengths) {
   InputData input = make_input({3, 2}, {3, 2});
-  const auto forward =
+  auto forward =
       make_forward_input(input, BatchForwardType::PREFILL, 2, 41, true);
+  forward.input_params.meta.execution_batch.num_computed_tokens = {17, 29};
   ASSERT_TRUE(prepare_model(forward, *transfer_).ok());
   expect_device_input(input);
   const ModelParamsView& params = binding_->model_params();
@@ -315,6 +399,13 @@ TEST_F(SlotBufferTest, PrefillUsesFixedInputsAndUncachedLengths) {
   EXPECT_TRUE(forward.input_params.meta.is_graph_warmup);
   EXPECT_EQ(params.meta.q_max_seq_len, 3);
   EXPECT_EQ(params.meta.kv_max_seq_len, 3);
+  const auto& execution = params.meta.execution_batch;
+  EXPECT_EQ(execution.num_reqs, 2);
+  EXPECT_EQ(execution.num_tokens, 5);
+  EXPECT_EQ(execution.query_start_loc, (std::vector<int32_t>{0, 3, 5}));
+  EXPECT_EQ(execution.num_scheduled_tokens, (std::vector<int32_t>{3, 2}));
+  EXPECT_EQ(execution.num_computed_tokens, (std::vector<int32_t>{17, 29}));
+  EXPECT_EQ(execution.is_prefilling, (std::vector<uint8_t>{1, 1}));
   EXPECT_EQ(params.attention.device.block_tables.stride(0), 5);
   EXPECT_EQ(params.attention.host.graph_q_seq_lens_data,
             params.attn_metadata->q_seq_lens_host.data_ptr<int32_t>());
@@ -327,8 +418,8 @@ TEST_F(SlotBufferTest, EmptyDpShardClearsSamplingAndPreviousTokenMapping) {
   InputData active = make_input({2, 1}, {2, 1});
   active.tokens.back() = -1;
   SamplingParameters sampling;
-  sampling.selected_token_idxes = torch::tensor({2}, torch::kInt32);
-  sampling.do_sample = torch::tensor({false}, torch::kBool);
+  sampling.selected_token_idxes() = torch::tensor({2}, torch::kInt32);
+  sampling.do_sample() = torch::tensor({false}, torch::kBool);
   auto forward = make_forward_input(active, BatchForwardType::PREFILL, 2);
   forward.sampling_params = sampling;
   ASSERT_TRUE(binding_
@@ -354,11 +445,15 @@ TEST_F(SlotBufferTest, EmptyDpShardClearsSamplingAndPreviousTokenMapping) {
     EXPECT_EQ(binding_->tokens().numel(), 1);
     EXPECT_EQ(binding_->model_params().meta.actual_num_sequences, 0);
     EXPECT_EQ(binding_->model_params().meta.num_sequences, 1);
+    EXPECT_EQ(binding_->model_params().meta.execution_batch.num_reqs, 0);
+    EXPECT_EQ(binding_->model_params().meta.execution_batch.query_start_loc,
+              (std::vector<int32_t>{0}));
+    EXPECT_EQ(binding_->model_params().meta.execution_batch.num_tokens, 1);
     EXPECT_EQ(binding_->model_params().meta.batch_id, 73);
     EXPECT_EQ(binding_->model_params().meta.batch_forward_type.value(),
               forward_type.value());
     EXPECT_FALSE(binding_->has_previous_tokens());
-    EXPECT_FALSE(binding_->sampling_params().selected_token_idxes.defined());
+    EXPECT_FALSE(binding_->sampling_params().selected_token_idxes().defined());
     EXPECT_FALSE(binding_->device_result().tokens.defined());
   }
   ASSERT_TRUE(prepare_model(make_forward_input({}, BatchForwardType::EMPTY, 0),
@@ -413,7 +508,7 @@ TEST_F(SlotBufferTest, DpMetadataStaysPrivateAcrossSlotPreparationAndReuse) {
   EXPECT_EQ(first_view.dp_execution_token_counts(),
             (std::vector<int32_t>{3, 1}));
   EXPECT_EQ(second_params.meta.actual_num_sequences, 0);
-  EXPECT_FALSE(second->sampling_params().selected_token_idxes.defined());
+  EXPECT_FALSE(second->sampling_params().selected_token_idxes().defined());
 
   // Reusing the retired first Slot must preserve both the other Slot and the
   // DP snapshot already handed to Python. Its vector storage stays allocated.
@@ -449,9 +544,9 @@ TEST_F(SlotBufferTest, GraphPaddingKeepsLogicalSamplingAndPreviousRows) {
   auto input = make_forward_input(data, BatchForwardType::DECODE, 2);
   input.input_params.parallel.dp_global_token_nums = {2, 3};
   input.input_params.parallel.dp_is_decode = {1, 1};
-  input.sampling_params.selected_token_idxes =
+  input.sampling_params.selected_token_idxes() =
       torch::tensor({0, 1}, torch::kInt32);
-  input.sampling_params.do_sample = torch::zeros({2}, torch::kBool);
+  input.sampling_params.do_sample() = torch::zeros({2}, torch::kBool);
   ASSERT_TRUE(binding_->validate(input, /*previous_rows=*/1, *transfer_).ok());
   binding_->prepare(input, *transfer_, /*padded_batch_size=*/4);
   ASSERT_EQ(transfer_->synchronize(), 0);
@@ -466,7 +561,7 @@ TEST_F(SlotBufferTest, GraphPaddingKeepsLogicalSamplingAndPreviousRows) {
             (std::vector<int32_t>{7, 9, 1, 1}));
   EXPECT_EQ(params.attention.host.new_cache_slots,
             (std::vector<int32_t>{301, 302, -1, -1}));
-  EXPECT_EQ(binding_->sampling_params().do_sample.numel(), 2);
+  EXPECT_EQ(binding_->sampling_params().do_sample().numel(), 2);
   EXPECT_EQ(binding_->device_result().tokens.numel(), 2);
   {
     auto guard = consumer_->set_stream_guard();
@@ -829,13 +924,13 @@ TEST_F(SlotBufferTest, InvalidSamplingDoesNotOverwriteModelOrPreviousMapping) {
   const auto before = binding_->tokens().cpu();
   input.tokens = {-2, -1};
   SamplingParameters sampling;
-  sampling.selected_token_idxes = torch::tensor({0, 1}, torch::kInt32);
-  sampling.do_sample = torch::zeros({2}, torch::kInt32);
+  sampling.selected_token_idxes() = torch::tensor({0, 1}, torch::kInt32);
+  sampling.do_sample() = torch::zeros({2}, torch::kInt32);
   auto forward = make_forward_input(input, BatchForwardType::DECODE, 2);
   forward.sampling_params = sampling;
   EXPECT_FALSE(binding_->validate(forward, 2, *transfer_).ok());
   EXPECT_FALSE(binding_->has_previous_tokens());
-  EXPECT_FALSE(binding_->sampling_params().selected_token_idxes.defined());
+  EXPECT_FALSE(binding_->sampling_params().selected_token_idxes().defined());
   EXPECT_TRUE(torch::equal(binding_->tokens().cpu(), before));
 }
 
@@ -879,43 +974,56 @@ inline uint64_t per_row_sampling_bytes() {
   return bytes;
 }
 
-constexpr std::array<torch::Tensor SamplingParameters::*, 12> kInputs = {
-    &SamplingParameters::selected_token_idxes,
-    &SamplingParameters::frequency_penalties,
-    &SamplingParameters::presence_penalties,
-    &SamplingParameters::repetition_penalties,
-    &SamplingParameters::temperatures,
-    &SamplingParameters::top_p,
-    &SamplingParameters::min_p,
-    &SamplingParameters::top_k,
-    &SamplingParameters::unique_token_ids,
-    &SamplingParameters::unique_token_counts,
-    &SamplingParameters::unique_token_ids_lens,
-    &SamplingParameters::do_sample};
+constexpr std::array<SamplingTensorAccessor, 12> kInputs = {
+    SamplingTensorAccessor{&SamplingParameters::selected_token_idxes,
+                           &SamplingParameters::selected_token_idxes},
+    SamplingTensorAccessor{&SamplingParameters::frequency_penalties,
+                           &SamplingParameters::frequency_penalties},
+    SamplingTensorAccessor{&SamplingParameters::presence_penalties,
+                           &SamplingParameters::presence_penalties},
+    SamplingTensorAccessor{&SamplingParameters::repetition_penalties,
+                           &SamplingParameters::repetition_penalties},
+    SamplingTensorAccessor{&SamplingParameters::temperatures,
+                           &SamplingParameters::temperatures},
+    SamplingTensorAccessor{&SamplingParameters::top_p,
+                           &SamplingParameters::top_p},
+    SamplingTensorAccessor{&SamplingParameters::min_p,
+                           &SamplingParameters::min_p},
+    SamplingTensorAccessor{&SamplingParameters::top_k,
+                           &SamplingParameters::top_k},
+    SamplingTensorAccessor{&SamplingParameters::unique_token_ids,
+                           &SamplingParameters::unique_token_ids},
+    SamplingTensorAccessor{&SamplingParameters::unique_token_counts,
+                           &SamplingParameters::unique_token_counts},
+    SamplingTensorAccessor{&SamplingParameters::unique_token_ids_lens,
+                           &SamplingParameters::unique_token_ids_lens},
+    SamplingTensorAccessor{&SamplingParameters::do_sample,
+                           &SamplingParameters::do_sample}};
 
 SamplingParameters make_input(int32_t rows, int32_t width) {
   SamplingParameters input;
-  input.selected_token_idxes = torch::arange(rows, torch::kInt32);
-  input.do_sample =
+  input.selected_token_idxes() = torch::arange(rows, torch::kInt32);
+  input.do_sample() =
       torch::arange(rows, torch::kInt32).remainder(/*other=*/2) == 0;
-  input.sampling_mode = testutil::sampling_mode_from_do_sample(input.do_sample);
-  input.frequency_penalties = torch::full({rows}, /*fill_value=*/0.15f);
-  input.presence_penalties = torch::full({rows}, /*fill_value=*/0.2f);
-  input.repetition_penalties = torch::full({rows}, /*fill_value=*/1.15f);
-  input.temperatures = torch::full({rows}, /*fill_value=*/0.85f);
-  input.top_p = torch::full({rows}, /*fill_value=*/0.9f);
-  input.min_p = torch::full({rows}, /*fill_value=*/0.1f);
-  input.top_k = torch::full({rows}, /*fill_value=*/16, torch::kInt64);
-  input.unique_token_ids =
+  input.sampling_mode() =
+      testutil::sampling_mode_from_do_sample(input.do_sample());
+  input.frequency_penalties() = torch::full({rows}, /*fill_value=*/0.15f);
+  input.presence_penalties() = torch::full({rows}, /*fill_value=*/0.2f);
+  input.repetition_penalties() = torch::full({rows}, /*fill_value=*/1.15f);
+  input.temperatures() = torch::full({rows}, /*fill_value=*/0.85f);
+  input.top_p() = torch::full({rows}, /*fill_value=*/0.9f);
+  input.min_p() = torch::full({rows}, /*fill_value=*/0.1f);
+  input.top_k() = torch::full({rows}, /*fill_value=*/16, torch::kInt64);
+  input.unique_token_ids() =
       torch::arange(width, torch::kInt64).expand({rows, width}).clone();
-  input.unique_token_counts =
+  input.unique_token_counts() =
       torch::full({rows, width}, /*fill_value=*/2, torch::kInt32);
-  input.unique_token_ids_lens = torch::full({rows}, width, torch::kInt32);
-  input.unique_token_ids_lens[0] = width - 1;
-  input.unique_token_ids[0][width - 1] = 0;
-  input.unique_token_counts[0][width - 1] = 0;
-  input.logprobs = true;
-  input.max_top_logprobs = 5;
+  input.unique_token_ids_lens() = torch::full({rows}, width, torch::kInt32);
+  input.unique_token_ids_lens()[0] = width - 1;
+  input.unique_token_ids()[0][width - 1] = 0;
+  input.unique_token_counts()[0][width - 1] = 0;
+  input.logprobs() = true;
+  input.max_top_logprobs() = 5;
   return input;
 }
 
@@ -985,19 +1093,19 @@ class SlotSamplingInputTest
   void expect_inputs(const SamplingParameters& reference) {
     auto guard = launch_->set_stream_guard();
     for (const auto member : kInputs) {
-      expect_equal(reference.*member, binding_->sampling_params().*member);
+      expect_equal(member(reference), member(binding_->sampling_params()));
     }
-    EXPECT_EQ(reference.has_unseeded_sample,
-              binding_->sampling_params().has_unseeded_sample);
-    EXPECT_EQ(reference.num_random_rows,
-              binding_->sampling_params().num_random_rows);
-    EXPECT_EQ(reference.sampling_mode,
-              binding_->sampling_params().sampling_mode);
-    EXPECT_EQ(reference.logprobs, binding_->sampling_params().logprobs);
-    EXPECT_EQ(reference.return_logits,
-              binding_->sampling_params().return_logits);
-    EXPECT_EQ(reference.max_top_logprobs,
-              binding_->sampling_params().max_top_logprobs);
+    EXPECT_EQ(reference.has_unseeded_sample(),
+              binding_->sampling_params().has_unseeded_sample());
+    EXPECT_EQ(reference.num_random_rows(),
+              binding_->sampling_params().num_random_rows());
+    EXPECT_EQ(reference.sampling_mode(),
+              binding_->sampling_params().sampling_mode());
+    EXPECT_EQ(reference.logprobs(), binding_->sampling_params().logprobs());
+    EXPECT_EQ(reference.return_logits(),
+              binding_->sampling_params().return_logits());
+    EXPECT_EQ(reference.max_top_logprobs(),
+              binding_->sampling_params().max_top_logprobs());
     ASSERT_EQ(aclrtSynchronizeStream(launch_->get_stream()->stream()),
               ACL_SUCCESS);
   }
@@ -1008,16 +1116,16 @@ class SlotSamplingInputTest
     std::array<torch::Tensor, kInputs.size()> values;
     auto guard = launch_->set_stream_guard();
     for (uint32_t index = 0; index < kInputs.size(); ++index) {
-      const torch::Tensor& tensor = old.*kInputs[index];
+      const torch::Tensor& tensor = kInputs[index](old);
       values[index] = tensor.defined() ? tensor.cpu() : torch::Tensor();
     }
     EXPECT_FALSE(prepare_sampling(input, tokens, *prepare_).ok());
     EXPECT_TRUE(torch::equal(model_before, binding_->tokens().cpu()));
     for (uint32_t index = 0; index < kInputs.size(); ++index) {
-      const torch::Tensor& tensor = binding_->sampling_params().*kInputs[index];
+      const torch::Tensor& tensor = kInputs[index](binding_->sampling_params());
       expect_equal(values[index], tensor);
       if (tensor.defined()) {
-        EXPECT_EQ(tensor.data_ptr(), (old.*kInputs[index]).data_ptr());
+        EXPECT_EQ(tensor.data_ptr(), kInputs[index](old).data_ptr());
       }
     }
   }
@@ -1032,21 +1140,21 @@ class SlotSamplingInputTest
 
 TEST_P(SlotSamplingInputTest, MinimumUsesDevicePositionsAndOwnsStopStorage) {
   SamplingParameters input;
-  input.selected_token_idxes = torch::arange(4, torch::kInt32);
-  input.min_token_positions = torch::full({4}, 203, torch::kInt64);
+  input.selected_token_idxes() = torch::arange(4, torch::kInt32);
+  input.min_token_positions() = torch::full({4}, 203, torch::kInt64);
   // Host output counts can lag when task scheduling overlaps execution.
-  input.min_tokens_remaining = torch::full({4}, 99, torch::kInt64);
-  input.min_token_ids = torch::tensor(
+  input.min_tokens_remaining() = torch::full({4}, 99, torch::kInt64);
+  input.min_token_ids() = torch::tensor(
       {{0, 7, -1}, {0, 7, -1}, {0, 7, -1}, {0, 7, -1}}, torch::kInt64);
   ASSERT_TRUE(prepare_sampling(input, 8, *prepare_).ok());
-  input.min_token_ids.fill_(-1);
-  input.min_token_positions.zero_();
+  input.min_token_ids().fill_(-1);
+  input.min_token_positions().zero_();
   handoff();
   {
     auto guard = launch_->set_stream_guard();
     const auto previous_binding = binding_->sampling_params();
     binding_->refresh_min_tokens();
-    EXPECT_TRUE(torch::equal(previous_binding.min_tokens_remaining.cpu(),
+    EXPECT_TRUE(torch::equal(previous_binding.min_tokens_remaining().cpu(),
                              torch::tensor({2, 1, 0, -1}, torch::kInt64)));
     auto logits = torch::zeros(
         {4, 128}, torch::TensorOptions().dtype(GetParam()).device(device_));
@@ -1063,27 +1171,27 @@ TEST_P(SlotSamplingInputTest, DoSampleBindingSurvivesInvalidReprepare) {
   const uint64_t pinned_bytes = binding_->pinned_bytes();
   const uint64_t device_bytes = binding_->device_bytes();
   auto input = make_input(/*rows=*/3, /*width=*/2);
-  auto expected = input.do_sample.clone();
+  auto expected = input.do_sample().clone();
   ASSERT_TRUE(prepare_sampling(input, /*model_tokens=*/8, *prepare_).ok());
-  input.do_sample.zero_();
+  input.do_sample().zero_();
   ASSERT_EQ(prepare_->synchronize(), ACL_SUCCESS);
-  EXPECT_TRUE(torch::equal(binding_->sampling_params().do_sample.cpu(),
+  EXPECT_TRUE(torch::equal(binding_->sampling_params().do_sample().cpu(),
                            expected.cpu()));
-  EXPECT_NE(binding_->sampling_params().do_sample.data_ptr(),
-            input.do_sample.data_ptr());
+  EXPECT_NE(binding_->sampling_params().do_sample().data_ptr(),
+            input.do_sample().data_ptr());
   ASSERT_EQ(prepare_->synchronize(), ACL_SUCCESS);
 
   auto invalid = make_input(/*rows=*/1, /*width=*/1);
-  invalid.do_sample = torch::zeros({1}, torch::kInt32);
+  invalid.do_sample() = torch::zeros({1}, torch::kInt32);
   EXPECT_FALSE(prepare_sampling(invalid, /*model_tokens=*/8, *prepare_).ok());
-  EXPECT_TRUE(torch::equal(binding_->sampling_params().do_sample.cpu(),
+  EXPECT_TRUE(torch::equal(binding_->sampling_params().do_sample().cpu(),
                            expected.cpu()));
   SamplingParameters empty;
-  empty.do_sample = torch::empty({0}, torch::kBool);
+  empty.do_sample() = torch::empty({0}, torch::kBool);
   ASSERT_TRUE(prepare_sampling(empty, /*model_tokens=*/0, *prepare_).ok());
-  EXPECT_EQ(binding_->sampling_params().do_sample.numel(), 0);
+  EXPECT_EQ(binding_->sampling_params().do_sample().numel(), 0);
   ASSERT_TRUE(prepare_sampling({}, /*model_tokens=*/0, *prepare_).ok());
-  EXPECT_FALSE(binding_->sampling_params().do_sample.defined());
+  EXPECT_FALSE(binding_->sampling_params().do_sample().defined());
   EXPECT_EQ(binding_->pinned_bytes(), pinned_bytes);
   EXPECT_EQ(binding_->device_bytes(), device_bytes);
 }
@@ -1093,29 +1201,29 @@ TEST_P(SlotSamplingInputTest, FixedAddressesSurviveShapeAndFeatureChanges) {
   for (int32_t round = 0; round < 16; ++round) {
     SCOPED_TRACE(round);
     SamplingParameters input = make_input(1 + round % 4, 1 + round % 7);
-    input.has_unseeded_sample = round % 2 == 0;
-    input.num_random_rows = round % 3;
+    input.has_unseeded_sample() = round % 2 == 0;
+    input.num_random_rows() = round % 3;
     if (round == 15) {
-      input.top_k.fill_(/*value=*/-7);
+      input.top_k().fill_(/*value=*/-7);
     }
     const SamplingParameters reference = input.to(device_, GetParam());
     ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
     ASSERT_TRUE(prepare_sampling(input, /*model_tokens=*/8, *prepare_).ok());
     for (uint32_t index = 0; index < kInputs.size(); ++index) {
-      const torch::Tensor& tensor = binding_->sampling_params().*kInputs[index];
+      const torch::Tensor& tensor = kInputs[index](binding_->sampling_params());
       if (round == 0) {
         addresses[index] = tensor.data_ptr();
       }
       EXPECT_EQ(addresses[index], tensor.data_ptr());
       EXPECT_TRUE(tensor.is_contiguous());
-      (input.*kInputs[index]).zero_();
+      kInputs[index](input).zero_();
     }
     handoff();
     expect_inputs(reference);
 
     SamplingParameters greedy;
-    greedy.selected_token_idxes = torch::tensor({0}, torch::kInt32);
-    greedy.do_sample = torch::tensor({false}, torch::kBool);
+    greedy.selected_token_idxes() = torch::tensor({0}, torch::kInt32);
+    greedy.do_sample() = torch::tensor({false}, torch::kBool);
     ASSERT_TRUE(prepare_sampling(greedy, /*model_tokens=*/8, *prepare_).ok());
     handoff();
     expect_inputs(greedy.to(device_, GetParam()));
@@ -1129,55 +1237,55 @@ TEST_P(SlotSamplingInputTest, InvalidInputPreservesPriorBindingAndValues) {
   expect_inputs(valid.to(device_, GetParam()));
 
   auto invalid = valid;
-  invalid.selected_token_idxes = torch::tensor({0, 1, -1, 3}, torch::kInt32);
+  invalid.selected_token_idxes() = torch::tensor({0, 1, -1, 3}, torch::kInt32);
   expect_rejected(invalid);
-  invalid.selected_token_idxes = torch::tensor({0, 1, 8, 3}, torch::kInt32);
+  invalid.selected_token_idxes() = torch::tensor({0, 1, 8, 3}, torch::kInt32);
   expect_rejected(invalid);
   invalid = valid;
-  invalid.temperatures = torch::tensor({1.0f, 1.0f, -1.0f, 1.0f});
+  invalid.temperatures() = torch::tensor({1.0f, 1.0f, -1.0f, 1.0f});
   expect_rejected(invalid);
-  invalid.temperatures =
+  invalid.temperatures() =
       torch::full({4}, std::numeric_limits<float>::quiet_NaN());
   expect_rejected(invalid);
   invalid = valid;
-  invalid.top_p = torch::full({4}, /*fill_value=*/1.1f);
+  invalid.top_p() = torch::full({4}, /*fill_value=*/1.1f);
   expect_rejected(invalid);
   invalid = valid;
-  invalid.min_p = torch::full({4}, /*fill_value=*/1.1f);
+  invalid.min_p() = torch::full({4}, /*fill_value=*/1.1f);
   expect_rejected(invalid);
   invalid = valid;
-  invalid.unique_token_ids =
+  invalid.unique_token_ids() =
       torch::full({4, 6}, /*fill_value=*/128, torch::kInt64);
   expect_rejected(invalid);
   invalid = valid;
-  invalid.unique_token_counts =
+  invalid.unique_token_counts() =
       torch::full({4, 5}, /*fill_value=*/1, torch::kInt32);
   expect_rejected(invalid);
   invalid = valid;
-  invalid.unique_token_ids_lens =
+  invalid.unique_token_ids_lens() =
       torch::full({4}, /*fill_value=*/7, torch::kInt32);
   expect_rejected(invalid);
   invalid = valid;
-  invalid.presence_penalties = torch::Tensor();
+  invalid.presence_penalties() = torch::Tensor();
   expect_rejected(invalid);
   invalid = valid;
-  invalid.do_sample = torch::Tensor();
+  invalid.do_sample() = torch::Tensor();
   expect_rejected(invalid);
   invalid = valid;
-  invalid.top_k = torch::zeros({4}, torch::kInt32);
+  invalid.top_k() = torch::zeros({4}, torch::kInt32);
   expect_rejected(invalid);
   invalid = valid;
-  invalid.frequency_penalties =
+  invalid.frequency_penalties() =
       torch::zeros({4, 2}).select(/*dim=*/1, /*index=*/0);
   expect_rejected(invalid);
   invalid = valid;
-  invalid.max_top_logprobs = 9;
+  invalid.max_top_logprobs() = 9;
   expect_rejected(invalid);
   invalid = valid;
-  invalid.filter_bitmask = torch::zeros({4, 4}, torch::kInt32);
+  invalid.filter_bitmask() = torch::zeros({4, 4}, torch::kInt32);
   expect_rejected(invalid);
   invalid = valid;
-  invalid.is_embeddings = true;
+  invalid.is_embeddings() = true;
   expect_rejected(invalid);
   expect_rejected(valid.to(device_, GetParam()));
   expect_rejected(valid, /*tokens=*/0);
@@ -1192,11 +1300,11 @@ TEST_P(SlotSamplingInputTest, EmptyClearsBindingAndTransfersNothing) {
   expect_inputs(input.to(device_, GetParam()));
   ASSERT_TRUE(prepare_sampling({}, /*model_tokens=*/0, *prepare_).ok());
   for (const auto member : kInputs) {
-    EXPECT_FALSE((binding_->sampling_params().*member).defined());
+    EXPECT_FALSE(member(binding_->sampling_params()).defined());
   }
-  EXPECT_FALSE(binding_->sampling_params().logprobs);
-  EXPECT_FALSE(binding_->sampling_params().return_logits);
-  EXPECT_EQ(binding_->sampling_params().max_top_logprobs, 0);
+  EXPECT_FALSE(binding_->sampling_params().logprobs());
+  EXPECT_FALSE(binding_->sampling_params().return_logits());
+  EXPECT_EQ(binding_->sampling_params().max_top_logprobs(), 0);
 }
 
 TEST_P(SlotSamplingInputTest,
@@ -1245,36 +1353,36 @@ TEST_P(SlotSamplingInputTest,
     SamplingParameters input = make_input(/*rows=*/4, /*width=*/6);
     if (mode == 0 || mode == 5) {
       input = SamplingParameters();
-      input.selected_token_idxes = torch::arange(/*end=*/4, torch::kInt32);
-      input.do_sample = torch::zeros({4}, torch::kBool);
-      input.return_logits = mode == 5;
+      input.selected_token_idxes() = torch::arange(/*end=*/4, torch::kInt32);
+      input.do_sample() = torch::zeros({4}, torch::kBool);
+      input.return_logits() = mode == 5;
     } else if (mode == 1) {
-      input.do_sample.zero_();
+      input.do_sample().zero_();
     } else if (mode == 6) {
-      input.do_sample.fill_(/*value=*/true);
-      input.top_k = torch::Tensor();
-      input.top_p.zero_();
+      input.do_sample().fill_(/*value=*/true);
+      input.top_k() = torch::Tensor();
+      input.top_p().zero_();
     } else if (mode == 3) {
       const torch::Tensor rows = torch::tensor({1, 3}, torch::kInt64);
-      input.selected_token_idxes = rows.to(torch::kInt32);
-      input.do_sample = torch::tensor({false, true}, torch::kBool);
-      input.top_k = torch::Tensor();
+      input.selected_token_idxes() = rows.to(torch::kInt32);
+      input.do_sample() = torch::tensor({false, true}, torch::kBool);
+      input.top_k() = torch::Tensor();
       for (const auto& field : kSamplingFields) {
-        if ((input.*field.member).defined()) {
-          input.*field.member =
-              (input.*field.member).index_select(/*dim=*/0, rows);
+        if (field.member(input).defined()) {
+          field.member(input) =
+              field.member(input).index_select(/*dim=*/0, rows);
         }
       }
     } else {
-      input.do_sample.fill_(/*value=*/true);
+      input.do_sample().fill_(/*value=*/true);
       if (mode == 4) {
-        input.top_p = torch::Tensor();
+        input.top_p() = torch::Tensor();
       }
     }
-    input.has_unseeded_sample = input.do_sample.any().item<bool>();
-    input.num_random_rows = input.do_sample.sum().item<int64_t>();
-    input.sampling_mode =
-        testutil::sampling_mode_from_do_sample(input.do_sample);
+    input.has_unseeded_sample() = input.do_sample().any().item<bool>();
+    input.num_random_rows() = input.do_sample().sum().item<int64_t>();
+    input.sampling_mode() =
+        testutil::sampling_mode_from_do_sample(input.do_sample());
     const SamplingParameters legacy = input.to(device_, GetParam());
     // One logits row per sampling row (SamplingParameters::num_sample_seqs):
     // gather hidden rows with selected_token_idxes before projection.
@@ -1285,7 +1393,7 @@ TEST_P(SlotSamplingInputTest,
          1.4f)
             .view({4, 128})
             .index_select(
-                /*dim=*/0, input.selected_token_idxes.to(torch::kInt64))
+                /*dim=*/0, input.selected_token_idxes().to(torch::kInt64))
             .to(device_, GetParam());
     ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
     auto guard = launch_->set_stream_guard();
@@ -1370,10 +1478,10 @@ class SlotBufferResultTest : public ::testing::Test {
     }
     SamplingParameters sampling;
     if (rows != 0) {
-      sampling.selected_token_idxes = torch::arange(rows, torch::kInt32);
-      sampling.do_sample = torch::zeros({rows}, torch::kBool);
-      sampling.logprobs = logprobs;
-      sampling.max_top_logprobs = top;
+      sampling.selected_token_idxes() = torch::arange(rows, torch::kInt32);
+      sampling.do_sample() = torch::zeros({rows}, torch::kBool);
+      sampling.logprobs() = logprobs;
+      sampling.max_top_logprobs() = top;
     }
     auto forward = make_forward_input(
         input,
@@ -1556,7 +1664,7 @@ TEST(SlotBufferModelOnlyTest,
   // and one 16-byte block table; no history, result, or previous-token mapping.
   EXPECT_EQ(buffer->pinned_bytes(), 160U);
   EXPECT_EQ(buffer->device_bytes(), 160U);
-  EXPECT_FALSE(buffer->sampling_params().selected_token_idxes.defined());
+  EXPECT_FALSE(buffer->sampling_params().selected_token_idxes().defined());
   EXPECT_FALSE(buffer->device_result().tokens.defined());
 
   SlotBufferCapacity capacity{{8, 2, 2}, 8, 128, 0};
@@ -1570,17 +1678,19 @@ TEST(SlotBufferModelOnlyTest,
                 4 * 8 * 12);
   EXPECT_EQ(buffer->device_bytes(), buffer->pinned_bytes());
   SamplingParameters parameters;
-  parameters.selected_token_idxes = torch::tensor({0, 1, 2, 3}, torch::kInt32);
-  parameters.do_sample =
+  parameters.selected_token_idxes() =
+      torch::tensor({0, 1, 2, 3}, torch::kInt32);
+  parameters.do_sample() =
       torch::tensor({false, true, false, true}, torch::kBool);
   Stream prepare(device);
   ASSERT_TRUE(buffer->prepare_sampling(parameters, 4, prepare).ok());
-  parameters.selected_token_idxes.fill_(7);
+  parameters.selected_token_idxes().fill_(7);
   ASSERT_EQ(prepare.synchronize(), 0);
-  EXPECT_TRUE(torch::equal(buffer->sampling_params().selected_token_idxes.cpu(),
-                           torch::tensor({0, 1, 2, 3}, torch::kInt32)));
   EXPECT_TRUE(
-      torch::equal(buffer->sampling_params().do_sample.cpu(),
+      torch::equal(buffer->sampling_params().selected_token_idxes().cpu(),
+                   torch::tensor({0, 1, 2, 3}, torch::kInt32)));
+  EXPECT_TRUE(
+      torch::equal(buffer->sampling_params().do_sample().cpu(),
                    torch::tensor({false, true, false, true}, torch::kBool)));
   EXPECT_FALSE(buffer->device_result().tokens.defined());
 }

@@ -40,17 +40,17 @@ TEST(SeededSamplerTest, NpuVerificationMatchesOrdinaryDrawsAtTokenOffsets) {
           .view({kRows, kSteps + 1, kVocab});
   for (const SamplingMode mode : {SamplingMode::RANDOM, SamplingMode::MIXED}) {
     SamplingParameters params;
-    params.sampling_mode = mode;
-    params.seeds = torch::arange(kRows, options.dtype(torch::kInt64)).add(42);
-    params.seed_offsets = torch::arange(kRows, params.seeds.options());
+    params.sampling_mode() = mode;
+    params.seeds() = torch::arange(kRows, options.dtype(torch::kInt64)).add(42);
+    params.seed_offsets() = torch::arange(kRows, params.seeds().options());
     if (mode == SamplingMode::MIXED) {
-      params.do_sample = params.seeds.remainder(2).eq(0);
+      params.do_sample() = params.seeds().remainder(2).eq(0);
     }
     torch::Tensor expected =
-        torch::empty({kRows, kSteps + 1}, params.seeds.options());
+        torch::empty({kRows, kSteps + 1}, params.seeds().options());
     for (int64_t column = 0; column <= kSteps; ++column) {
       SamplingParameters step_params = params;
-      step_params.seed_offsets = params.seed_offsets + column;
+      step_params.seed_offsets() = params.seed_offsets() + column;
       torch::Tensor logits = original.select(1, column).clone();
       expected.select(1, column).copy_(sample(logits, step_params).next_tokens);
     }
@@ -65,7 +65,7 @@ TEST(SeededSamplerTest, NpuVerificationMatchesOrdinaryDrawsAtTokenOffsets) {
 
     const SampleOutput bonus = rejection_sample(
         params,
-        DraftProposal(torch::empty({kRows, 0}, params.seeds.options())),
+        DraftProposal(torch::empty({kRows, 0}, params.seeds().options())),
         original.select(1, 0).clone());
     EXPECT_TRUE(torch::equal(bonus.next_tokens, expected.narrow(1, 0, 1)));
     EXPECT_TRUE(
@@ -97,11 +97,11 @@ TEST(SeededSamplerTest, NpuVerificationLogprobsUseRawLogitsWithBiasAndTopK) {
           .to(torch::kBFloat16)
           .repeat({kRows * 3, 1});
   SamplingParameters params;
-  params.sampling_mode = SamplingMode::RANDOM;
-  params.logprobs = true;
-  params.logits_bias = torch::zeros({kRows, kVocab}, options);
-  params.logits_bias.select(1, 0).fill_(100.0F);
-  params.top_k = torch::ones({kRows}, options.dtype(torch::kInt64));
+  params.sampling_mode() = SamplingMode::RANDOM;
+  params.logprobs() = true;
+  params.logits_bias() = torch::zeros({kRows, kVocab}, options);
+  params.logits_bias().select(1, 0).fill_(100.0F);
+  params.top_k() = torch::ones({kRows}, options.dtype(torch::kInt64));
   const DraftProposal proposal(
       torch::zeros({kRows, 2}, options.dtype(torch::kInt64)));
   const torch::Tensor expected =
@@ -109,7 +109,7 @@ TEST(SeededSamplerTest, NpuVerificationLogprobsUseRawLogitsWithBiasAndTopK) {
           .select(1, 0)
           .view({kRows, 3});
   for (const int64_t top_logprobs : {int64_t{0}, int64_t{5}}) {
-    params.max_top_logprobs = top_logprobs;
+    params.max_top_logprobs() = top_logprobs;
     const SampleOutput result =
         rejection_sample(params, proposal, original.clone());
     EXPECT_TRUE(
@@ -131,10 +131,10 @@ SamplingParameters make_seeded_params(const torch::Tensor& seeds,
                                       const torch::Tensor& offsets) {
   const int64_t rows = seeds.numel();
   SamplingParameters params;
-  params.selected_token_idxes = torch::arange(rows, torch::kInt);
-  params.sampling_mode = SamplingMode::RANDOM;
-  params.seeds = seeds;
-  params.seed_offsets = offsets;
+  params.selected_token_idxes() = torch::arange(rows, torch::kInt);
+  params.sampling_mode() = SamplingMode::RANDOM;
+  params.seeds() = seeds;
+  params.seed_offsets() = offsets;
   return params.to(torch::Device(torch::kPrivateUse1, 0), torch::kFloat32);
 }
 
@@ -310,8 +310,8 @@ TEST(SeededSamplerTest, NpuCompactLogprobsAreInvariantToLargeCommonOffsets) {
   constexpr int64_t kRows = 128;
   constexpr int64_t kVocab = 65536;
   SamplingParameters params;
-  params.sampling_mode = SamplingMode::GREEDY;
-  params.logprobs = true;
+  params.sampling_mode() = SamplingMode::GREEDY;
+  params.logprobs() = true;
   for (const torch::ScalarType dtype :
        {torch::kFloat32, torch::kBFloat16, torch::kFloat16}) {
     for (const float offset : {0.0F, 8192.0F, 60000.0F, 1e8F}) {
@@ -405,12 +405,12 @@ TEST(SeededSamplerTest, NpuCompactLogprobsPreserveRawModelDistribution) {
   for (const torch::ScalarType dtype : {torch::kBFloat16, torch::kFloat16}) {
     SamplingParameters params = make_seeded_params(
         torch::arange(128, torch::kInt64), torch::zeros({128}, torch::kInt64));
-    params.logprobs = true;
-    params.max_top_logprobs = 0;
-    params.temperatures =
+    params.logprobs() = true;
+    params.max_top_logprobs() = 0;
+    params.temperatures() =
         torch::full({128}, 0.7, torch::TensorOptions().device(device));
-    params.top_k = torch::full({128}, 20, params.seeds.options());
-    params.top_p = torch::full({128}, 0.95, params.temperatures.options());
+    params.top_k() = torch::full({128}, 20, params.seeds().options());
+    params.top_p() = torch::full({128}, 0.95, params.temperatures().options());
     const torch::Tensor logits = torch::randn(
         {128, 65536}, torch::TensorOptions().dtype(dtype).device(device));
     torch::Tensor compact_logits = logits.clone();
@@ -419,7 +419,7 @@ TEST(SeededSamplerTest, NpuCompactLogprobsPreserveRawModelDistribution) {
         torch::log_softmax(logits, /*dim=*/-1, /*dtype=*/torch::kFloat32)
             .gather(/*dim=*/-1, actual.next_tokens.view({-1, 1}))
             .view({-1});
-    params.logprobs = false;
+    params.logprobs() = false;
     torch::Tensor sampling_logits = logits.clone();
     const SampleOutput sampled = sample(sampling_logits, params);
     EXPECT_TRUE(torch::equal(actual.next_tokens, sampled.next_tokens));
@@ -438,9 +438,9 @@ TEST(SeededSamplerTest, NpuCompactNormalizationPreservesRoundedTopLogprobTies) {
   logits.narrow(1, 0, 16).copy_(
       torch::arange(16, options.dtype(torch::kFloat32)).mul(1e-8));
   SamplingParameters params;
-  params.sampling_mode = SamplingMode::GREEDY;
-  params.logprobs = true;
-  params.max_top_logprobs = 5;
+  params.sampling_mode() = SamplingMode::GREEDY;
+  params.logprobs() = true;
+  params.max_top_logprobs() = 5;
   const auto [expected_values, expected_tokens] =
       torch::log_softmax(logits, /*dim=*/-1, /*dtype=*/torch::kFloat32)
           .topk(/*k=*/5, /*dim=*/-1);
@@ -454,11 +454,11 @@ TEST(SeededSamplerTest, NpuMixedSamplingKeepsGreedyRowsAndAdvancesUnseededRng) {
   SamplingParameters params =
       make_seeded_params(torch::tensor({42, -1, 7, -1}, torch::kLong),
                          torch::zeros({4}, torch::kLong));
-  params.sampling_mode = SamplingMode::MIXED;
-  params.do_sample = torch::tensor({true, true, false, false}).to(device);
-  params.has_unseeded_sample = true;
+  params.sampling_mode() = SamplingMode::MIXED;
+  params.do_sample() = torch::tensor({true, true, false, false}).to(device);
+  params.has_unseeded_sample() = true;
   torch::Tensor logits =
-      torch::zeros({4, 33}, params.seeds.options().dtype(torch::kFloat32));
+      torch::zeros({4, 33}, params.seeds().options().dtype(torch::kFloat32));
   logits.select(0, 2).select(0, 17).fill_(2.0F);
   logits.select(0, 3).select(0, 31).fill_(2.0F);
   const auto& generator = at_npu::detail::getDefaultNPUGenerator(0);
@@ -476,15 +476,16 @@ TEST(SeededSamplerTest, NpuMixedFilteringPreservesTieMasks) {
     for (const torch::ScalarType dtype : {torch::kFloat32, torch::kBFloat16}) {
       const auto options = torch::TensorOptions().device(device).dtype(dtype);
       SamplingParameters params;
-      params.sampling_mode = SamplingMode::MIXED;
-      params.num_random_rows = (rows + 3) / 4;
-      params.do_sample =
-          torch::arange(rows, options).lt(params.num_random_rows);
-      params.top_k = torch::where(params.do_sample, 20, 0).to(torch::kInt64);
-      params.top_p =
-          torch::where(params.do_sample, 0.95, 1).to(torch::kFloat32);
-      params.temperatures =
-          torch::where(params.do_sample, 0.7, 0).to(torch::kFloat32);
+      params.sampling_mode() = SamplingMode::MIXED;
+      params.num_random_rows() = (rows + 3) / 4;
+      params.do_sample() =
+          torch::arange(rows, options).lt(params.num_random_rows());
+      params.top_k() =
+          torch::where(params.do_sample(), 20, 0).to(torch::kInt64);
+      params.top_p() =
+          torch::where(params.do_sample(), 0.95, 1).to(torch::kFloat32);
+      params.temperatures() =
+          torch::where(params.do_sample(), 0.7, 0).to(torch::kFloat32);
       for (const int64_t levels : {int64_t{1}, int64_t{5}}) {
         torch::Tensor original =
             torch::arange(kVocab, options.dtype(torch::kFloat32))
@@ -495,13 +496,13 @@ TEST(SeededSamplerTest, NpuMixedFilteringPreservesTieMasks) {
                 .clone();
         torch::Tensor reference = original.clone();
         SamplingParameters reference_params = params;
-        reference_params.sampling_mode = SamplingMode::RANDOM;
+        reference_params.sampling_mode() = SamplingMode::RANDOM;
         process_logits(reference, reference_params);
         torch::Tensor compacted = original.clone();
         process_logits(compacted, params);
         EXPECT_TRUE(
-            torch::equal(compacted.narrow(0, 0, params.num_random_rows),
-                         reference.narrow(0, 0, params.num_random_rows)))
+            torch::equal(compacted.narrow(0, 0, params.num_random_rows()),
+                         reference.narrow(0, 0, params.num_random_rows())))
             << "rows=" << rows << ", dtype=" << dtype << ", levels=" << levels;
         EXPECT_TRUE(torch::equal(compacted.argmax(-1), reference.argmax(-1)));
       }
@@ -514,18 +515,18 @@ TEST(SeededSamplerTest, NpuMixedFilterMatchesRandomRowsAndSkipsGreedyRows) {
   constexpr int64_t kRows = 128;
   constexpr int64_t kVocab = 65536;
   SamplingParameters params;
-  params.sampling_mode = SamplingMode::MIXED;
-  params.num_random_rows = 32;
+  params.sampling_mode() = SamplingMode::MIXED;
+  params.num_random_rows() = 32;
   const auto options = torch::TensorOptions().device(device);
-  params.do_sample = torch::arange(kRows, options).lt(32);
-  params.top_k = torch::full({kRows}, 20, options.dtype(torch::kInt64));
+  params.do_sample() = torch::arange(kRows, options).lt(32);
+  params.top_k() = torch::full({kRows}, 20, options.dtype(torch::kInt64));
   torch::Tensor original = torch::arange(kVocab, options)
                                .unsqueeze(0)
                                .expand({kRows, kVocab})
                                .clone();
   torch::Tensor reference = original.clone();
   SamplingParameters reference_params = params;
-  reference_params.sampling_mode = SamplingMode::RANDOM;
+  reference_params.sampling_mode() = SamplingMode::RANDOM;
   process_logits(reference, reference_params);
   torch::Tensor compacted = original.clone();
   process_logits(compacted, params);

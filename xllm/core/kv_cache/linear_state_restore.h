@@ -30,24 +30,10 @@ LinearStateValidityMask build_linear_state_mask(
     const std::vector<int32_t>& cached_tokens,
     int64_t active_rows);
 
-// Apply each op's linear-state preparation plan across every linear-attention
-// layer in `kv_caches`, then record the outcome in `validity_mask`. The caller
-// sizes the mask to the active batch and pre-fills it with the KV-cache
-// default; this helper only overrides rows that require preparation:
-//   - RESTORED: copy the checkpoint source into the live slot and mark warm.
-//   - DIRECT_READ: keep the checkpoint in its source slot, skip the copy, and
-//     mark warm so the forward reads the source and writes the live slot.
-//   - COLD_START: clear the reused live slot and mark cold.
-//   - continued request / no reused prefix: leave the default unchanged.
-// Slot ownership, source resolution, and save promotion stay scheduler-side;
-// this helper only executes the worker-side reset/restore/direct-read plan.
-// Device copies and clears run on the current stream (today the worker's
-// `prepare_stream_`); the caller inserts the stream-event barrier before model
-// forward. Direct-read rows enqueue no state copy, but their checkpoint source
-// must remain pinned until the forward finishes.
-void restore_linear_state_slots(
-    std::vector<KVCache>& kv_caches,
-    const std::vector<LinearStateCacheOp>& cache_ops,
-    LinearStateValidityMask& validity_mask);
+void restore_linear_state_slots(std::vector<KVCache>& kv_caches,
+                                const std::vector<int32_t>& write_ids,
+                                const std::vector<int32_t>& read_ids,
+                                LinearStateValidityMask& validity_mask,
+                                bool reads_distinct_state);
 
 }  // namespace xllm

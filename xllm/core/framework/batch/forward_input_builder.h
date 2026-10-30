@@ -66,10 +66,6 @@ class ForwardInputBuilder final {
   VlmForwardInput build_vlm_forward_input(uint32_t num_decoding_tokens,
                                           uint32_t min_decoding_batch_size);
 
-  std::vector<Block> take_linear_restore_src_blocks() {
-    return std::move(state_.linear_restore_src_blocks);
-  }
-
  private:
   friend class ForwardInputBuilderTestPeer;
 
@@ -110,6 +106,9 @@ class ForwardInputBuilder final {
     uint32_t q_max_seq_len = 0;
     // Tracking token counts in KV cache for linear-attention state setup.
     std::vector<int32_t> kv_cache_tokens_nums;
+    std::vector<int32_t> num_scheduled_tokens;
+    std::vector<int32_t> num_computed_tokens;
+    std::vector<uint8_t> is_prefilling;
 #if defined(USE_NPU)
     std::vector<int32_t> seq_lens;
     std::vector<int32_t> q_seq_lens;
@@ -132,8 +131,7 @@ class ForwardInputBuilder final {
     // Additional data
     std::vector<int32_t> embedding_ids;
     std::vector<int32_t> linear_state_ids;
-    std::vector<LinearStateCacheOp> linear_state_cache_ops;
-    std::vector<Block> linear_restore_src_blocks;
+    std::vector<int32_t> linear_state_read_ids;
     std::vector<std::string> request_ids;
     std::vector<int32_t> extra_token_ids;
     std::vector<int32_t> mtp_shifted_token_ids;
@@ -165,13 +163,7 @@ class ForwardInputBuilder final {
                                     uint32_t n_kv_cache_tokens,
                                     uint32_t seq_len,
                                     BuilderState* state_ptr = nullptr);
-  // Append this batch row's linear-state transport fields: the live slot id
-  // (always, so rows stay aligned) plus a LinearStateCacheOp carrying the
-  // resolved restore/save plan for linear-attention models.
-  void append_linear_state_row(Sequence* sequence,
-                               uint32_t n_kv_cache_tokens,
-                               uint32_t seq_len,
-                               BuilderState& state);
+  void append_linear_state_row(Sequence* sequence, BuilderState& state);
   torch::Tensor get_mrope_positions(Sequence* sequence,
                                     uint32_t start,
                                     uint32_t end);
@@ -200,6 +192,7 @@ class ForwardInputBuilder final {
   uint32_t num_sequences_ = 0;
   bool need_unique_tokens_ = true;
   bool build_eplb_decode_token_mask_ = false;
+  bool build_execution_batch_ = false;
   bool is_graph_warmup_ = false;
   int32_t cp_size_ = 1;
 

@@ -83,11 +83,11 @@ std::optional<ForwardOutput> EmbedWorkerImpl::step(
   ForwardOutput output;
   SampleOutput sample_output;
   if (sampling_params.num_sample_seqs() > 0 &&
-      input.sampling_params.is_embeddings) {
+      input.sampling_params.is_embeddings()) {
     // create embeddings
     timer.reset();
     auto embeddings =
-        model_->pooler(hidden_states, sampling_params.selected_token_idxes);
+        model_->pooler(hidden_states, sampling_params.selected_token_idxes());
     sample_output.embeddings = embeddings;
     COUNTER_ADD(execution_latency_seconds_sampling, timer.elapsed_seconds());
 
@@ -95,8 +95,8 @@ std::optional<ForwardOutput> EmbedWorkerImpl::step(
     output.sample_output = sample_output;
 
     // carry over the sampling params
-    output.logprobs = sampling_params.logprobs;
-    output.max_top_logprobs = sampling_params.max_top_logprobs;
+    output.logprobs = sampling_params.logprobs();
+    output.max_top_logprobs = sampling_params.max_top_logprobs();
   }
   auto ret = device_.synchronize_default_stream();
   return output;

@@ -180,7 +180,7 @@ TEST(RecForwardInputFactoryTest, MultiRoundInputKeepsScheduledTokenBudgets) {
   EXPECT_EQ(input.step_meta()->total_round, 3);
   EXPECT_EQ(input.step_meta()->decode_positions_vec,
             (std::vector<int32_t>{3, 3}));
-  EXPECT_TRUE(torch::equal(input.decoder_sampling_params.selected_token_idxes,
+  EXPECT_TRUE(torch::equal(input.decoder_sampling_params.selected_token_idxes(),
                            torch::tensor({0, 1, 2, 3}, torch::kInt32)));
 }
 

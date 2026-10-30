@@ -92,46 +92,6 @@ int64_t kv_slot_size(const ModelArgs& model_args,
          options.n_local_kv_heads;
 }
 
-int64_t index_slot_size(const ModelArgs& model_args,
-                        bool enable_indexer_cache_quantization,
-                        int64_t dtype_size,
-                        KPoolCacheLayout kpool_layout) {
-  if (model_args.index_n_heads() <= 0) {
-    return 0;
-  }
-
-  const int64_t index_n_head = 1;
-  const bool uses_compressed_tail =
-      kpool_layout == KPoolCacheLayout::COMPRESSED_WITH_TAIL &&
-      model_args.index_kpool_compress();
-  const bool uses_kpool = model_args.index_kpool_compress();
-  // uses_compressed_tail implies uses_kpool, so this is simply the kPool gate.
-  if (uses_kpool) {
-    CHECK(!enable_indexer_cache_quantization)
-        << "KPool cache layouts do not support indexer_cache_dtype=\"int8\".";
-    CHECK_GT(model_args.index_kpool(), 0) << "KPool requires index_kpool > 0.";
-  }
-  const int64_t split_factor = Platform::supports_dsa_indexer_cache_sharding()
-                                   ? util::kv_split_size_effective()
-                                   : 1;
-  if (enable_indexer_cache_quantization) {
-    // int8 index cache: one byte per element, plus an independent per-token
-    // fp32 scale (kept separate from the main-KV scale_slot_size path).
-    return split_factor * (static_cast<int64_t>(sizeof(int8_t)) * index_n_head *
-                               model_args.index_head_dim() +
-                           static_cast<int64_t>(sizeof(float)));
-  }
-  if (uses_compressed_tail) {
-    CHECK_EQ(model_args.index_head_dim() % model_args.index_kpool(), 0)
-        << "KPool index head dim must be divisible by index_kpool.";
-    return split_factor * dtype_size * index_n_head *
-           model_args.index_head_dim() / model_args.index_kpool();
-  }
-  const int64_t index_width = uses_kpool ? 2 * model_args.index_head_dim() + 1
-                                         : model_args.index_head_dim();
-  return split_factor * dtype_size * index_n_head * index_width;
-}
-
 int64_t scale_slot_size(const ModelArgs& model_args,
                         const KVCacheEstimateOptions& options) {
   if (options.kv_cache_dtype == "auto") {
@@ -158,9 +118,9 @@ int64_t standard_full_cache_block_size_in_bytes(
       << "num_indexer_layers cannot exceed full-attention layers";
   const int64_t logical_block_bytes =
       kv_cache_cap.block_size() *
-      (full_attention_layers *
-           (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size()) +
-       indexer_layers * kv_cache_cap.index_slot_size());
+          (full_attention_layers *
+           (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size())) +
+      indexer_layers * kv_cache_cap.index_block_bytes();
   CHECK_GT(logical_block_bytes, 0) << "logical block bytes must be positive";
   return logical_block_bytes;
 }
@@ -181,22 +141,22 @@ int64_t layerwise_split_block_count(const ModelArgs& model_args,
       continue;
     }
     const bool has_indexer =
-        kv_cache_cap.index_slot_size() > 0 &&
+        kv_cache_cap.index_block_bytes() > 0 &&
         (indexer_layer_mask.empty() ||
          indexer_layer_mask[static_cast<size_t>(layer_id)]);
     any_indexer_layer = any_indexer_layer || has_indexer;
     const int64_t bytes =
         kv_cache_cap.block_size() *
-        (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size() +
-         (has_indexer ? kv_cache_cap.index_slot_size() : 0));
+            (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size()) +
+        (has_indexer ? kv_cache_cap.index_block_bytes() : 0);
     layer_bytes[static_cast<size_t>(layer_id)] = bytes;
   }
 
   // Scratch matches an owned layer, including indexer when any layer has one.
   const int64_t scratch_bytes_per_block =
       kv_cache_cap.block_size() *
-      (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size() +
-       (any_indexer_layer ? kv_cache_cap.index_slot_size() : 0));
+          (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size()) +
+      (any_indexer_layer ? kv_cache_cap.index_block_bytes() : 0);
   CHECK_GT(scratch_bytes_per_block, 0);
 
   int64_t common_block_count = std::numeric_limits<int64_t>::max();
@@ -287,20 +247,17 @@ int64_t max_linear_state_blocks(int64_t cache_size_in_bytes,
 int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
                                       int64_t state_slot_bytes,
                                       int64_t full_cache_block_size_in_bytes,
-                                      int64_t max_seqs_per_batch,
-                                      int64_t max_concurrent_requests,
-                                      int64_t max_linear_state_cache_slots,
-                                      bool enable_prefix_cache) {
-  CHECK_GE(max_linear_state_cache_slots, 0)
+                                      const KVCacheEstimateOptions& options) {
+  CHECK_GE(options.max_linear_state_cache_slots, 0)
       << "max_linear_state_cache_slots must be greater than or equal to 0.";
   if (state_slot_bytes <= 0) {
     return kPaddingLinearStateBlocks;
   }
   const int64_t max_blocks = max_linear_state_blocks(
       cache_size_in_bytes, state_slot_bytes, full_cache_block_size_in_bytes);
-  if (max_linear_state_cache_slots > 0) {
+  if (options.max_linear_state_cache_slots > 0) {
     const int64_t requested_blocks =
-        max_linear_state_cache_slots + kPaddingLinearStateBlocks;
+        options.max_linear_state_cache_slots + kPaddingLinearStateBlocks;
     CHECK_LE(requested_blocks, max_blocks)
         << "max_linear_state_cache_slots requires " << requested_blocks
         << " linear-state blocks, but only " << max_blocks
@@ -308,18 +265,21 @@ int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
     return requested_blocks;
   }
 
-  if (!enable_prefix_cache) {
-    // Slots must cover every simultaneously running sequence, bounded by
-    // both the scheduler batch limit and the service concurrency cap.
-    int64_t running_seqs_upper_bound = max_seqs_per_batch;
-    if (max_concurrent_requests > 0) {
-      running_seqs_upper_bound =
-          std::min<int64_t>(running_seqs_upper_bound, max_concurrent_requests);
+  if (!options.enable_prefix_cache) {
+    int64_t running_seqs_upper_bound = options.max_seqs_per_batch;
+    if (options.max_concurrent_requests > 0) {
+      running_seqs_upper_bound = running_seqs_upper_bound > 0
+                                     ? std::min(running_seqs_upper_bound,
+                                                options.max_concurrent_requests)
+                                     : options.max_concurrent_requests;
     }
-    const int64_t live_slot_blocks =
-        running_seqs_upper_bound + kPaddingLinearStateBlocks;
-    return std::max<int64_t>(std::min<int64_t>(live_slot_blocks, max_blocks),
-                             kPaddingLinearStateBlocks);
+    if (running_seqs_upper_bound <= 0) {
+      return max_blocks;
+    }
+    if (running_seqs_upper_bound > max_blocks - kPaddingLinearStateBlocks) {
+      return max_blocks;
+    }
+    return running_seqs_upper_bound + kPaddingLinearStateBlocks;
   }
 
   // Auto-size: allocate ~47% of cache bytes to linear-state slots (ratio 0.9
@@ -592,7 +552,7 @@ void init_standard_counts(const ModelArgs& model_args,
     }
   }
 
-  if (kv_cache_cap->index_slot_size() > 0) {
+  if (kv_cache_cap->index_block_bytes() > 0) {
     int64_t num_indexer_layers = kv_cache_cap->num_full_attention_layers();
     const std::vector<bool> indexer_layer_mask =
         resolve_indexer_cache_enabled_layers(model_args,
@@ -617,10 +577,7 @@ void init_standard_counts(const ModelArgs& model_args,
       calculate_linear_state_blocks(kv_cache_cap->cache_size_in_bytes(),
                                     total_state_bytes,
                                     full_cache_block_size_in_bytes,
-                                    options.max_seqs_per_batch,
-                                    options.max_concurrent_requests,
-                                    options.max_linear_state_cache_slots,
-                                    options.enable_prefix_cache);
+                                    options);
   CHECK_GE(options.linear_state_cache_block_limit, 0);
   if (options.linear_state_cache_block_limit > 0 &&
       kv_cache_cap->num_linear_attention_layers() > 0) {
@@ -916,11 +873,54 @@ KVCacheCapacity estimate_kv_cache_capacity(
       util::enable_mla_packed_c8(options.kv_cache_dtype == "int8",
                                  model_args.model_type());
 
+  int64_t index_cache_slot_size = 0;
+  int64_t index_cache_block_size = 0;
+  if (model_args.index_n_heads() > 0) {
+    const int64_t index_n_head = 1;
+    const bool uses_compressed_tail =
+        kpool_layout == KPoolCacheLayout::COMPRESSED_WITH_TAIL &&
+        model_args.index_kpool_compress();
+    const bool uses_kpool = model_args.index_kpool_compress();
+    if (uses_kpool) {
+      CHECK(!enable_indexer_cache_quantization)
+          << "KPool cache layouts do not support indexer_cache_dtype=\"int8\".";
+      CHECK_GT(model_args.index_kpool(), 0)
+          << "KPool requires index_kpool > 0.";
+    }
+    const int64_t split_factor = Platform::supports_dsa_indexer_cache_sharding()
+                                     ? util::kv_split_size_effective()
+                                     : 1;
+    if (enable_indexer_cache_quantization) {
+      // int8 index cache: one byte per element plus a per-token fp32 scale.
+      index_cache_slot_size =
+          split_factor * (static_cast<int64_t>(sizeof(int8_t)) * index_n_head *
+                              model_args.index_head_dim() +
+                          static_cast<int64_t>(sizeof(float)));
+      index_cache_block_size = index_cache_slot_size * options.block_size;
+    } else if (uses_compressed_tail) {
+      // A compressed block holds block_size / index_kpool whole pools.
+      const int64_t pool_bytes = split_factor * dtype_size * index_n_head *
+                                 model_args.index_head_dim();
+      // The per-token value rounds up; the block charge below stays exact.
+      index_cache_slot_size = (pool_bytes + model_args.index_kpool() - 1) /
+                              model_args.index_kpool();
+      CHECK_EQ(options.block_size % model_args.index_kpool(), 0)
+          << "Index cache block size must hold whole KPool pools.";
+      index_cache_block_size =
+          options.block_size / model_args.index_kpool() * pool_bytes;
+    } else {
+      const int64_t index_width = uses_kpool
+                                      ? 2 * model_args.index_head_dim() + 1
+                                      : model_args.index_head_dim();
+      index_cache_slot_size =
+          split_factor * dtype_size * index_n_head * index_width;
+      index_cache_block_size = index_cache_slot_size * options.block_size;
+    }
+  }
+
   kv_cache_cap.slot_size(kv_slot_size(model_args, options, cache_dtype_size))
-      .index_slot_size(index_slot_size(model_args,
-                                       enable_indexer_cache_quantization,
-                                       dtype_size,
-                                       kpool_layout))
+      .index_slot_size(index_cache_slot_size)
+      .index_block_bytes(index_cache_block_size)
       .kpool_layout(kpool_layout)
       .enable_indexer_cache_quant(enable_indexer_cache_quantization)
       .enable_mla_kv_cache_quant(enable_mla_kv_cache_quantization)

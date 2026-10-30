@@ -58,7 +58,7 @@ std::optional<ForwardOutput> MMEmbedVLMWorkerImpl::step(
   // TODO to adapt multi stream parallel later, just use [0] temporarily
   // all tensors should be on the same device as model
   auto params = input.input_params.to(device_);
-  CHECK(input.sampling_params.is_embeddings)
+  CHECK(input.sampling_params.is_embeddings())
       << "Only mm embedding is supported.";
 
   // call model executor forward to get hidden states

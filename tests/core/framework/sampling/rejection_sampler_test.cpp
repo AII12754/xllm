@@ -124,7 +124,16 @@ TEST(RejectionSamplerTest, Greedy) {
       torch::equal(output.num_accepted_tokens,
                    torch::full({batch_size, 1},
                                static_cast<int64_t>(n_speculative_tokens),
-                               torch::kInt32)));
+                               options.dtype(torch::kInt32))));
+  const auto no_draft =
+      rejection_sample(rejection_params,
+                       DraftProposal(draft_token_ids.narrow(1, 0, 0)),
+                       flatten_rows(full_logits.narrow(/*dim=*/1,
+                                                       /*start=*/0,
+                                                       /*length=*/1)));
+  EXPECT_TRUE(torch::equal(
+      no_draft.num_accepted_tokens,
+      torch::zeros({batch_size, 1}, options.dtype(torch::kInt32))));
 }
 
 TEST(RejectionSamplerTest, GreedyFromTokenIds) {
@@ -376,9 +385,9 @@ TEST_P(SparseDraftTest, PreservesRoundedTopLogprobTieIds) {
   const torch::Tensor tokens =
       torch::full({64, 2}, 15, options.dtype(torch::kInt64));
   SamplingParameters params;
-  params.sampling_mode = SamplingMode::GREEDY;
-  params.logprobs = true;
-  params.max_top_logprobs = 5;
+  params.sampling_mode() = SamplingMode::GREEDY;
+  params.logprobs() = true;
+  params.max_top_logprobs() = 5;
   const auto [expected_values, expected_tokens] =
       torch::log_softmax(
           logits.view({64, 3, 65536}), /*dim=*/-1, /*dtype=*/torch::kFloat32)
@@ -402,7 +411,7 @@ TEST_P(SparseDraftTest, GrammarRejectionDoesNotReplacePointMassProposal) {
                     torch::tensor({{1}, {2}, {3}, {1}, {2}, {3}}, ids_options),
                     0.0F);
   SamplingParameters params;
-  params.sampling_mode = SamplingMode::RANDOM;
+  params.sampling_mode() = SamplingMode::RANDOM;
   const SampleOutput masked =
       rejection_sample(params, proposal, target.clone(), invalid);
   EXPECT_TRUE(
@@ -445,8 +454,8 @@ TEST_P(SparseDraftTest, SelectedLogprobsPreserveLargeCommonOffsets) {
   const torch::Tensor tokens =
       torch::zeros({64, 2}, options.dtype(torch::kInt64));
   SamplingParameters params;
-  params.sampling_mode = SamplingMode::GREEDY;
-  params.logprobs = true;
+  params.sampling_mode() = SamplingMode::GREEDY;
+  params.logprobs() = true;
   for (const float offset : {8192.0F, 1e8F}) {
     torch::Tensor logits = torch::full({192, 65536}, offset, options);
     const torch::Tensor expected =
@@ -479,8 +488,8 @@ TEST_P(SparseDraftTest, MatchesDenseWideVocabularyVerification) {
   target.narrow(1, 0, 16).copy_(torch::arange(16, options).mul(0.125));
   target.select(1, 7).fill_(-std::numeric_limits<float>::infinity());
   SamplingParameters params;
-  params.sampling_mode = SamplingMode::RANDOM;
-  params.logprobs = true;
+  params.sampling_mode() = SamplingMode::RANDOM;
+  params.logprobs() = true;
 #if defined(USE_NPU)
   auto generator = at_npu::detail::getDefaultNPUGenerator(0);
   generator.set_current_seed(42);

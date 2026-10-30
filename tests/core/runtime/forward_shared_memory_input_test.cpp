@@ -99,7 +99,7 @@ TYPED_TEST(ForwardSharedMemoryInputTest,
   const TypeParam source = make_input<TypeParam>(make_sparse_role_offsets());
   proto::PackedForwardInput packed;
   ASSERT_TRUE(source.to_packed_proto(&packed));
-  constexpr uint16_t kPreviousVersion = 9;
+  constexpr uint16_t kPreviousVersion = 10;
   ASSERT_GE(packed.payload().size(),
             sizeof(uint64_t) + sizeof(kPreviousVersion));
   std::memcpy(packed.mutable_payload()->data() + sizeof(uint64_t),
@@ -112,26 +112,27 @@ TYPED_TEST(ForwardSharedMemoryInputTest,
 TYPED_TEST(ForwardSharedMemoryInputTest,
            SamplingDispatchMetadataSurvivesPackedInputs) {
   TypeParam source = make_input<TypeParam>(make_sparse_role_offsets());
-  source.sampling_params.selected_token_idxes = torch::tensor({1});
-  source.sampling_params.has_unseeded_sample = true;
-  source.sampling_params.num_random_rows = 1;
-  source.sampling_params.sampling_mode = SamplingMode::RANDOM;
+  source.sampling_params.selected_token_idxes() = torch::tensor({1});
+  source.sampling_params.has_unseeded_sample() = true;
+  source.sampling_params.num_random_rows() = 1;
+  source.sampling_params.sampling_mode() = SamplingMode::RANDOM;
   proto::PackedForwardInput packed;
   ASSERT_TRUE(source.to_packed_proto(&packed));
   TypeParam lazy;
   ASSERT_TRUE(lazy.from_packed_proto(packed));
   const TypeParam decoded =
       lazy.to(torch::Device(torch::kCPU), torch::kFloat32);
-  EXPECT_TRUE(decoded.sampling_params.has_unseeded_sample);
-  EXPECT_EQ(decoded.sampling_params.num_random_rows, 1);
-  EXPECT_EQ(decoded.sampling_params.sampling_mode, SamplingMode::RANDOM);
+  EXPECT_TRUE(decoded.sampling_params.has_unseeded_sample());
+  EXPECT_EQ(decoded.sampling_params.num_random_rows(), 1);
+  EXPECT_EQ(decoded.sampling_params.sampling_mode(), SamplingMode::RANDOM);
 }
 
 TYPED_TEST(ForwardSharedMemoryInputTest,
-           PackedInputPreservesEngineSelectedMtpDepth) {
+           PackedInputPreservesExecutionMetadata) {
   TypeParam source = make_input<TypeParam>(make_sparse_role_offsets());
   source.input_params.meta.mtp_draft_steps = 2;
   source.input_params.meta.mtp_target_graph_rows = 16;
+  source.input_params.meta.execution_batch = {1, 2, {2}, {17}, {0, 2}, {1}};
   proto::PackedForwardInput packed;
   ASSERT_TRUE(source.to_packed_proto(&packed));
   TypeParam lazy;
@@ -140,6 +141,13 @@ TYPED_TEST(ForwardSharedMemoryInputTest,
       lazy.to(torch::Device(torch::kCPU), torch::kFloat32);
   EXPECT_EQ(decoded.input_params.meta.mtp_draft_steps, 2U);
   EXPECT_EQ(decoded.input_params.meta.mtp_target_graph_rows, 16U);
+  const auto& batch = decoded.input_params.meta.execution_batch;
+  EXPECT_EQ(batch.num_reqs, 1);
+  EXPECT_EQ(batch.num_tokens, 2);
+  EXPECT_EQ(batch.num_scheduled_tokens, (std::vector<int32_t>{2}));
+  EXPECT_EQ(batch.num_computed_tokens, (std::vector<int32_t>{17}));
+  EXPECT_EQ(batch.query_start_loc, (std::vector<int32_t>{0, 2}));
+  EXPECT_EQ(batch.is_prefilling, (std::vector<uint8_t>{1}));
 }
 
 TYPED_TEST(ForwardSharedMemoryInputTest,

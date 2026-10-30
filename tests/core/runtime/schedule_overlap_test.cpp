@@ -176,8 +176,8 @@ class OverlapTestWorker final : public WorkerImpl {
   template <typename Input>
   std::optional<ForwardOutput> execute(const Input& input) {
     executed_tokens_ = input.token_ids;
-    executed_filter_bitmask_ = input.sampling_params.filter_bitmask;
-    executed_filter_mask_ = input.sampling_params.filter_mask;
+    executed_filter_bitmask_ = input.sampling_params.filter_bitmask();
+    executed_filter_mask_ = input.sampling_params.filter_mask();
     executed_grammar_initialized_ =
         !input.json_object_states.empty() &&
         input.json_object_states.front().initialized();
@@ -371,8 +371,8 @@ TYPED_TEST(ScheduleOverlapTest,
   auto input = step_input<TypeParam>(/*decode=*/true, /*token_id=*/-1);
   input.json_object_states = {grammar.initial_state()};
   input.sample_prior_output_rows = {0};
-  input.sampling_params.filter_bitmask = torch::zeros({1, 1}, torch::kInt32);
-  input.sampling_params.filter_mask = torch::ones({1, 3});
+  input.sampling_params.filter_bitmask() = torch::zeros({1, 1}, torch::kInt32);
+  input.sampling_params.filter_mask() = torch::ones({1, 3});
   auto step = worker.step_async(input);
   const auto output = std::move(step).get();
   ASSERT_TRUE(output.has_value());
@@ -387,9 +387,9 @@ TYPED_TEST(ScheduleOverlapTest,
       1 << 2);
   EXPECT_FALSE(worker.executed_filter_mask().defined());
   EXPECT_TRUE(input.json_object_states.front().snapshot().token_ids.empty());
-  EXPECT_EQ(input.sampling_params.filter_bitmask.template item<int32_t>(), 0);
+  EXPECT_EQ(input.sampling_params.filter_bitmask().template item<int32_t>(), 0);
   EXPECT_TRUE(
-      torch::equal(input.sampling_params.filter_mask, torch::ones({1, 3})));
+      torch::equal(input.sampling_params.filter_mask(), torch::ones({1, 3})));
   worker.get_last_step_result();
 }
 

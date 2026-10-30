@@ -125,9 +125,9 @@ SamplingParameters SamplingInputBuilder::build() {
   }
   if (need_constraints) {
     CHECK_GT(vocab_size, 0);
-    result.logits_bias = torch::zeros(
+    result.logits_bias() = torch::zeros(
         {static_cast<int64_t>(size()), vocab_size}, torch::kFloat32);
-    auto rows = result.logits_bias.accessor<float, 2>();
+    auto rows = result.logits_bias().accessor<float, 2>();
     const float blocked = -std::numeric_limits<float>::infinity();
     for (size_t row = 0; row < size(); ++row) {
       const auto& params = *params_[row];
@@ -153,18 +153,18 @@ SamplingParameters SamplingInputBuilder::build() {
     }
   }
   if (max_words > 0) {
-    result.bad_words = torch::full({static_cast<int64_t>(size()),
-                                    static_cast<int64_t>(max_words),
-                                    static_cast<int64_t>(max_word_length)},
-                                   -1,
-                                   torch::kInt64);
-    result.bad_word_suffix =
+    result.bad_words() = torch::full({static_cast<int64_t>(size()),
+                                      static_cast<int64_t>(max_words),
+                                      static_cast<int64_t>(max_word_length)},
+                                     -1,
+                                     torch::kInt64);
+    result.bad_word_suffix() =
         torch::full({static_cast<int64_t>(size()),
                      static_cast<int64_t>(max_word_length - 1)},
                     -1,
                     torch::kInt64);
-    auto words = result.bad_words.accessor<int64_t, 3>();
-    auto suffixes = result.bad_word_suffix.accessor<int64_t, 2>();
+    auto words = result.bad_words().accessor<int64_t, 3>();
+    auto suffixes = result.bad_word_suffix().accessor<int64_t, 2>();
     for (size_t row = 0; row < size(); ++row) {
       const auto& bad_words = params_[row]->bad_words_token_ids;
       for (size_t index = 0; index < bad_words.size(); ++index) {
@@ -222,9 +222,9 @@ SamplingParameters SamplingInputBuilder::build() {
       }
     }
     util::pad_2d_vector<int64_t>(stops, /*pad_value=*/-1);
-    result.min_token_positions = make_pinned_cpu_tensor(limits);
-    result.min_tokens_remaining = make_pinned_cpu_tensor(remaining);
-    result.min_token_ids = create_2d_tensor(stops, torch::kInt64);
+    result.min_token_positions() = make_pinned_cpu_tensor(limits);
+    result.min_tokens_remaining() = make_pinned_cpu_tensor(remaining);
+    result.min_token_ids() = create_2d_tensor(stops, torch::kInt64);
   }
   if (need_seed) {
     std::vector<int64_t> seeds;
@@ -241,8 +241,8 @@ SamplingParameters SamplingInputBuilder::build() {
                     sequence->num_valid_generated_tokens();
       offsets.emplace_back(static_cast<int64_t>(offset));
     }
-    result.seeds = make_pinned_cpu_tensor(seeds);
-    result.seed_offsets = make_pinned_cpu_tensor(offsets);
+    result.seeds() = make_pinned_cpu_tensor(seeds);
+    result.seed_offsets() = make_pinned_cpu_tensor(offsets);
   }
   return result;
 }

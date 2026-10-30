@@ -241,7 +241,7 @@ TEST_F(ApplyTokenBitmaskWrapperTest, RejectsInputsThatRequireFallback) {
     // The LogitsProcessor fallback and the reference both mask with -inf.
     torch::Tensor actual = logits.clone();
     SamplingParameters params;
-    params.filter_bitmask = bitmask;
+    params.filter_bitmask() = bitmask;
     process_logits(actual, params);
     ASSERT_EQ(aclrtSynchronizeStream(
                   c10_npu::getCurrentNPUStream(device.index()).stream()),

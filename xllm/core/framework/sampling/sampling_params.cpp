@@ -127,9 +127,9 @@ void advance_sampling_history(SamplingParameters& params,
                               const torch::Tensor& prior_tokens,
                               const std::vector<int32_t>& output_rows) {
   if (!prior_tokens.defined() || output_rows.empty() ||
-      (!params.bad_words.defined() && !params.seeds.defined() &&
-       !params.repetition_penalties.defined() &&
-       !params.frequency_penalties.defined())) {
+      (!params.bad_words().defined() && !params.seeds().defined() &&
+       !params.repetition_penalties().defined() &&
+       !params.frequency_penalties().defined())) {
     return;
   }
   CHECK_EQ(output_rows.size(), params.num_sample_seqs());
@@ -137,16 +137,16 @@ void advance_sampling_history(SamplingParameters& params,
       torch::tensor(output_rows, torch::kInt64).to(prior_tokens.device());
   const torch::Tensor tokens =
       prior_tokens.dim() == 1 ? prior_tokens.unsqueeze(1) : prior_tokens;
-  params.prefix_tokens =
+  params.prefix_tokens() =
       tokens.index_select(/*dim=*/0, rows.clamp_min(0)).to(torch::kInt64);
-  params.prefix_tokens.masked_fill_(rows.lt(0).unsqueeze(1), -1);
-  if (params.bad_word_suffix.defined()) {
-    params.bad_word_suffix =
-        append_token_suffix(params.bad_word_suffix, params.prefix_tokens);
+  params.prefix_tokens().masked_fill_(rows.lt(0).unsqueeze(1), -1);
+  if (params.bad_word_suffix().defined()) {
+    params.bad_word_suffix() =
+        append_token_suffix(params.bad_word_suffix(), params.prefix_tokens());
   }
-  if (params.seed_offsets.defined()) {
-    params.seed_offsets =
-        params.seed_offsets + params.prefix_tokens.ge(0).sum(/*dim=*/1);
+  if (params.seed_offsets().defined()) {
+    params.seed_offsets() =
+        params.seed_offsets() + params.prefix_tokens().ge(0).sum(/*dim=*/1);
   }
 }
 
@@ -187,14 +187,15 @@ void SamplingParameters::init(
     top_p.emplace_back(p->temperature == 0 ? 1.0F : p->top_p);
     top_k.emplace_back(p->temperature == 0 ? 0 : p->top_k);
     min_p.emplace_back(p->temperature == 0 ? 0.0F : p->min_p);
-    has_unseeded_sample |= p->temperature != 0.0F && p->seed.value_or(-1) == -1;
+    has_unseeded_sample() |=
+        p->temperature != 0.0F && p->seed.value_or(-1) == -1;
     logprobs = logprobs || p->logprobs;
     is_embeddings = is_embeddings || p->is_embeddings;
     max_top_logprobs = std::max(max_top_logprobs, p->top_logprobs);
     num_return_sequences =
         std::max(num_return_sequences, p->num_return_sequences);
     if (p->beam_width > 0) {
-      use_beam_search = true;
+      this->use_beam_search() = true;
     }
   }
 
@@ -206,36 +207,36 @@ void SamplingParameters::init(
       std::any_of(presence_penalties.begin(),
                   presence_penalties.end(),
                   [](float t) { return t != 0.0; })) {
-    this->frequency_penalties = make_pinned_cpu_tensor(frequency_penalties);
-    this->presence_penalties = make_pinned_cpu_tensor(presence_penalties);
+    this->frequency_penalties() = make_pinned_cpu_tensor(frequency_penalties);
+    this->presence_penalties() = make_pinned_cpu_tensor(presence_penalties);
     need_token_stats = true;
   }
   if (std::any_of(repetition_penalties.begin(),
                   repetition_penalties.end(),
                   [](float t) { return t != 1.0; })) {
-    this->repetition_penalties = make_pinned_cpu_tensor(repetition_penalties);
+    this->repetition_penalties() = make_pinned_cpu_tensor(repetition_penalties);
     need_token_stats = true;
   }
   if (std::any_of(temperatures.begin(), temperatures.end(), [](float t) {
         return t != 0.0 && t != 1.0;
       })) {
-    this->temperatures = make_pinned_cpu_tensor(temperatures);
+    this->temperatures() = make_pinned_cpu_tensor(temperatures);
   }
   if (std::any_of(
           top_k.begin(), top_k.end(), [](int64_t t) { return t > 0; })) {
-    this->top_k = make_pinned_cpu_tensor(top_k);
+    this->top_k() = make_pinned_cpu_tensor(top_k);
   }
   if (std::any_of(
           top_p.begin(), top_p.end(), [](float t) { return t != 1.0; })) {
-    this->top_p = make_pinned_cpu_tensor(top_p);
+    this->top_p() = make_pinned_cpu_tensor(top_p);
   }
 
   if (std::any_of(
           min_p.begin(), min_p.end(), [](float value) { return value > 0; })) {
-    this->min_p = make_pinned_cpu_tensor(min_p);
+    this->min_p() = make_pinned_cpu_tensor(min_p);
   }
 
-  this->selected_token_idxes = make_pinned_cpu_tensor(selected_token_idxes);
+  this->selected_token_idxes() = make_pinned_cpu_tensor(selected_token_idxes);
   const bool has_filter_mask =
       std::any_of(filter_mask_rows.begin(),
                   filter_mask_rows.end(),
@@ -265,7 +266,7 @@ void SamplingParameters::init(
             {vocab_size}, torch::TensorOptions().dtype(torch::kFloat32)));
       }
     }
-    this->filter_mask =
+    this->filter_mask() =
         torch::cat(rows, /*dim=*/0)
             .view({static_cast<int64_t>(rows.size()), vocab_size});
     HISTOGRAM_OBSERVE(
@@ -276,11 +277,12 @@ void SamplingParameters::init(
     CHECK_EQ(req_sampling_params.size(), unique_token_ids_vec.size());
     CHECK_EQ(req_sampling_params.size(), unique_token_counts_vec.size());
     CHECK_EQ(req_sampling_params.size(), unique_token_lens_vec.size());
-    this->unique_token_ids =
+    this->unique_token_ids() =
         create_2d_tensor(unique_token_ids_vec, torch::kInt64);
-    this->unique_token_counts =
+    this->unique_token_counts() =
         create_2d_tensor(unique_token_counts_vec, torch::kInt);
-    this->unique_token_ids_lens = make_pinned_cpu_tensor(unique_token_lens_vec);
+    this->unique_token_ids_lens() =
+        make_pinned_cpu_tensor(unique_token_lens_vec);
   }
 
   // Only a mixed batch dispatches per sequence; uniform batches (greedy or
@@ -290,7 +292,7 @@ void SamplingParameters::init(
       temperatures.begin(), temperatures.end(), [](const float temperature) {
         return temperature != 0.0F;
       });
-  num_random_rows = static_cast<int64_t>(num_random_seqs);
+  num_random_rows() = static_cast<int64_t>(num_random_seqs);
   const bool any_random = num_random_seqs > 0;
   const bool all_random =
       !temperatures.empty() && num_random_seqs == temperatures.size();
@@ -301,15 +303,15 @@ void SamplingParameters::init(
     for (const float temperature : temperatures) {
       do_sample.push_back(temperature != 0.0F);
     }
-    this->do_sample = make_pinned_cpu_tensor(do_sample);
+    this->do_sample() = make_pinned_cpu_tensor(do_sample);
   }
-  this->sampling_mode =
+  this->sampling_mode() =
       all_random ? SamplingMode::RANDOM
                  : (any_random ? SamplingMode::MIXED : SamplingMode::GREEDY);
-  this->logprobs = logprobs;
-  this->max_top_logprobs = max_top_logprobs;
-  this->is_embeddings = is_embeddings;
-  this->num_return_sequences = num_return_sequences;
+  this->logprobs() = logprobs;
+  this->max_top_logprobs() = max_top_logprobs;
+  this->is_embeddings() = is_embeddings;
+  this->num_return_sequences() = num_return_sequences;
 }
 
 SamplingParameters SamplingParameters::to(const torch::Device& device,
@@ -319,69 +321,71 @@ SamplingParameters SamplingParameters::to(const torch::Device& device,
   // selected indices are tiny control tensors and correctness-critical. Use
   // blocking H2D copies to avoid consuming partially transferred index
   // buffers on NPU runtime paths.
-  params.selected_token_idxes =
-      selected_token_idxes.defined()
-          ? safe_to(selected_token_idxes, device).contiguous()
-          : selected_token_idxes;
+  params.selected_token_idxes() =
+      selected_token_idxes().defined()
+          ? safe_to(selected_token_idxes(), device).contiguous()
+          : selected_token_idxes();
   const torch::TensorOptions options = torch::device(device).dtype(dtype);
-  if (filter_mask.defined()) {
+  if (filter_mask().defined()) {
     if (device.is_cpu()) {
-      params.filter_mask = safe_to(filter_mask, options, true).contiguous();
+      params.filter_mask() = safe_to(filter_mask(), options, true).contiguous();
     } else {
       Timer transfer_timer;
-      params.filter_mask = safe_to(filter_mask, options, true).contiguous();
+      params.filter_mask() = safe_to(filter_mask(), options, true).contiguous();
       HISTOGRAM_OBSERVE(
           json_object_mask_transfer_submission_latency_microseconds,
           static_cast<int64_t>(transfer_timer.elapsed_microseconds()));
     }
   }
-  if (filter_bitmask.defined()) {
+  if (filter_bitmask().defined()) {
     if (device.is_cpu()) {
-      params.filter_bitmask =
-          safe_to(filter_bitmask, device, true).contiguous();
+      params.filter_bitmask() =
+          safe_to(filter_bitmask(), device, true).contiguous();
     } else {
       Timer transfer_timer;
-      params.filter_bitmask =
-          safe_to(filter_bitmask, device, true).contiguous();
+      params.filter_bitmask() =
+          safe_to(filter_bitmask(), device, true).contiguous();
       HISTOGRAM_OBSERVE(
           json_object_mask_transfer_submission_latency_microseconds,
           static_cast<int64_t>(transfer_timer.elapsed_microseconds()));
     }
   }
-  params.frequency_penalties = safe_to(frequency_penalties, options, true);
-  params.presence_penalties = safe_to(presence_penalties, options, true);
-  params.repetition_penalties = safe_to(repetition_penalties, options, true);
-  params.temperatures = safe_to(temperatures, options, true);
-  params.top_p = safe_to(top_p, options, true);
-  params.min_p = safe_to(min_p, options, true);
-  params.seed_offsets = safe_to(seed_offsets, device, true);
-  params.bad_words = safe_to(bad_words, device, true);
-  params.bad_word_suffix = safe_to(bad_word_suffix, device, true);
-  params.prefix_tokens = safe_to(prefix_tokens, device, true);
+  params.frequency_penalties() = safe_to(frequency_penalties(), options, true);
+  params.presence_penalties() = safe_to(presence_penalties(), options, true);
+  params.repetition_penalties() =
+      safe_to(repetition_penalties(), options, true);
+  params.temperatures() = safe_to(temperatures(), options, true);
+  params.top_p() = safe_to(top_p(), options, true);
+  params.min_p() = safe_to(min_p(), options, true);
+  params.seed_offsets() = safe_to(seed_offsets(), device, true);
+  params.bad_words() = safe_to(bad_words(), device, true);
+  params.bad_word_suffix() = safe_to(bad_word_suffix(), device, true);
+  params.prefix_tokens() = safe_to(prefix_tokens(), device, true);
 
-  params.seeds = safe_to(seeds, device, true);
-  params.logits_bias = safe_to(logits_bias, device, true);
-  params.min_token_positions = safe_to(min_token_positions, device, true);
-  params.min_tokens_remaining = safe_to(min_tokens_remaining, device, true);
-  params.min_token_ids = safe_to(min_token_ids, device, true);
-  params.top_k = safe_to(top_k, device, true);
+  params.seeds() = safe_to(seeds(), device, true);
+  params.logits_bias() = safe_to(logits_bias(), device, true);
+  params.min_token_positions() = safe_to(min_token_positions(), device, true);
+  params.min_tokens_remaining() = safe_to(min_tokens_remaining(), device, true);
+  params.min_token_ids() = safe_to(min_token_ids(), device, true);
+  params.top_k() = safe_to(top_k(), device, true);
 
-  params.unique_token_ids = safe_to(unique_token_ids, device, true);
-  params.unique_token_counts = safe_to(unique_token_counts, device, true);
-  params.unique_token_ids_lens = safe_to(unique_token_ids_lens, device, true);
+  params.unique_token_ids() = safe_to(unique_token_ids(), device, true);
+  params.unique_token_counts() = safe_to(unique_token_counts(), device, true);
+  params.unique_token_ids_lens() =
+      safe_to(unique_token_ids_lens(), device, true);
 
-  params.do_sample = safe_to(do_sample, device, true);
-  params.acc_logprob = safe_to(acc_logprob, device, true);
-  params.has_unseeded_sample = has_unseeded_sample;
-  params.num_random_rows = num_random_rows;
-  params.sampling_mode = sampling_mode;
-  params.logprobs = logprobs;
-  params.return_logits = return_logits;
-  params.max_top_logprobs = max_top_logprobs;
-  params.is_embeddings = is_embeddings;
-  params.num_return_sequences = num_return_sequences;
+  params.do_sample() = safe_to(do_sample(), device, true);
+  params.acc_logprob() = safe_to(acc_logprob(), device, true);
+  params.has_unseeded_sample() = has_unseeded_sample();
+  params.num_random_rows() = num_random_rows();
+  params.sampling_mode() = sampling_mode();
+  params.logprobs() = logprobs();
+  params.return_logits() = return_logits();
+  params.max_top_logprobs() = max_top_logprobs();
+  params.is_embeddings() = is_embeddings();
+  params.num_return_sequences() = num_return_sequences();
 
-  params.use_beam_search = use_beam_search;
+  params.use_beam_search() = use_beam_search();
   return params;
 }
 

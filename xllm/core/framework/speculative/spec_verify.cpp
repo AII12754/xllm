@@ -131,31 +131,41 @@ torch::Tensor rejection_sample_ragged(
   CHECK_EQ(owners.device(), target_logits.device());
   CHECK(owners.scalar_type() == torch::kInt32 ||
         owners.scalar_type() == torch::kInt64);
-  CHECK(request_sampling.selected_token_idxes.defined());
+  CHECK(request_sampling.selected_token_idxes().defined());
   CHECK_GT(request_sampling.num_sample_seqs(), 0);
-  if (request_sampling.sampling_mode == SamplingMode::MIXED) {
-    CHECK(request_sampling.do_sample.defined());
+  if (request_sampling.sampling_mode() == SamplingMode::MIXED) {
+    CHECK(request_sampling.do_sample().defined());
   }
-  CHECK(!request_sampling.logprobs) << "logprobs unsupported";
-  const bool minimum = request_sampling.min_token_ids.defined();
-  CHECK_EQ(minimum, request_sampling.min_token_positions.defined());
-  CHECK_EQ(minimum, request_sampling.min_tokens_remaining.defined());
+  CHECK(!request_sampling.logprobs()) << "logprobs unsupported";
+  const bool minimum = request_sampling.min_token_ids().defined();
+  CHECK_EQ(minimum, request_sampling.min_token_positions().defined());
+  CHECK_EQ(minimum, request_sampling.min_tokens_remaining().defined());
   // Scalar transforms and the compact minimum-length controls have explicit
   // ragged mappings. Other penalties, seeds and constraints remain unsupported.
-  constexpr std::array<torch::Tensor SamplingParameters::*, 4> kRequestFields =
-      {&SamplingParameters::temperatures,
-       &SamplingParameters::top_k,
-       &SamplingParameters::top_p,
-       &SamplingParameters::min_p};
+  constexpr std::array<SamplingTensorAccessor, 4> kRequestFields = {
+      SamplingTensorAccessor{&SamplingParameters::temperatures,
+                             &SamplingParameters::temperatures},
+      SamplingTensorAccessor{&SamplingParameters::top_k,
+                             &SamplingParameters::top_k},
+      SamplingTensorAccessor{&SamplingParameters::top_p,
+                             &SamplingParameters::top_p},
+      SamplingTensorAccessor{&SamplingParameters::min_p,
+                             &SamplingParameters::min_p}};
   for (const auto& field : kSamplingFields) {
-    const torch::Tensor& values = request_sampling.*field.member;
+    const torch::Tensor& values = field.member(request_sampling);
     const bool packed_field =
         std::find(kRequestFields.begin(), kRequestFields.end(), field.member) !=
         kRequestFields.end();
     const bool minimum_field =
-        field.member == &SamplingParameters::min_token_positions ||
-        field.member == &SamplingParameters::min_tokens_remaining ||
-        field.member == &SamplingParameters::min_token_ids;
+        field.member ==
+            SamplingTensorAccessor{&SamplingParameters::min_token_positions,
+                                   &SamplingParameters::min_token_positions} ||
+        field.member ==
+            SamplingTensorAccessor{&SamplingParameters::min_tokens_remaining,
+                                   &SamplingParameters::min_tokens_remaining} ||
+        field.member ==
+            SamplingTensorAccessor{&SamplingParameters::min_token_ids,
+                                   &SamplingParameters::min_token_ids};
     CHECK(packed_field || minimum_field || !values.defined())
         << "unsupported sampling field for ragged sampling";
   }
@@ -165,19 +175,19 @@ torch::Tensor rejection_sample_ragged(
   target_logits.masked_fill_(owners.lt(0).unsqueeze(1), 0);
   const torch::Tensor request_rows = owners.clamp_min(0).to(torch::kInt64);
   SamplingParameters packed;
-  packed.sampling_mode = request_sampling.sampling_mode;
+  packed.sampling_mode() = request_sampling.sampling_mode();
   for (const auto member : kRequestFields) {
-    const auto& values = request_sampling.*member;
+    const auto& values = member(request_sampling);
     if (values.defined()) {
       CHECK_EQ(values.device(), owners.device());
       CHECK_EQ(values.dim(), 1);
       CHECK_EQ(values.numel(), request_sampling.num_sample_seqs());
-      packed.*member = values.index_select(/*dim=*/0, request_rows);
+      member(packed) = values.index_select(/*dim=*/0, request_rows);
     }
   }
-  if (request_sampling.sampling_mode == SamplingMode::MIXED) {
-    packed.do_sample =
-        request_sampling.do_sample.index_select(/*dim=*/0, request_rows);
+  if (request_sampling.sampling_mode() == SamplingMode::MIXED) {
+    packed.do_sample() =
+        request_sampling.do_sample().index_select(/*dim=*/0, request_rows);
   }
   if (minimum) {
     CHECK(columns.defined());
@@ -185,18 +195,18 @@ torch::Tensor rejection_sample_ragged(
     CHECK_EQ(columns.device(), owners.device());
     CHECK(columns.scalar_type() == torch::kInt32 ||
           columns.scalar_type() == torch::kInt64);
-    CHECK(request_sampling.min_tokens_remaining.defined());
-    CHECK_EQ(request_sampling.min_token_ids.device(), owners.device());
-    CHECK_EQ(request_sampling.min_tokens_remaining.device(), owners.device());
-    packed.min_token_ids = request_sampling.min_token_ids.index_select(
+    CHECK(request_sampling.min_tokens_remaining().defined());
+    CHECK_EQ(request_sampling.min_token_ids().device(), owners.device());
+    CHECK_EQ(request_sampling.min_tokens_remaining().device(), owners.device());
+    packed.min_token_ids() = request_sampling.min_token_ids().index_select(
         /*dim=*/0, request_rows);
-    packed.min_tokens_remaining =
-        request_sampling.min_tokens_remaining.index_select(/*dim=*/0,
-                                                           request_rows) -
+    packed.min_tokens_remaining() =
+        request_sampling.min_tokens_remaining().index_select(
+            /*dim=*/0, request_rows) -
         columns.to(torch::kInt64);
     // Uncommitted padding must retain a finite distribution, even if request
     // zero suppresses token zero until its minimum is reached.
-    packed.min_tokens_remaining.masked_fill_(owners.lt(0), 0);
+    packed.min_tokens_remaining().masked_fill_(owners.lt(0), 0);
   }
   // Residual X|X!=d ~ p/(1-p(d)); the caller establishes TP consensus
   // before committing KV.

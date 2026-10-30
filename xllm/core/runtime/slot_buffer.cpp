@@ -26,6 +26,7 @@ limitations under the License.
 #include <numeric>
 #include <unordered_set>
 
+#include "core/framework/config/model_config.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/platform/platform.h"
 #include "core/runtime/forward_params.h"
@@ -116,7 +117,7 @@ TokenResultTensors bind_result_views(const TokenResultTensors& storage,
 }
 
 struct InputField {
-  torch::Tensor SamplingParameters::* member;
+  SamplingTensorAccessor member;
   torch::ScalarType dtype;
   // History fields are 2-D [rows, unique_tokens]. Stop IDs use a separate
   // growable 2-D buffer; other fields are 1-D per-row tensors.
@@ -129,21 +130,66 @@ struct InputField {
 // per-sequence tensors; carries no seeds/seed_offsets/logits_bias — see
 // kSamplingFields in sampling_params.h for the roles each member plays).
 constexpr std::array<InputField, 15> kFields = {{
-    {&SamplingParameters::selected_token_idxes, torch::kInt32, false},
-    {&SamplingParameters::frequency_penalties, torch::kFloat32, false},
-    {&SamplingParameters::presence_penalties, torch::kFloat32, false},
-    {&SamplingParameters::repetition_penalties, torch::kFloat32, false},
-    {&SamplingParameters::temperatures, torch::kFloat32, false},
-    {&SamplingParameters::top_p, torch::kFloat32, false},
-    {&SamplingParameters::min_p, torch::kFloat32, false},
-    {&SamplingParameters::min_token_positions, torch::kInt64, false},
-    {&SamplingParameters::min_tokens_remaining, torch::kInt64, false},
-    {&SamplingParameters::min_token_ids, torch::kInt64, false},
-    {&SamplingParameters::top_k, torch::kInt64, false},
-    {&SamplingParameters::unique_token_ids, torch::kInt64, true},
-    {&SamplingParameters::unique_token_counts, torch::kInt32, true},
-    {&SamplingParameters::unique_token_ids_lens, torch::kInt32, false},
-    {&SamplingParameters::do_sample, torch::kBool, false},
+    {SamplingTensorAccessor{&SamplingParameters::selected_token_idxes,
+                            &SamplingParameters::selected_token_idxes},
+     torch::kInt32,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::frequency_penalties,
+                            &SamplingParameters::frequency_penalties},
+     torch::kFloat32,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::presence_penalties,
+                            &SamplingParameters::presence_penalties},
+     torch::kFloat32,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::repetition_penalties,
+                            &SamplingParameters::repetition_penalties},
+     torch::kFloat32,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::temperatures,
+                            &SamplingParameters::temperatures},
+     torch::kFloat32,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::top_p,
+                            &SamplingParameters::top_p},
+     torch::kFloat32,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::min_p,
+                            &SamplingParameters::min_p},
+     torch::kFloat32,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::min_token_positions,
+                            &SamplingParameters::min_token_positions},
+     torch::kInt64,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::min_tokens_remaining,
+                            &SamplingParameters::min_tokens_remaining},
+     torch::kInt64,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::min_token_ids,
+                            &SamplingParameters::min_token_ids},
+     torch::kInt64,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::top_k,
+                            &SamplingParameters::top_k},
+     torch::kInt64,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::unique_token_ids,
+                            &SamplingParameters::unique_token_ids},
+     torch::kInt64,
+     true},
+    {SamplingTensorAccessor{&SamplingParameters::unique_token_counts,
+                            &SamplingParameters::unique_token_counts},
+     torch::kInt32,
+     true},
+    {SamplingTensorAccessor{&SamplingParameters::unique_token_ids_lens,
+                            &SamplingParameters::unique_token_ids_lens},
+     torch::kInt32,
+     false},
+    {SamplingTensorAccessor{&SamplingParameters::do_sample,
+                            &SamplingParameters::do_sample},
+     torch::kBool,
+     false},
 }};
 
 namespace {
@@ -155,7 +201,9 @@ bool parameter_type(torch::ScalarType dtype) {
 
 uint64_t capacity_elements(const InputField& field,
                            const SlotBufferCapacity& capacity) {
-  if (field.member == &SamplingParameters::min_token_ids) {
+  if (field.member ==
+      SamplingTensorAccessor{&SamplingParameters::min_token_ids,
+                             &SamplingParameters::min_token_ids}) {
     return 0;  // Grow stop-ID storage outside the model graph.
   }
   return field.history ? static_cast<uint64_t>(capacity.max_sample_rows) *
@@ -310,10 +358,17 @@ BatchInputMeta batch_meta(const ModelInputBatch& batch) {
   return meta;
 }
 
-std::span<const int32_t> linear_ids(const LlmModelParams& params) {
-  return params.embedding.linear_state_ids.empty()
-             ? int_span(params.embedding.linear_state_indices)
-             : std::span<const int32_t>(params.embedding.linear_state_ids);
+std::span<const int32_t> linear_ids(const LlmEmbeddingInput& embedding,
+                                    bool read = false) {
+  if (read && !embedding.linear_state_read_ids.empty()) {
+    return embedding.linear_state_read_ids;
+  }
+  if (read && embedding.linear_state_read_indices.defined()) {
+    return int_span(embedding.linear_state_read_indices);
+  }
+  return embedding.linear_state_ids.empty()
+             ? int_span(embedding.linear_state_indices)
+             : std::span<const int32_t>(embedding.linear_state_ids);
 }
 
 void copy_to_device(const torch::Tensor& destination,
@@ -523,7 +578,7 @@ Status SlotBuffer::create(const SlotBufferCapacity& capacity,
 }
 
 Status SlotBuffer::configure_sampling(const SlotBufferCapacity& requested) {
-  if (sampling_host_.selected_token_idxes.defined() || copy_submitted_) {
+  if (sampling_host_.selected_token_idxes().defined() || copy_submitted_) {
     return Status(StatusCode::INVALID_ARGUMENT,
                   "Sampling storage is already configured.");
   }
@@ -543,9 +598,9 @@ Status SlotBuffer::configure_sampling(const SlotBufferCapacity& requested) {
         static_cast<int64_t>(capacity_elements(field, capacity_));
     const auto options = torch::TensorOptions().dtype(
         storage_dtype(field, capacity_.parameter_dtype));
-    sampling_host_.*field.member = torch::empty(
+    field.member(sampling_host_) = torch::empty(
         {elements}, options.device(torch::kCPU).pinned_memory(true));
-    sampling_device_.*field.member =
+    field.member(sampling_device_) =
         torch::empty({elements}, options.device(device_));
   }
   for (const auto& field : kResultFields) {
@@ -603,17 +658,27 @@ SlotBuffer::SlotBuffer(SlotBufferCapacity capacity,
                      device_buffer_.options().dtype(torch::kBool));
     model_params_.embedding.linear_state_ids.reserve(
         capacity_.model.max_sequences);
-    model_params_.linear_state_cache_ops.reserve(capacity_.model.max_sequences);
+    model_params_.embedding.linear_state_read_ids.reserve(
+        capacity_.model.max_sequences);
     model_params_.linear_state_validity_mask.reserve(
         capacity_.model.max_sequences);
   }
 
+  populate_execution_batch_ = ModelConfig::is_python_model_impl(
+      ModelConfig::get_instance().model_impl());
   AttentionHostInputView& host = model_params_.attention.host;
+  auto& execution_batch = model_params_.meta.execution_batch;
   for (std::vector<int32_t>* lengths : {&host.q_seq_lens,
                                         &host.q_cu_seq_lens,
                                         &host.kv_seq_lens,
                                         &host.kv_cache_tokens_nums}) {
     lengths->reserve(capacity_.model.max_sequences);
+  }
+  if (populate_execution_batch_) {
+    execution_batch.num_scheduled_tokens.reserve(capacity_.model.max_sequences);
+    execution_batch.num_computed_tokens.reserve(capacity_.model.max_sequences);
+    execution_batch.query_start_loc.reserve(capacity_.model.max_sequences + 1);
+    execution_batch.is_prefilling.reserve(capacity_.model.max_sequences);
   }
   host.new_cache_slots.reserve(capacity_.model.max_tokens);
   model_params_.attn_metadata = std::make_shared<layer::AttentionMetadata>();
@@ -670,25 +735,25 @@ Status SlotBuffer::validate_model(const ModelInputHostView& input) const {
 
 Status SlotBuffer::validate_sampling(const SamplingParameters& input,
                                      uint32_t model_tokens) const {
-  if (input.logits_bias.defined() || input.seeds.defined() ||
-      input.seed_offsets.defined() || input.filter_mask.defined() ||
-      input.filter_bitmask.defined() || input.acc_logprob.defined() ||
-      input.is_embeddings || input.use_beam_search ||
-      input.num_return_sequences != 0 || input.max_top_logprobs < 0 ||
+  if (input.logits_bias().defined() || input.seeds().defined() ||
+      input.seed_offsets().defined() || input.filter_mask().defined() ||
+      input.filter_bitmask().defined() || input.acc_logprob().defined() ||
+      input.is_embeddings() || input.use_beam_search() ||
+      input.num_return_sequences() != 0 || input.max_top_logprobs() < 0 ||
       model_tokens >
           static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) ||
-      static_cast<uint64_t>(input.max_top_logprobs) >
+      static_cast<uint64_t>(input.max_top_logprobs()) >
           capacity_.max_top_logprobs) {
     return invalid_input();
   }
   const int64_t rows = input.num_sample_seqs();
-  if (!sampling_host_.selected_token_idxes.defined() ||
+  if (!sampling_host_.selected_token_idxes().defined() ||
       rows > capacity_.max_sample_rows || (rows > 0 && model_tokens == 0)) {
     return invalid_input();
   }
   int64_t width = 0;
   for (const auto& field : kFields) {
-    const torch::Tensor& tensor = input.*field.member;
+    const torch::Tensor& tensor = field.member(input);
     if (!tensor.defined()) {
       continue;
     }
@@ -696,7 +761,9 @@ Status SlotBuffer::validate_sampling(const SamplingParameters& input,
                                    ? parameter_type(tensor.scalar_type())
                                    : tensor.scalar_type() == field.dtype;
     const bool history = field.history;
-    const bool stop = field.member == &SamplingParameters::min_token_ids;
+    const bool stop = field.member == SamplingTensorAccessor{
+                                          &SamplingParameters::min_token_ids,
+                                          &SamplingParameters::min_token_ids};
     if (!tensor.device().is_cpu() || !tensor.is_contiguous() ||
         !dtype_matches || tensor.dim() != ((history || stop) ? 2 : 1) ||
         tensor.size(0) != rows) {
@@ -715,38 +782,38 @@ Status SlotBuffer::validate_sampling(const SamplingParameters& input,
       width = tensor.size(1);
     }
   }
-  const bool minimum = input.min_token_ids.defined();
-  if (minimum != input.min_token_positions.defined() ||
-      minimum != input.min_tokens_remaining.defined()) {
+  const bool minimum = input.min_token_ids().defined();
+  if (minimum != input.min_token_positions().defined() ||
+      minimum != input.min_tokens_remaining().defined()) {
     return invalid_input();
   }
   if (minimum &&
-      (!all_values<int64_t>(input.min_token_ids,
+      (!all_values<int64_t>(input.min_token_ids(),
                             [this](int64_t token) {
                               return token >= -1 &&
                                      token < capacity_.vocab_size;
                             }) ||
-       !all_values<int64_t>(input.min_token_positions,
+       !all_values<int64_t>(input.min_token_positions(),
                             [](int64_t value) { return value >= 0; }) ||
-       !all_values<int64_t>(input.min_tokens_remaining,
+       !all_values<int64_t>(input.min_tokens_remaining(),
                             [](int64_t value) { return value >= 0; }))) {
     return invalid_input();
   }
-  const bool history = input.unique_token_ids.defined();
-  if (history != input.unique_token_counts.defined() ||
-      history != input.unique_token_ids_lens.defined() ||
-      input.frequency_penalties.defined() !=
-          input.presence_penalties.defined() ||
-      ((input.frequency_penalties.defined() ||
-        input.repetition_penalties.defined()) &&
+  const bool history = input.unique_token_ids().defined();
+  if (history != input.unique_token_counts().defined() ||
+      history != input.unique_token_ids_lens().defined() ||
+      input.frequency_penalties().defined() !=
+          input.presence_penalties().defined() ||
+      ((input.frequency_penalties().defined() ||
+        input.repetition_penalties().defined()) &&
        !history) ||
-      (rows > 0 && input.sampling_mode == SamplingMode::MIXED &&
-       !input.do_sample.defined())) {
+      (rows > 0 && input.sampling_mode() == SamplingMode::MIXED &&
+       !input.do_sample().defined())) {
     return invalid_input();
   }
   if (rows > 0) {
     if (!all_values<int32_t>(
-            input.selected_token_idxes, [model_tokens](int32_t value) {
+            input.selected_token_idxes(), [model_tokens](int32_t value) {
               return value >= 0 && static_cast<uint32_t>(value) < model_tokens;
             })) {
       return invalid_input();
@@ -754,40 +821,40 @@ Status SlotBuffer::validate_sampling(const SamplingParameters& input,
   }
   const auto finite = [](float /*value*/) { return true; };
   if (!valid_parameters(
-          input.frequency_penalties, capacity_.parameter_dtype, finite) ||
+          input.frequency_penalties(), capacity_.parameter_dtype, finite) ||
       !valid_parameters(
-          input.presence_penalties, capacity_.parameter_dtype, finite) ||
-      !valid_parameters(input.repetition_penalties,
+          input.presence_penalties(), capacity_.parameter_dtype, finite) ||
+      !valid_parameters(input.repetition_penalties(),
                         capacity_.parameter_dtype,
                         [](float value) { return value > 0; }) ||
-      !valid_parameters(input.temperatures,
+      !valid_parameters(input.temperatures(),
                         capacity_.parameter_dtype,
                         [](float value) { return value >= 0; }) ||
-      !valid_parameters(input.min_p,
+      !valid_parameters(input.min_p(),
                         capacity_.parameter_dtype,
                         [](float value) { return value >= 0 && value <= 1; }) ||
-      !valid_parameters(input.top_p,
+      !valid_parameters(input.top_p(),
                         capacity_.parameter_dtype,
                         [](float value) { return value >= 0 && value <= 1; })) {
     return invalid_input();
   }
-  if (input.top_k.defined() &&
-      !all_values<int64_t>(input.top_k, [](int64_t value) {
+  if (input.top_k().defined() &&
+      !all_values<int64_t>(input.top_k(), [](int64_t value) {
         return value <= std::numeric_limits<int32_t>::max();
       })) {
     return invalid_input();
   }
   if (history &&
-      (!all_values<int64_t>(input.unique_token_ids,
+      (!all_values<int64_t>(input.unique_token_ids(),
                             [this](int64_t value) {
                               return value >= 0 &&
                                      static_cast<uint64_t>(value) <
                                          capacity_.vocab_size;
                             }) ||
-       !all_values<int32_t>(input.unique_token_counts,
+       !all_values<int32_t>(input.unique_token_counts(),
                             [](int32_t value) { return value >= 0; }) ||
        !all_values<int32_t>(
-           input.unique_token_ids_lens,
+           input.unique_token_ids_lens(),
            [width](int32_t value) { return value >= 0 && value <= width; }))) {
     return invalid_input();
   }
@@ -831,7 +898,8 @@ ModelInputHostView SlotBuffer::model_input_view(const LlmForwardInput& input) {
           int_span(host.block_tables),
           tokens.empty()
               ? 0
-              : static_cast<uint32_t>(host.block_tables.size(/*dim=*/1))};
+              : static_cast<uint32_t>(host.block_tables.size(/*dim=*/1)),
+          &input.input_params.meta.execution_batch};
 }
 
 Status SlotBuffer::validate_model_state(const LlmForwardInput& input) const {
@@ -845,7 +913,7 @@ Status SlotBuffer::validate_model_state(const LlmForwardInput& input) const {
                             indices.numel() != rows)) {
     return invalid("Linear-state indices must be row-aligned CPU int32.");
   }
-  const auto ids = linear_ids(params);
+  const auto ids = linear_ids(params.embedding);
   if (overlaps_host(ids, host_buffer_)) {
     return invalid("Linear-state input aliases destination staging storage.");
   }
@@ -854,14 +922,28 @@ Status SlotBuffer::validate_model_state(const LlmForwardInput& input) const {
        !std::equal(ids.begin(), ids.end(), indices.data_ptr<int32_t>()))) {
     return invalid("Linear-state IDs and indices must agree on every row.");
   }
-  const auto& ops = params.linear_state_cache_ops;
+  const auto& read_ids = params.embedding.linear_state_read_ids;
+  const auto& read_indices = params.embedding.linear_state_read_indices;
   const auto& validity = params.linear_state_validity_mask;
-  if ((!ops.empty() && ops.size() != rows) ||
+  if (read_indices.defined() &&
+      (!is_cpu_int_tensor(read_indices, /*dimensions=*/1) ||
+       read_indices.numel() != rows)) {
+    return invalid("Linear-state read indices must be row-aligned CPU int32.");
+  }
+  const auto reads = linear_ids(params.embedding, /*read=*/true);
+  if ((!reads.empty() && reads.size() != rows) ||
+      overlaps_host(reads, host_buffer_) ||
       (!validity.empty() && validity.size() != rows) ||
       std::any_of(validity.begin(), validity.end(), [](int64_t value) {
         return value != 0 && value != 1;
       })) {
-    return invalid("Linear-state operations and validity must be row-aligned.");
+    return invalid("Linear-state reads and validity must be row-aligned.");
+  }
+  if (!read_ids.empty() && read_indices.defined() &&
+      !std::equal(
+          reads.begin(), reads.end(), read_indices.data_ptr<int32_t>())) {
+    return invalid(
+        "Linear-state read IDs and indices must agree on every row.");
   }
   if (params.meta.is_graph_warmup) {
     return Status();
@@ -875,21 +957,12 @@ Status SlotBuffer::validate_model_state(const LlmForwardInput& input) const {
     if (ids[row] <= 0 || !active_ids.insert(ids[row]).second) {
       return invalid("Linear-state rows require unique non-padding IDs.");
     }
-    if (ops.empty()) {
-      continue;
-    }
-    const auto& op = ops[row];
-    if (op.linear_state_id != ids[row] ||
-        (op.reset_requested && op.restore_requested) ||
-        (op.reset_requested && op.restore_src_slot_id >= 0) ||
-        (op.restore_requested && op.restore_src_slot_id <= 0) ||
-        (op.is_direct_read() &&
-         (op.restore_src_slot_id == 0 ||
-          (!params.meta.batch_forward_type.is_prefill() &&
-           !params.meta.batch_forward_type.is_chunked_prefill() &&
-           !params.meta.batch_forward_type.is_mixed())))) {
+    const int32_t read_id = reads[row];
+    if (read_id <= kPaddingLinearStateId ||
+        (read_id != ids[row] && (validity.empty() || validity[row] == 0))) {
       return invalid(
-          "Invalid linear-state reset, restore or direct-read operation.");
+          "Invalid linear-state checkpoint read: a direct read requires a "
+          "warm checkpoint.");
     }
   }
   return Status();
@@ -1082,6 +1155,21 @@ void SlotBuffer::prepare_model(const ModelInputHostView& input,
   model_params_.meta.is_graph_warmup = batch.is_graph_warmup;
   model_params_.meta.q_max_seq_len = maximum(host.q_seq_lens);
   model_params_.meta.kv_max_seq_len = maximum(host.kv_seq_lens);
+  if (populate_execution_batch_) {
+    auto& execution_batch = model_params_.meta.execution_batch;
+    if (input.execution_batch != nullptr) {
+      execution_batch = *input.execution_batch;
+    } else {
+      const int32_t requests = batch.actual_num_sequences;
+      execution_batch.num_reqs = requests;
+      execution_batch.num_scheduled_tokens.assign(
+          input.q_seq_lens.begin(), input.q_seq_lens.begin() + requests);
+      fill_request_layout(execution_batch, input.positions);
+      execution_batch.is_prefilling.assign(
+          requests, batch.batch_forward_type.no_decode());
+    }
+    execution_batch.num_tokens = token_count;
+  }
   // These are the original Python paged-attention inputs. The Slot owns the
   // tensor views and Host metadata until its last reader retires. No model
   // invocation, rotary computation or attention kernel is created here.
@@ -1132,7 +1220,7 @@ void SlotBuffer::prepare_model_state(const LlmForwardInput& input,
   const bool warmup = source.meta.is_graph_warmup;
   auto ids = model_host_.linear_state_indices.narrow(0, 0, rows);
   ids.zero_();
-  const auto source_ids = linear_ids(source);
+  const auto source_ids = linear_ids(source.embedding);
   if (!warmup && actual_rows != 0) {
     std::memcpy(
         ids.data_ptr<int32_t>(), source_ids.data(), source_ids.size_bytes());
@@ -1141,16 +1229,26 @@ void SlotBuffer::prepare_model_state(const LlmForwardInput& input,
   params.embedding.linear_state_indices =
       model_device_.linear_state_indices.narrow(0, 0, rows);
   params.embedding.linear_state_indices.copy_(ids, /*non_blocking=*/true);
-  params.linear_state_cache_ops.clear();
-  if (!warmup) {
-    params.linear_state_cache_ops.assign(source.linear_state_cache_ops.begin(),
-                                         source.linear_state_cache_ops.end());
-  }
+  const auto source_read_ids = linear_ids(source.embedding, /*read=*/true);
   auto read_ids = model_host_.linear_state_read_indices.narrow(0, 0, rows);
-  read_ids.copy_(ids);
-  int32_t* reads = read_ids.data_ptr<int32_t>();
+  if (!warmup && actual_rows != 0) {
+    const size_t copied = source_read_ids.size();
+    std::memcpy(read_ids.data_ptr<int32_t>(),
+                source_read_ids.data(),
+                source_read_ids.size_bytes());
+    std::memcpy(read_ids.data_ptr<int32_t>() + copied,
+                ids.data_ptr<int32_t>() + copied,
+                (rows - copied) * sizeof(int32_t));
+  } else {
+    read_ids.copy_(ids);
+  }
+  assign_prefix(params.embedding.linear_state_read_ids, read_ids, rows);
+  params.embedding.linear_state_read_indices =
+      model_device_.linear_state_read_indices.narrow(0, 0, rows);
+  params.embedding.linear_state_read_indices.copy_(read_ids,
+                                                   /*non_blocking=*/true);
   bool has_direct_read = false;
-  params.linear_state_validity_mask.assign(actual_rows, 0);
+  params.linear_state_validity_mask.assign(rows, 0);
   bool* initial = initial_states_host_.data_ptr<bool>();
   for (uint32_t row = 0; row < rows; ++row) {
     bool valid =
@@ -1159,13 +1257,10 @@ void SlotBuffer::prepare_model_state(const LlmForwardInput& input,
     if (!warmup && row < source.linear_state_validity_mask.size()) {
       valid = source.linear_state_validity_mask[row] != 0;
     }
-    if (row < params.linear_state_cache_ops.size()) {
-      const auto& op = params.linear_state_cache_ops[row];
-      valid = op.is_valid_after(valid);
-      if (op.is_direct_read()) {
-        reads[row] = op.restore_src_slot_id;
-        has_direct_read = true;
-      }
+    if (!warmup && row < actual_rows &&
+        source_read_ids[row] != source_ids[row]) {
+      has_direct_read = true;
+      valid = true;
     }
     initial[row] = valid;
     if (row < actual_rows) {
@@ -1174,12 +1269,9 @@ void SlotBuffer::prepare_model_state(const LlmForwardInput& input,
   }
   auto& metadata = *params.attn_metadata;
   metadata.linear_state_indices = params.embedding.linear_state_indices;
-  metadata.linear_state_read_indices = torch::Tensor();
-  if (has_direct_read) {
-    metadata.linear_state_read_indices =
-        model_device_.linear_state_read_indices.narrow(0, 0, rows);
-    metadata.linear_state_read_indices.copy_(read_ids, /*non_blocking=*/true);
-  }
+  metadata.linear_state_read_indices =
+      has_direct_read ? params.embedding.linear_state_read_indices
+                      : torch::Tensor();
   metadata.has_initial_states = initial_states_device_.narrow(0, 0, rows);
   metadata.has_initial_states.copy_(initial_states_host_.narrow(0, 0, rows),
                                     /*non_blocking=*/true);
@@ -1227,54 +1319,56 @@ void SlotBuffer::prepare_sampling(const SamplingParameters& input) {
   const bool empty = input.num_sample_seqs() == 0;
   if (!empty) {
     for (const auto& field : kFields) {
-      const torch::Tensor& source = input.*field.member;
+      const torch::Tensor& source = field.member(input);
       if (!source.defined()) {
         continue;
       }
-      if (field.member == &SamplingParameters::min_token_ids &&
-          (sampling_host_.*field.member).numel() < source.numel()) {
+      if (field.member ==
+              SamplingTensorAccessor{&SamplingParameters::min_token_ids,
+                                     &SamplingParameters::min_token_ids} &&
+          (field.member(sampling_host_)).numel() < source.numel()) {
         const auto options = torch::TensorOptions().dtype(field.dtype);
-        sampling_host_.*field.member = torch::empty(
+        field.member(sampling_host_) = torch::empty(
             {source.numel()}, options.device(torch::kCPU).pinned_memory(true));
-        sampling_device_.*field.member =
+        field.member(sampling_device_) =
             torch::empty({source.numel()}, options.device(device_));
       }
-      torch::Tensor host = (sampling_host_.*field.member)
+      torch::Tensor host = (field.member(sampling_host_))
                                .narrow(/*dim=*/0, /*start=*/0, source.numel());
       torch::Tensor device =
-          (sampling_device_.*field.member)
+          (field.member(sampling_device_))
               .narrow(/*dim=*/0, /*start=*/0, source.numel());
       host.copy_(source.view({-1}));
       device.copy_(host, /*non_blocking=*/true);
-      prepared.*field.member = device.view(source.sizes());
+      field.member(prepared) = device.view(source.sizes());
     }
-    prepared.has_unseeded_sample = input.has_unseeded_sample;
-    prepared.num_random_rows = input.num_random_rows;
-    prepared.sampling_mode = input.sampling_mode;
-    prepared.logprobs = input.logprobs;
-    prepared.return_logits = input.return_logits;
-    prepared.max_top_logprobs = input.max_top_logprobs;
+    prepared.has_unseeded_sample() = input.has_unseeded_sample();
+    prepared.num_random_rows() = input.num_random_rows();
+    prepared.sampling_mode() = input.sampling_mode();
+    prepared.logprobs() = input.logprobs();
+    prepared.return_logits() = input.return_logits();
+    prepared.max_top_logprobs() = input.max_top_logprobs();
   }
   sampling_params_ = std::move(prepared);
 }
 
 void SlotBuffer::refresh_min_tokens() {
   auto& params = sampling_params_;
-  if (!params.min_token_positions.defined()) {
+  if (!params.min_token_positions().defined()) {
     return;
   }
   const auto selected_positions = positions().index_select(
-      /*dim=*/0, params.selected_token_idxes.to(torch::kInt64));
+      /*dim=*/0, params.selected_token_idxes().to(torch::kInt64));
   refresh_min_tokens(selected_positions);
 }
 
 void SlotBuffer::refresh_min_tokens(const torch::Tensor& selected_positions) {
   auto& params = sampling_params_;
-  if (!params.min_token_positions.defined()) {
+  if (!params.min_token_positions().defined()) {
     return;
   }
-  torch::sub_out(params.min_tokens_remaining,
-                 params.min_token_positions,
+  torch::sub_out(params.min_tokens_remaining(),
+                 params.min_token_positions(),
                  selected_positions);
 }
 
@@ -1340,18 +1434,18 @@ void SlotBuffer::prepare_result() {
   const uint32_t rows =
       static_cast<uint32_t>(sampling_params_.num_sample_seqs());
   const uint32_t top_logprobs =
-      sampling_params_.logprobs ? sampling_params_.max_top_logprobs : 0;
+      sampling_params_.logprobs() ? sampling_params_.max_top_logprobs() : 0;
   result_host_ = bind_result_views(result_host_storage_,
                                    rows,
                                    1,
                                    top_logprobs,
-                                   sampling_params_.logprobs,
+                                   sampling_params_.logprobs(),
                                    false);
   result_device_ = bind_result_views(result_device_storage_,
                                      rows,
                                      1,
                                      top_logprobs,
-                                     sampling_params_.logprobs,
+                                     sampling_params_.logprobs(),
                                      false);
   result_sequences_ = rows;
   result_width_ = 1;
@@ -1480,8 +1574,8 @@ uint64_t SlotBuffer::pinned_bytes() const {
       (host_buffer_.defined() ? host_buffer_.nbytes() : 0) +
       (initial_states_host_.defined() ? initial_states_host_.nbytes() : 0) +
       auxiliary_bytes_ + (host_indices_.defined() ? host_indices_.nbytes() : 0);
-  bytes += sampling_host_.min_token_ids.defined()
-               ? sampling_host_.min_token_ids.nbytes()
+  bytes += sampling_host_.min_token_ids().defined()
+               ? sampling_host_.min_token_ids().nbytes()
                : 0;
   bytes += input_scratch_ ? input_scratch_->pinned_bytes_ : 0;
   return bytes;
@@ -1495,8 +1589,8 @@ uint64_t SlotBuffer::device_bytes() const {
        {&device_indices_, &gathered_int64_, &gathered_int32_}) {
     bytes += tensor->defined() ? tensor->nbytes() : 0;
   }
-  bytes += sampling_device_.min_token_ids.defined()
-               ? sampling_device_.min_token_ids.nbytes()
+  bytes += sampling_device_.min_token_ids().defined()
+               ? sampling_device_.min_token_ids().nbytes()
                : 0;
   bytes += input_scratch_ ? input_scratch_->device_bytes_ : 0;
   return bytes;
@@ -1604,6 +1698,14 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
   auto scratch = std::make_unique<SlotBuffer::InputScratch>();
   auto& view = *scratch;
   view.spec_ = spec;
+  auto& execution_batch = view.planned_execution_batch_;
+  if (ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl())) {
+    execution_batch.num_scheduled_tokens.reserve(spec.model.max_sequences);
+    execution_batch.num_computed_tokens.reserve(spec.model.max_sequences);
+    execution_batch.query_start_loc.reserve(spec.model.max_sequences + 1);
+    execution_batch.is_prefilling.reserve(spec.model.max_sequences);
+  }
   ModelInputCapacity capacity = spec.model;
   if (!prefill) {
     view.rows_per_sequence_ =
@@ -1843,6 +1945,16 @@ Status SlotBuffer::plan_mtp_decode(SlotBuffer& input,
                    view.query_ends_,
                    view.block_tables_,
                    base.block_table_width};
+  auto& execution_batch = view.planned_execution_batch_;
+  if (input.populate_execution_batch_) {
+    execution_batch.num_reqs = static_cast<int32_t>(count);
+    execution_batch.num_tokens = view.tokens_.size();
+    execution_batch.num_scheduled_tokens.assign(count, view.rows_per_sequence_);
+    fill_request_layout(execution_batch, view.positions_);
+    execution_batch.is_prefilling.assign(
+        count, view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT);
+  }
+  view.planned_.execution_batch = &view.planned_execution_batch_;
   return Status();
 }
 
@@ -1901,7 +2013,8 @@ Status SlotBuffer::prepare_block_draft_padded(SlotBuffer& input,
                                   view.kv_lengths_,
                                   view.query_ends_,
                                   view.block_tables_,
-                                  view.planned_.block_table_width};
+                                  view.planned_.block_table_width,
+                                  &view.planned_execution_batch_};
   status = input.prepare(padded, batch, stream);
   if (status.ok()) {
     input.model_params().enable_graph = true;
@@ -2163,8 +2276,8 @@ Status SlotBuffer::plan_mtp_prefill(SlotBuffer& input,
         "MTP Prefill requires known query tokens and one extra token per row.");
   }
   const int64_t sample_count = sampling.num_sample_seqs();
-  if (sample_count > 0 &&
-      !is_cpu_int_tensor(sampling.selected_token_idxes, /*dimensions=*/1)) {
+  if (sample_count > 0 && !is_cpu_int_tensor(sampling.selected_token_idxes(),
+                                             /*dimensions=*/1)) {
     return invalid(
         "MTP Prefill sampling indices must be contiguous CPU int32.");
   }
@@ -2188,8 +2301,9 @@ Status SlotBuffer::plan_mtp_prefill(SlotBuffer& input,
   view.planned_rows_.clear();
   view.sampled_token_rows_.clear();
   const int32_t* selected_data =
-      sample_count > 0 ? sampling.selected_token_idxes.const_data_ptr<int32_t>()
-                       : nullptr;
+      sample_count > 0
+          ? sampling.selected_token_idxes().const_data_ptr<int32_t>()
+          : nullptr;
   // One sample per completed chunk: a row is completed iff its extra token is
   // -1, and its selected tail token is the last query position of that row.
   for (int64_t index = 0; index < sample_count; ++index) {

@@ -26,7 +26,7 @@ using testutil::make_sampling_params;
 
 TEST(SamplerFilterMaskTest, GreedySamplingHonorsMixedRows) {
   SamplingParameters params = make_sampling_params(/*batch_size=*/2);
-  params.filter_mask =
+  params.filter_mask() =
       torch::tensor({{0.0F, -1.0e9F, 0.0F}, {0.0F, 0.0F, -1.0e9F}});
   torch::Tensor logits =
       torch::tensor({{1.0F, 100.0F, 2.0F}, {1.0F, 2.0F, 100.0F}});
@@ -39,7 +39,7 @@ TEST(SamplerFilterMaskTest, GreedySamplingHonorsMixedRows) {
 TEST(SamplerFilterMaskTest, RandomSamplingCannotSelectDisallowedToken) {
   SamplingParameters params =
       make_sampling_params(torch::ones({1}, torch::kBool));
-  params.filter_mask = torch::tensor({{-1.0e9F, 0.0F, -1.0e9F}});
+  params.filter_mask() = torch::tensor({{-1.0e9F, 0.0F, -1.0e9F}});
   torch::Tensor logits = torch::tensor({{100.0F, 1.0F, 100.0F}});
 
   const torch::Device device = get_test_device();
@@ -52,7 +52,7 @@ TEST(SamplerFilterMaskTest, RandomSamplingCannotSelectDisallowedToken) {
 
 TEST(SamplerFilterMaskTest, PackedMaskFiltersCallerLogitsInPlace) {
   SamplingParameters params = make_sampling_params(/*batch_size=*/1);
-  params.filter_bitmask =
+  params.filter_bitmask() =
       torch::tensor({{static_cast<int32_t>(0b0101)}},
                     torch::TensorOptions().dtype(torch::kInt32));
   torch::Tensor logits = torch::tensor({{1.0F, 100.0F, 2.0F, 100.0F}});

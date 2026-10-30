@@ -117,25 +117,25 @@ TEST(MtpWorkerSelectionTest, RejectsDsparkDpUnifiedGraphsBeforeModelSetup) {
 
 TEST(MtpWorkerSelectionTest, RequestRoutingDoesNotRejectUnsupportedSampling) {
   LlmForwardInput input;
-  input.sampling_params.sampling_mode = SamplingMode::GREEDY;
+  input.sampling_params.sampling_mode() = SamplingMode::GREEDY;
   EXPECT_TRUE(supports_unified_mtp_request(input));
-  input.sampling_params.logprobs = true;
-  input.sampling_params.max_top_logprobs = 5;
+  input.sampling_params.logprobs() = true;
+  input.sampling_params.max_top_logprobs() = 5;
   EXPECT_TRUE(supports_unified_mtp_request(input));
-  input.sampling_params.sampling_mode = SamplingMode::MIXED;
+  input.sampling_params.sampling_mode() = SamplingMode::MIXED;
   EXPECT_FALSE(supports_unified_mtp_request(input));
-  input.sampling_params.sampling_mode = SamplingMode::GREEDY;
-  input.sampling_params.use_beam_search = true;
+  input.sampling_params.sampling_mode() = SamplingMode::GREEDY;
+  input.sampling_params.use_beam_search() = true;
   EXPECT_FALSE(supports_unified_mtp_request(input));
-  input.sampling_params.use_beam_search = false;
-  for (torch::Tensor* control : {&input.sampling_params.temperatures,
-                                 &input.sampling_params.top_k,
-                                 &input.sampling_params.top_p,
-                                 &input.sampling_params.frequency_penalties,
-                                 &input.sampling_params.presence_penalties,
-                                 &input.sampling_params.repetition_penalties,
-                                 &input.sampling_params.filter_mask,
-                                 &input.sampling_params.filter_bitmask}) {
+  input.sampling_params.use_beam_search() = false;
+  for (torch::Tensor* control : {&input.sampling_params.temperatures(),
+                                 &input.sampling_params.top_k(),
+                                 &input.sampling_params.top_p(),
+                                 &input.sampling_params.frequency_penalties(),
+                                 &input.sampling_params.presence_penalties(),
+                                 &input.sampling_params.repetition_penalties(),
+                                 &input.sampling_params.filter_mask(),
+                                 &input.sampling_params.filter_bitmask()}) {
     *control = torch::ones({1});
     EXPECT_FALSE(supports_unified_mtp_request(input));
     *control = torch::Tensor();
@@ -156,7 +156,7 @@ class DecodeMetadataTestWorker final : public UnifiedMtpWorkerImpl {
       : UnifiedMtpWorkerImpl(parallel_args, device, options, WorkerType::LLM) {
     context_.set_model_impl("python");
     target_spec_verify_mode_ =
-        mtp_async::TargetSpecVerifyMode::DEEPSEEK_V32_EXPANDED_VERIFY;
+        mtp_async::TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY;
   }
 
   void initialize_target_cache() {
@@ -164,8 +164,7 @@ class DecodeMetadataTestWorker final : public UnifiedMtpWorkerImpl {
   }
 
   void use_qwen_hybrid_verify() {
-    target_spec_verify_mode_ =
-        mtp_async::TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY;
+    target_spec_verify_mode_ = mtp_async::TargetSpecVerifyMode::EXPANDED_VERIFY;
   }
 
   void retain_prefix(const LlmForwardInput& input, int32_t accepted_count) {

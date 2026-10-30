@@ -192,32 +192,38 @@ struct ForwardInputBufferPlan {
 inline bool add_sampling_to_plan(const SamplingParameters& source,
                                  SamplingParameters& target,
                                  ForwardInputBufferPlan& plan) {
-  return plan.add(source.selected_token_idxes, &target.selected_token_idxes) &&
-         plan.add(source.frequency_penalties, &target.frequency_penalties) &&
-         plan.add(source.presence_penalties, &target.presence_penalties) &&
-         plan.add(source.repetition_penalties, &target.repetition_penalties) &&
-         plan.add(source.temperatures, &target.temperatures) &&
-         plan.add(source.top_p, &target.top_p) &&
-         plan.add(source.min_p, &target.min_p) &&
-         plan.add(source.logits_bias, &target.logits_bias) &&
-         plan.add(source.min_token_positions, &target.min_token_positions) &&
-         plan.add(source.min_tokens_remaining, &target.min_tokens_remaining) &&
-         plan.add(source.min_token_ids, &target.min_token_ids) &&
-         plan.add(source.seeds, &target.seeds) &&
-         plan.add(source.seed_offsets, &target.seed_offsets) &&
-         plan.add(source.bad_words, &target.bad_words) &&
-         plan.add(source.bad_word_suffix, &target.bad_word_suffix) &&
-         plan.add(source.prefix_tokens, &target.prefix_tokens) &&
+  return plan.add(source.selected_token_idxes(),
+                  &target.selected_token_idxes()) &&
+         plan.add(source.frequency_penalties(),
+                  &target.frequency_penalties()) &&
+         plan.add(source.presence_penalties(), &target.presence_penalties()) &&
+         plan.add(source.repetition_penalties(),
+                  &target.repetition_penalties()) &&
+         plan.add(source.temperatures(), &target.temperatures()) &&
+         plan.add(source.top_p(), &target.top_p()) &&
+         plan.add(source.min_p(), &target.min_p()) &&
+         plan.add(source.logits_bias(), &target.logits_bias()) &&
+         plan.add(source.min_token_positions(),
+                  &target.min_token_positions()) &&
+         plan.add(source.min_tokens_remaining(),
+                  &target.min_tokens_remaining()) &&
+         plan.add(source.min_token_ids(), &target.min_token_ids()) &&
+         plan.add(source.seeds(), &target.seeds()) &&
+         plan.add(source.seed_offsets(), &target.seed_offsets()) &&
+         plan.add(source.bad_words(), &target.bad_words()) &&
+         plan.add(source.bad_word_suffix(), &target.bad_word_suffix()) &&
+         plan.add(source.prefix_tokens(), &target.prefix_tokens()) &&
 
-         plan.add(source.top_k, &target.top_k) &&
-         plan.add(source.unique_token_ids, &target.unique_token_ids) &&
-         plan.add(source.unique_token_counts, &target.unique_token_counts) &&
-         plan.add(source.unique_token_ids_lens,
-                  &target.unique_token_ids_lens) &&
-         plan.add(source.do_sample, &target.do_sample) &&
-         plan.add(source.filter_mask, &target.filter_mask) &&
-         plan.add(source.filter_bitmask, &target.filter_bitmask) &&
-         plan.add(source.acc_logprob, &target.acc_logprob);
+         plan.add(source.top_k(), &target.top_k()) &&
+         plan.add(source.unique_token_ids(), &target.unique_token_ids()) &&
+         plan.add(source.unique_token_counts(),
+                  &target.unique_token_counts()) &&
+         plan.add(source.unique_token_ids_lens(),
+                  &target.unique_token_ids_lens()) &&
+         plan.add(source.do_sample(), &target.do_sample()) &&
+         plan.add(source.filter_mask(), &target.filter_mask()) &&
+         plan.add(source.filter_bitmask(), &target.filter_bitmask()) &&
+         plan.add(source.acc_logprob(), &target.acc_logprob());
 }
 
 inline torch::Tensor normalize_positions_for_device(
@@ -568,8 +574,8 @@ class LlmForwardInput final {
     LOG(INFO) << "  positions: " << positions << std::endl;
     ModelParamsView(input_params).print();
     LOG(INFO) << " params.selected_token_idxes "
-              << sampling_params.selected_token_idxes;
-    LOG(INFO) << " params.do_sample " << sampling_params.do_sample;
+              << sampling_params.selected_token_idxes();
+    LOG(INFO) << " params.do_sample " << sampling_params.do_sample();
   }
 
   // flatten token ids

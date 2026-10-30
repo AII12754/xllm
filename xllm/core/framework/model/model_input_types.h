@@ -16,13 +16,17 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <torch/types.h>
 
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -50,6 +54,29 @@ limitations under the License.
 #include "core/util/tensor_helper.h"
 
 namespace xllm {
+
+template <typename Embedding>
+void materialize_linear_state_indices(Embedding& embedding,
+                                      const torch::Device& device) {
+  if (embedding.linear_state_ids.empty()) {
+    return;
+  }
+  if (!embedding.linear_state_indices.defined()) {
+    embedding.linear_state_indices =
+        make_cpu_tensor(embedding.linear_state_ids).to(device);
+  }
+  if (!embedding.linear_state_read_indices.defined()) {
+    const auto& read_ids = embedding.linear_state_read_ids.empty()
+                               ? embedding.linear_state_ids
+                               : embedding.linear_state_read_ids;
+    CHECK_EQ(read_ids.size(), embedding.linear_state_ids.size());
+    embedding.linear_state_read_indices =
+        read_ids == embedding.linear_state_ids
+            ? embedding.linear_state_indices
+            : make_cpu_tensor(read_ids).to(device);
+  }
+}
+
 class PythonAttentionMetadata;
 namespace npu {
 struct AclGraphTaskUpdateContext;
@@ -302,12 +329,45 @@ class BlockTransferInfo final {
   }
 };
 
+struct ExecutionBatchMetadata {
+  int32_t num_reqs = 0;
+  int64_t num_tokens = 0;
+  std::vector<int32_t> num_scheduled_tokens;
+  std::vector<int32_t> num_computed_tokens;
+  std::vector<int32_t> query_start_loc;
+  std::vector<uint8_t> is_prefilling;
+};
+
+inline void fill_request_layout(
+    ExecutionBatchMetadata& batch,
+    std::optional<std::span<const int32_t>> token_positions = std::nullopt) {
+  auto& starts = batch.query_start_loc;
+  const size_t num_reqs = batch.num_scheduled_tokens.size();
+  if (token_positions) {
+    batch.num_computed_tokens.resize(num_reqs);
+    starts.resize(num_reqs + 1);
+    starts[0] = 0;
+    for (size_t row = 0; row < num_reqs; ++row) {
+      const int32_t begin = starts[row];
+      batch.num_computed_tokens[row] = (*token_positions)[begin];
+      starts[row + 1] = begin + batch.num_scheduled_tokens[row];
+    }
+    return;
+  }
+  starts.reserve(num_reqs + 1);
+  starts.assign(1, 0);
+  std::partial_sum(batch.num_scheduled_tokens.begin(),
+                   batch.num_scheduled_tokens.end(),
+                   std::back_inserter(starts));
+}
+
 struct BatchInputMeta {
   BatchForwardType batch_forward_type;
   int32_t num_sequences = 0;
   int32_t actual_num_sequences = 0;
   int32_t kv_max_seq_len = 0;
   int32_t q_max_seq_len = 0;
+  ExecutionBatchMetadata execution_batch;
   uint64_t batch_id = 0;
   bool is_graph_warmup = false;
   // Engine-selected MTP depth for this task; zero keeps configured maximum.
@@ -331,6 +391,9 @@ class LlmEmbeddingInput final {
   // IntTensor: [n_seq]
   torch::Tensor linear_state_indices;
 
+  std::vector<int32_t> linear_state_read_ids;
+  torch::Tensor linear_state_read_indices;
+
   // request ids of each sequence, used by suffix decoding request identity
   std::vector<std::string> request_ids;
 
@@ -351,6 +414,9 @@ class LlmEmbeddingInput final {
     out.embedding_ids = embedding_ids;
     out.linear_state_ids = linear_state_ids;
     out.linear_state_indices = safe_to(linear_state_indices, device, true);
+    out.linear_state_read_ids = linear_state_read_ids;
+    out.linear_state_read_indices =
+        safe_to(linear_state_read_indices, device, true);
     out.request_ids = request_ids;
     out.extra_token_ids = extra_token_ids;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
@@ -633,6 +699,9 @@ class VlmEmbeddingInput final {
   // IntTensor: [n_seq]
   torch::Tensor linear_state_indices;
 
+  std::vector<int32_t> linear_state_read_ids;
+  torch::Tensor linear_state_read_indices;
+
   // request ids of each sequence, used by suffix decoding request identity
   std::vector<std::string> request_ids;
 
@@ -653,6 +722,9 @@ class VlmEmbeddingInput final {
     out.embedding_ids = embedding_ids;
     out.linear_state_ids = linear_state_ids;
     out.linear_state_indices = safe_to(linear_state_indices, device, true);
+    out.linear_state_read_ids = linear_state_read_ids;
+    out.linear_state_read_indices =
+        safe_to(linear_state_read_indices, device, true);
     out.request_ids = request_ids;
     out.extra_token_ids = extra_token_ids;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);

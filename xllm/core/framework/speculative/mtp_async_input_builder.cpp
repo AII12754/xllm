@@ -207,8 +207,8 @@ void prepare_draft_prefix_from_target(LlmForwardInput& draft_input,
   CHECK(accepted_tokens.device() == target_hidden.device());
   CHECK(accepted_tokens.device() == base_positions.device());
   CHECK(accepted_tokens.device() == base_kv_seq_lens.device());
-  CHECK(draft_input.sampling_params.selected_token_idxes.defined());
-  CHECK_EQ(draft_input.sampling_params.selected_token_idxes.numel(),
+  CHECK(draft_input.sampling_params.selected_token_idxes().defined());
+  CHECK_EQ(draft_input.sampling_params.selected_token_idxes().numel(),
            batch_size);
 
   const torch::Tensor offsets =
@@ -233,10 +233,11 @@ void prepare_draft_prefix_from_target(LlmForwardInput& draft_input,
       target_hidden.flatten(/*start_dim=*/0, /*end_dim=*/1);
   const torch::Tensor lengths =
       accepted_tokens.ge(0).sum(/*dim=*/1, /*keepdim=*/false, torch::kLong);
-  draft_input.sampling_params.selected_token_idxes =
+  draft_input.sampling_params.selected_token_idxes() =
       (torch::arange(batch_size, lengths.options()) * width + lengths - 1)
-          .to(draft_input.sampling_params.selected_token_idxes.options().device(
-              accepted_tokens.device()));
+          .to(draft_input.sampling_params.selected_token_idxes()
+                  .options()
+                  .device(accepted_tokens.device()));
   draft_input.runtime.device_tensors_ready = true;
 }
 

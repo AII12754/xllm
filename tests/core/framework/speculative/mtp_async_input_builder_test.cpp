@@ -298,6 +298,61 @@ TEST(MtpAsyncInputBuilderTest, RejectsPageCountBeyondBlockTableWidth) {
                "Expanded KV length exceeds block-table capacity");
 }
 
+TEST(MtpAsyncInputBuilderTest, PybindViewOwnsGlobalDpKvMaxSequenceLengths) {
+  ensure_xllm_torch_ops_registered();
+  if (!Py_IsInitialized()) {
+    setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0", 1);
+    Py_InitializeEx(0);
+  }
+  py::gil_scoped_acquire gil;
+  prepend_python_model_path();
+  py::module_::import("xllm.python._npu_bootstrap");
+  py::module_::import("xllm.python").attr("initialize_runtime")();
+  py::module_ main_module = py::module_::import("__main__");
+  if (!py::hasattr(main_module, "AttentionMetadataView")) {
+    register_attention_metadata_views(main_module);
+  }
+
+  auto metadata = std::make_shared<layer::AttentionMetadata>();
+  metadata->kv_seq_lens_vec = {1};
+  metadata->max_seq_len = 1;
+  metadata->is_dummy = true;
+  EXPECT_TRUE(
+      PyAttentionMetadataView(metadata).dp_global_kv_max_seq_lens().empty());
+
+  const std::vector<std::vector<int32_t>> histories = {{32769, 0}, {0, 32769}};
+  for (const std::vector<int32_t>& expected : histories) {
+    py::object py_metadata;
+    {
+      ModelParamsView params = ModelInputSnapshot(LlmModelParams()).view();
+      params.parallel.dp_global_token_nums = {expected[0] == 0 ? 0 : 1,
+                                              expected[1] == 0 ? 0 : 1};
+      params.parallel.dp_global_kv_max_seq_lens = expected;
+      py_metadata = py::cast(PyAttentionMetadataView(metadata, params));
+      EXPECT_EQ(py_metadata.attr("dp_global_kv_max_seq_lens")
+                    .cast<std::vector<int32_t>>(),
+                expected);
+
+      params.parallel.dp_global_kv_max_seq_lens = {7, 9};
+      EXPECT_EQ(py_metadata.attr("dp_global_kv_max_seq_lens")
+                    .cast<std::vector<int32_t>>(),
+                expected);
+    }
+
+    EXPECT_EQ(py_metadata.attr("dp_global_kv_max_seq_lens")
+                  .cast<std::vector<int32_t>>(),
+              expected);
+    py::list lengths = py_metadata.attr("dp_global_kv_max_seq_lens");
+    lengths[0] = py::int_(123);
+    EXPECT_EQ(py_metadata.attr("dp_global_kv_max_seq_lens")
+                  .cast<std::vector<int32_t>>(),
+              expected);
+    EXPECT_THROW(
+        py::setattr(py_metadata, "dp_global_kv_max_seq_lens", py::none()),
+        py::error_already_set);
+  }
+}
+
 TEST(MtpAsyncInputBuilderTest, PybindViewExposesLinearStateReadAndWriteSlots) {
   ensure_xllm_torch_ops_registered();
   if (!Py_IsInitialized()) {
@@ -320,15 +375,8 @@ TEST(MtpAsyncInputBuilderTest, PybindViewExposesLinearStateReadAndWriteSlots) {
   ModelParamsView params = ModelInputSnapshot(LlmModelParams()).view();
   params.embedding.linear_state_ids = {3, 7};
   params.embedding.linear_state_indices = torch::tensor({3, 7}, torch::kInt);
-
-  LinearStateCacheOp direct_read;
-  direct_read.linear_state_id = 3;
-  direct_read.restore_src_slot_id = 2;
-  LinearStateCacheOp legacy_restore;
-  legacy_restore.linear_state_id = 7;
-  legacy_restore.restore_requested = true;
-  legacy_restore.restore_src_slot_id = 6;
-  params.linear_state_cache_ops = {direct_read, legacy_restore};
+  params.embedding.linear_state_read_ids = {2, 6};
+  params.meta.batch_forward_type = BatchForwardType::PREFILL;
 
   py::object py_metadata = py::cast(PyAttentionMetadataView(metadata, params));
   EXPECT_TRUE(torch::equal(
@@ -339,7 +387,7 @@ TEST(MtpAsyncInputBuilderTest, PybindViewExposesLinearStateReadAndWriteSlots) {
       torch::tensor({3, 7}, torch::kInt)));
   EXPECT_TRUE(torch::equal(
       py_metadata.attr("linear_state_read_indices").cast<torch::Tensor>(),
-      torch::tensor({2, 7}, torch::kInt)));
+      torch::tensor({2, 6}, torch::kInt)));
   EXPECT_TRUE(py_metadata.attr("is_dummy").cast<bool>());
 }
 

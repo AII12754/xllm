@@ -103,7 +103,7 @@ constexpr PackedInputDomain packed_input_domain() {
   return PackedInputDomain::LLM;
 }
 constexpr uint64_t kPackedInputMagic = 0x584c4c4d494e5032;
-constexpr uint16_t kPackedInputSchemaVersion = 10;
+constexpr uint16_t kPackedInputSchemaVersion = 11;
 constexpr uint32_t kPackedInputHeaderBytes = 40;
 
 struct RawInputLayoutHeader final {
@@ -479,18 +479,6 @@ inline void write_bytes(RawInputSectionCursor& cursor,
     cursor.ptr += bytes;
   }
   cursor.size += bytes;
-}
-
-inline void write_linear_state_cache_ops(
-    RawInputSerializeContext& context,
-    const std::vector<LinearStateCacheOp>& cache_ops) {
-  write_data(context.descriptor, static_cast<uint64_t>(cache_ops.size()));
-  for (const LinearStateCacheOp& cache_op : cache_ops) {
-    write_data(context.descriptor, cache_op.linear_state_id);
-    write_data(context.descriptor, cache_op.reset_requested);
-    write_data(context.descriptor, cache_op.restore_requested);
-    write_data(context.descriptor, cache_op.restore_src_slot_id);
-  }
 }
 
 inline void write_padding(RawInputSectionCursor& cursor, uint64_t bytes) {
@@ -1239,20 +1227,6 @@ template <typename T>
 inline void read_data(ReadContext& context, T& data) {
   std::memcpy(&data, context.descriptor_cursor, sizeof(data));
   advance_descriptor_cursor(context, type_size<T>);
-}
-
-inline void read_linear_state_cache_ops(
-    ReadContext& context,
-    std::vector<LinearStateCacheOp>& cache_ops) {
-  uint64_t size;
-  read_data(context, size);
-  cache_ops.resize(size);
-  for (LinearStateCacheOp& cache_op : cache_ops) {
-    read_data(context, cache_op.linear_state_id);
-    read_data(context, cache_op.reset_requested);
-    read_data(context, cache_op.restore_requested);
-    read_data(context, cache_op.restore_src_slot_id);
-  }
 }
 
 template <typename T>
@@ -2617,6 +2591,12 @@ inline void deserialize_forward_input_payload(
   read_data(context, input_params.meta.q_max_seq_len);
   read_data(context, input_params.meta.batch_id);
   read_data(context, input_params.meta.is_graph_warmup);
+  read_data(context, input_params.meta.execution_batch.num_reqs);
+  read_data(context, input_params.meta.execution_batch.num_tokens);
+  read_vector(context, input_params.meta.execution_batch.num_scheduled_tokens);
+  read_vector(context, input_params.meta.execution_batch.num_computed_tokens);
+  read_vector(context, input_params.meta.execution_batch.query_start_loc);
+  read_vector(context, input_params.meta.execution_batch.is_prefilling);
   read_data(context, input_params.meta.mtp_draft_steps);
   read_data(context, input_params.meta.mtp_target_graph_rows);
   read_tensor_and_vector(context,
@@ -2678,13 +2658,17 @@ inline void deserialize_forward_input_payload(
   read_vector(context, input_params.parallel.dp_dspark_rounds_since_full_width);
   read_vector(context, input_params.embedding.embedding_ids);
   read_vector(context, input_params.embedding.linear_state_ids);
-  read_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
+  read_vector(context, input_params.embedding.linear_state_read_ids);
   normalize_linear_state_ids(input_params.embedding.linear_state_ids,
                              input_params.meta.num_sequences);
   if (materialize_device_buffer &&
       !input_params.embedding.linear_state_ids.empty()) {
     input_params.embedding.linear_state_indices =
         async_h2d_tensor(input_params.embedding.linear_state_ids, device);
+    if (!input_params.embedding.linear_state_read_ids.empty()) {
+      input_params.embedding.linear_state_read_indices = async_h2d_tensor(
+          input_params.embedding.linear_state_read_ids, device);
+    }
   }
   read_string_vector(context, input_params.embedding.request_ids);
   if constexpr (!std::is_same_v<Input, RecForwardInput>) {
@@ -2715,43 +2699,43 @@ inline void deserialize_forward_input_payload(
   read_data(context, selected_token_idxes_size);
   if (selected_token_idxes_size > 0) {
     auto& sampling_params = forward_input.sampling_params;
-    read_tensor(context, sampling_params.selected_token_idxes, stream);
-    read_tensor(context, sampling_params.filter_mask, stream);
-    read_tensor(context, sampling_params.filter_bitmask, stream);
-    read_tensor(context, sampling_params.frequency_penalties, stream);
-    read_tensor(context, sampling_params.presence_penalties, stream);
-    read_tensor(context, sampling_params.repetition_penalties, stream);
-    read_tensor(context, sampling_params.temperatures, stream);
-    read_tensor(context, sampling_params.top_p, stream);
-    read_tensor(context, sampling_params.min_p, stream);
-    read_tensor(context, sampling_params.logits_bias, stream);
-    read_tensor(context, sampling_params.min_token_positions, stream);
-    read_tensor(context, sampling_params.min_tokens_remaining, stream);
-    read_tensor(context, sampling_params.min_token_ids, stream);
-    read_tensor(context, sampling_params.seeds, stream);
-    read_tensor(context, sampling_params.seed_offsets, stream);
-    read_tensor(context, sampling_params.bad_words, stream);
-    read_tensor(context, sampling_params.bad_word_suffix, stream);
-    read_tensor(context, sampling_params.prefix_tokens, stream);
+    read_tensor(context, sampling_params.selected_token_idxes(), stream);
+    read_tensor(context, sampling_params.filter_mask(), stream);
+    read_tensor(context, sampling_params.filter_bitmask(), stream);
+    read_tensor(context, sampling_params.frequency_penalties(), stream);
+    read_tensor(context, sampling_params.presence_penalties(), stream);
+    read_tensor(context, sampling_params.repetition_penalties(), stream);
+    read_tensor(context, sampling_params.temperatures(), stream);
+    read_tensor(context, sampling_params.top_p(), stream);
+    read_tensor(context, sampling_params.min_p(), stream);
+    read_tensor(context, sampling_params.logits_bias(), stream);
+    read_tensor(context, sampling_params.min_token_positions(), stream);
+    read_tensor(context, sampling_params.min_tokens_remaining(), stream);
+    read_tensor(context, sampling_params.min_token_ids(), stream);
+    read_tensor(context, sampling_params.seeds(), stream);
+    read_tensor(context, sampling_params.seed_offsets(), stream);
+    read_tensor(context, sampling_params.bad_words(), stream);
+    read_tensor(context, sampling_params.bad_word_suffix(), stream);
+    read_tensor(context, sampling_params.prefix_tokens(), stream);
 
-    read_tensor(context, sampling_params.top_k, stream);
-    read_tensor(context, sampling_params.unique_token_ids, stream);
-    read_tensor(context, sampling_params.unique_token_counts, stream);
-    read_tensor(context, sampling_params.unique_token_ids_lens, stream);
-    read_tensor(context, sampling_params.do_sample, stream);
-    read_data(context, sampling_params.has_unseeded_sample);
-    read_data(context, sampling_params.num_random_rows);
-    read_data(context, sampling_params.sampling_mode);
-    read_data(context, sampling_params.logprobs);
-    read_data(context, sampling_params.is_embeddings);
-    read_data(context, sampling_params.max_top_logprobs);
-    read_data(context, sampling_params.num_return_sequences);
-    read_data(context, sampling_params.use_beam_search);
+    read_tensor(context, sampling_params.top_k(), stream);
+    read_tensor(context, sampling_params.unique_token_ids(), stream);
+    read_tensor(context, sampling_params.unique_token_counts(), stream);
+    read_tensor(context, sampling_params.unique_token_ids_lens(), stream);
+    read_tensor(context, sampling_params.do_sample(), stream);
+    read_data(context, sampling_params.has_unseeded_sample());
+    read_data(context, sampling_params.num_random_rows());
+    read_data(context, sampling_params.sampling_mode());
+    read_data(context, sampling_params.logprobs());
+    read_data(context, sampling_params.is_embeddings());
+    read_data(context, sampling_params.max_top_logprobs());
+    read_data(context, sampling_params.num_return_sequences());
+    read_data(context, sampling_params.use_beam_search());
   }
   forward_input.input_host_sample_count =
       static_cast<int32_t>(forward_input.sampling_params.num_sample_seqs());
   // acc_logprob
-  read_tensor(context, forward_input.sampling_params.acc_logprob, stream);
+  read_tensor(context, forward_input.sampling_params.acc_logprob(), stream);
   read_string_vector(context, forward_input.sample_sequence_ids);
   read_vector(context, forward_input.sample_prior_output_rows);
   read_json_object_state_snapshots(context,
@@ -2964,6 +2948,16 @@ inline void serialize_forward_input_sections(
   write_data(context.descriptor, input_params.meta.q_max_seq_len);
   write_data(context.descriptor, input_params.meta.batch_id);
   write_data(context.descriptor, input_params.meta.is_graph_warmup);
+  write_data(context.descriptor, input_params.meta.execution_batch.num_reqs);
+  write_data(context.descriptor, input_params.meta.execution_batch.num_tokens);
+  write_vector(context.descriptor,
+               input_params.meta.execution_batch.num_scheduled_tokens);
+  write_vector(context.descriptor,
+               input_params.meta.execution_batch.num_computed_tokens);
+  write_vector(context.descriptor,
+               input_params.meta.execution_batch.query_start_loc);
+  write_vector(context.descriptor,
+               input_params.meta.execution_batch.is_prefilling);
   write_data(context.descriptor, input_params.meta.mtp_draft_steps);
   write_data(context.descriptor, input_params.meta.mtp_target_graph_rows);
 
@@ -3027,7 +3021,8 @@ inline void serialize_forward_input_sections(
                input_params.parallel.dp_dspark_rounds_since_full_width);
   write_vector(context.descriptor, input_params.embedding.embedding_ids);
   write_vector(context.descriptor, input_params.embedding.linear_state_ids);
-  write_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
+  write_vector(context.descriptor,
+               input_params.embedding.linear_state_read_ids);
   write_string_vector(context.descriptor, input_params.embedding.request_ids);
   if constexpr (!std::is_same_v<Input, RecForwardInput>) {
     write_vector(context.descriptor, input_params.embedding.extra_token_ids);
@@ -3057,41 +3052,41 @@ inline void serialize_forward_input_sections(
       static_cast<uint64_t>(sampling_params.num_sample_seqs());
   write_data(context.descriptor, selected_token_idxes_size);
   if (selected_token_idxes_size > 0) {
-    write_tensor(context, sampling_params.selected_token_idxes);
-    write_tensor(context, sampling_params.filter_mask);
-    write_tensor(context, sampling_params.filter_bitmask);
-    write_tensor(context, sampling_params.frequency_penalties);
-    write_tensor(context, sampling_params.presence_penalties);
-    write_tensor(context, sampling_params.repetition_penalties);
-    write_tensor(context, sampling_params.temperatures);
-    write_tensor(context, sampling_params.top_p);
-    write_tensor(context, sampling_params.min_p);
-    write_tensor(context, sampling_params.logits_bias);
-    write_tensor(context, sampling_params.min_token_positions);
-    write_tensor(context, sampling_params.min_tokens_remaining);
-    write_tensor(context, sampling_params.min_token_ids);
-    write_tensor(context, sampling_params.seeds);
-    write_tensor(context, sampling_params.seed_offsets);
-    write_tensor(context, sampling_params.bad_words);
-    write_tensor(context, sampling_params.bad_word_suffix);
-    write_tensor(context, sampling_params.prefix_tokens);
+    write_tensor(context, sampling_params.selected_token_idxes());
+    write_tensor(context, sampling_params.filter_mask());
+    write_tensor(context, sampling_params.filter_bitmask());
+    write_tensor(context, sampling_params.frequency_penalties());
+    write_tensor(context, sampling_params.presence_penalties());
+    write_tensor(context, sampling_params.repetition_penalties());
+    write_tensor(context, sampling_params.temperatures());
+    write_tensor(context, sampling_params.top_p());
+    write_tensor(context, sampling_params.min_p());
+    write_tensor(context, sampling_params.logits_bias());
+    write_tensor(context, sampling_params.min_token_positions());
+    write_tensor(context, sampling_params.min_tokens_remaining());
+    write_tensor(context, sampling_params.min_token_ids());
+    write_tensor(context, sampling_params.seeds());
+    write_tensor(context, sampling_params.seed_offsets());
+    write_tensor(context, sampling_params.bad_words());
+    write_tensor(context, sampling_params.bad_word_suffix());
+    write_tensor(context, sampling_params.prefix_tokens());
 
-    write_tensor(context, sampling_params.top_k);
-    write_tensor(context, sampling_params.unique_token_ids);
-    write_tensor(context, sampling_params.unique_token_counts);
-    write_tensor(context, sampling_params.unique_token_ids_lens);
-    write_tensor(context, sampling_params.do_sample);
-    write_data(context.descriptor, sampling_params.has_unseeded_sample);
-    write_data(context.descriptor, sampling_params.num_random_rows);
-    write_data(context.descriptor, sampling_params.sampling_mode);
-    write_data(context.descriptor, sampling_params.logprobs);
-    write_data(context.descriptor, sampling_params.is_embeddings);
-    write_data(context.descriptor, sampling_params.max_top_logprobs);
-    write_data(context.descriptor, sampling_params.num_return_sequences);
-    write_data(context.descriptor, sampling_params.use_beam_search);
+    write_tensor(context, sampling_params.top_k());
+    write_tensor(context, sampling_params.unique_token_ids());
+    write_tensor(context, sampling_params.unique_token_counts());
+    write_tensor(context, sampling_params.unique_token_ids_lens());
+    write_tensor(context, sampling_params.do_sample());
+    write_data(context.descriptor, sampling_params.has_unseeded_sample());
+    write_data(context.descriptor, sampling_params.num_random_rows());
+    write_data(context.descriptor, sampling_params.sampling_mode());
+    write_data(context.descriptor, sampling_params.logprobs());
+    write_data(context.descriptor, sampling_params.is_embeddings());
+    write_data(context.descriptor, sampling_params.max_top_logprobs());
+    write_data(context.descriptor, sampling_params.num_return_sequences());
+    write_data(context.descriptor, sampling_params.use_beam_search());
   }
 
-  write_tensor(context, sampling_params.acc_logprob);
+  write_tensor(context, sampling_params.acc_logprob());
   write_string_vector(context.descriptor, input.sample_sequence_ids);
   write_vector(context.descriptor, input.sample_prior_output_rows);
   write_json_object_state_snapshots(context.descriptor,
@@ -3462,20 +3457,22 @@ bool unpack_native_input_host_buffer(const Input& input,
     }
   };
   if (materialize_device_buffer) {
-    normalize_float_param(output.sampling_params.frequency_penalties);
-    normalize_float_param(output.sampling_params.presence_penalties);
-    normalize_float_param(output.sampling_params.repetition_penalties);
-    normalize_float_param(output.sampling_params.temperatures);
-    normalize_float_param(output.sampling_params.top_p);
-    normalize_float_param(output.sampling_params.min_p);
+    normalize_float_param(output.sampling_params.frequency_penalties());
+    normalize_float_param(output.sampling_params.presence_penalties());
+    normalize_float_param(output.sampling_params.repetition_penalties());
+    normalize_float_param(output.sampling_params.temperatures());
+    normalize_float_param(output.sampling_params.top_p());
+    normalize_float_param(output.sampling_params.min_p());
     if constexpr (std::is_same_v<Input, RecForwardInput>) {
-      normalize_float_param(output.decoder_sampling_params.frequency_penalties);
-      normalize_float_param(output.decoder_sampling_params.presence_penalties);
       normalize_float_param(
-          output.decoder_sampling_params.repetition_penalties);
-      normalize_float_param(output.decoder_sampling_params.temperatures);
-      normalize_float_param(output.decoder_sampling_params.top_p);
-      normalize_float_param(output.decoder_sampling_params.min_p);
+          output.decoder_sampling_params.frequency_penalties());
+      normalize_float_param(
+          output.decoder_sampling_params.presence_penalties());
+      normalize_float_param(
+          output.decoder_sampling_params.repetition_penalties());
+      normalize_float_param(output.decoder_sampling_params.temperatures());
+      normalize_float_param(output.decoder_sampling_params.top_p());
+      normalize_float_param(output.decoder_sampling_params.min_p());
     }
     output.positions = detail::normalize_positions_for_device(output.positions);
     return output.runtime.device_tensors_ready;
@@ -3561,9 +3558,9 @@ bool token_input_to_packed_proto(
   // The packed layout stores the per-sequence fields as flat vectors;
   // anything else (e.g. a reshaped [1, N] view) would serialize with a
   // mismatched shape and corrupt the unpack-side sample count.
-  if ((sampling.selected_token_idxes.defined() &&
-       sampling.selected_token_idxes.dim() != 1) ||
-      (sampling.do_sample.defined() && sampling.do_sample.dim() != 1)) {
+  if ((sampling.selected_token_idxes().defined() &&
+       sampling.selected_token_idxes().dim() != 1) ||
+      (sampling.do_sample().defined() && sampling.do_sample().dim() != 1)) {
     LOG(ERROR) << "Packed sampling fields must be 1-D vectors";
     return false;
   }

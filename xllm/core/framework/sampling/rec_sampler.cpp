@@ -49,9 +49,10 @@ static inline bool use_air_log_softmax_env() {
 
 // Check if fast path sampling can be used for multi-round pipeline.
 static inline bool can_use_fast_path(const SamplingParameters& params) {
-  return params.use_beam_search && params.logprobs &&
+  return params.use_beam_search() && params.logprobs() &&
          ::xllm::RecConfig::get_instance().enable_rec_fast_sampler() &&
-         params.max_top_logprobs > 0 && !params.has_post_penalty_transforms() &&
+         params.max_top_logprobs() > 0 &&
+         !params.has_post_penalty_transforms() &&
          !::xllm::ModelConfig::get_instance().enable_qwen3_reranker() &&
          ::xllm::RecConfig::get_instance().max_decode_rounds() > 0;
 }
@@ -180,7 +181,7 @@ SampleOutput RecSampler::OneRecConstrainedSamplingStrategy::forward(
     const torch::Tensor& filter_mask,
     const RecSamplingContext* context) const {
   if (context != nullptr && context->device_constrained_sampler &&
-      !params.filter_mask.defined() && !params.min_p.defined()) {
+      !params.filter_mask().defined() && !params.min_p().defined()) {
     auto sampled = context->device_constrained_sampler(logits,
                                                        params,
                                                        context->sequence_group,
@@ -191,9 +192,9 @@ SampleOutput RecSampler::OneRecConstrainedSamplingStrategy::forward(
     }
   }
 
-  if (!(params.use_beam_search &&
-        params.sampling_mode == SamplingMode::RANDOM && params.logprobs &&
-        params.max_top_logprobs > 0)) {
+  if (!(params.use_beam_search() &&
+        params.sampling_mode() == SamplingMode::RANDOM && params.logprobs() &&
+        params.max_top_logprobs() > 0)) {
     return sample(logits, params, filter_mask);
   }
 
@@ -207,7 +208,7 @@ SampleOutput RecSampler::OneRecConstrainedSamplingStrategy::forward(
   auto probs = logprobs.exp();
 
   const int64_t vocab_size = probs.size(-1);
-  const int64_t top_count = std::min<int64_t>(params.max_top_logprobs,
+  const int64_t top_count = std::min<int64_t>(params.max_top_logprobs(),
                                               static_cast<int64_t>(vocab_size));
   sample_top_candidates(
       probs, logprobs, top_count, &output.top_tokens, &output.top_logprobs);
@@ -242,7 +243,7 @@ SampleOutput RecSampler::MultiRoundFastPathSamplingStrategy::forward(
   CHECK_EQ(logits.size(0), params.num_sample_seqs());
 
   auto [topk_values, topk_indices] = logits.topk(
-      params.max_top_logprobs,
+      params.max_top_logprobs(),
       /*dim=*/-1,
       /*largest=*/true,
       /*sorted=*/::xllm::BeamSearchConfig::get_instance().enable_topk_sorted());
@@ -251,8 +252,8 @@ SampleOutput RecSampler::MultiRoundFastPathSamplingStrategy::forward(
                           : topk_indices.to(torch::kLong);
 
   torch::Tensor temperatures;
-  if (params.temperatures.defined()) {
-    temperatures = params.temperatures.to(torch::kFloat32);
+  if (params.temperatures().defined()) {
+    temperatures = params.temperatures().to(torch::kFloat32);
   }
 
   output.top_logprobs = log_softmax_last_dim(topk_values, temperatures);

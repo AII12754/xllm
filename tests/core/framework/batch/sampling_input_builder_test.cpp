@@ -102,12 +102,12 @@ TEST(SamplingInputBuilderTest, MergesConstraintsAndIndependentSeedOffsets) {
                 &sequence);
   first.merge(std::move(second), /*token_offset=*/1);
   auto result = first.build();
-  EXPECT_EQ(result.logits_bias[0].sum().item<float>(), 0.0F);
-  EXPECT_TRUE(std::isinf(result.logits_bias[1][1].item<float>()));
-  EXPECT_EQ(result.logits_bias[1][2].item<float>(), 5.0F);
-  EXPECT_EQ(result.seeds[0].item<int64_t>(), -1);
-  EXPECT_EQ(result.seeds[1].item<int64_t>(), 42);
-  EXPECT_EQ(result.seed_offsets[1].item<int64_t>(), (int64_t{2} << 32) + 1);
+  EXPECT_EQ(result.logits_bias()[0].sum().item<float>(), 0.0F);
+  EXPECT_TRUE(std::isinf(result.logits_bias()[1][1].item<float>()));
+  EXPECT_EQ(result.logits_bias()[1][2].item<float>(), 5.0F);
+  EXPECT_EQ(result.seeds()[0].item<int64_t>(), -1);
+  EXPECT_EQ(result.seeds()[1].item<int64_t>(), 42);
+  EXPECT_EQ(result.seed_offsets()[1].item<int64_t>(), (int64_t{2} << 32) + 1);
 }
 
 TEST(SamplingInputBuilderTest, PromptAffectsRepetitionButNotOutputCounts) {
@@ -120,10 +120,11 @@ TEST(SamplingInputBuilderTest, PromptAffectsRepetitionButNotOutputCounts) {
   sequence.append_token(Token(2));
   sequence.append_token(Token(3));
   auto result = build_row(params, sequence);
-  ASSERT_EQ(result.unique_token_ids_lens[0].item<int32_t>(), 3);
+  ASSERT_EQ(result.unique_token_ids_lens()[0].item<int32_t>(), 3);
   for (int64_t column = 0; column < 3; ++column) {
-    const int64_t token = result.unique_token_ids[0][column].item<int64_t>();
-    const int32_t count = result.unique_token_counts[0][column].item<int32_t>();
+    const int64_t token = result.unique_token_ids()[0][column].item<int64_t>();
+    const int32_t count =
+        result.unique_token_counts()[0][column].item<int32_t>();
     EXPECT_EQ(count, token == 1 ? 0 : 1);
   }
 }

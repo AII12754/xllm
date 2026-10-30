@@ -71,25 +71,26 @@ void ordinary_sampling(benchmark::State& state) {
       torch::randn({rows, vocab}, options.dtype(dtype));
   torch::Tensor working = torch::empty_like(original);
   SamplingParameters params;
-  params.sampling_mode = mode == 1 ? SamplingMode::MIXED : SamplingMode::RANDOM;
-  params.num_random_rows = mode == 1 ? (rows + 3) / 4 : rows;
-  params.has_unseeded_sample = mode == 2;
-  params.logprobs = mode >= 3;
-  params.max_top_logprobs = mode == 4 ? 5 : 0;
+  params.sampling_mode() =
+      mode == 1 ? SamplingMode::MIXED : SamplingMode::RANDOM;
+  params.num_random_rows() = mode == 1 ? (rows + 3) / 4 : rows;
+  params.has_unseeded_sample() = mode == 2;
+  params.logprobs() = mode >= 3;
+  params.max_top_logprobs() = mode == 4 ? 5 : 0;
   if (mode != 2) {
-    params.seeds = torch::arange(rows, options.dtype(torch::kInt64));
-    params.seed_offsets = torch::zeros_like(params.seeds);
+    params.seeds() = torch::arange(rows, options.dtype(torch::kInt64));
+    params.seed_offsets() = torch::zeros_like(params.seeds());
   }
-  params.temperatures =
+  params.temperatures() =
       torch::full({rows}, 0.7, options.dtype(torch::kFloat32));
-  params.top_k = torch::full({rows}, 20, options.dtype(torch::kInt64));
-  params.top_p = torch::full({rows}, 0.95, options.dtype(torch::kFloat32));
+  params.top_k() = torch::full({rows}, 20, options.dtype(torch::kInt64));
+  params.top_p() = torch::full({rows}, 0.95, options.dtype(torch::kFloat32));
   if (mode == 1) {
-    params.do_sample =
+    params.do_sample() =
         torch::arange(rows, options.dtype(torch::kInt64)).remainder(4).eq(0);
-    params.temperatures.masked_fill_(params.do_sample.logical_not(), 0);
-    params.top_k.masked_fill_(params.do_sample.logical_not(), 0);
-    params.top_p.masked_fill_(params.do_sample.logical_not(), 1);
+    params.temperatures().masked_fill_(params.do_sample().logical_not(), 0);
+    params.top_k().masked_fill_(params.do_sample().logical_not(), 0);
+    params.top_p().masked_fill_(params.do_sample().logical_not(), 1);
   }
   configure(mask);
   for (int64_t warmup = 0; warmup < 5; ++warmup) {
@@ -139,8 +140,8 @@ void verification(benchmark::State& state, bool point_mass) {
       torch::randn({rows * (steps + 1), vocab}, options);
   torch::Tensor working = torch::empty_like(original);
   SamplingParameters params;
-  params.sampling_mode = SamplingMode::RANDOM;
-  params.logprobs = state.range(4) != 0;
+  params.sampling_mode() = SamplingMode::RANDOM;
+  params.logprobs() = state.range(4) != 0;
   configure(mask);
   const auto execute = [&]() {
     if (point_mass) {

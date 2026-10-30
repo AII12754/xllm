@@ -38,19 +38,19 @@ inline SamplingMode sampling_mode_from_do_sample(
 
 inline SamplingParameters make_sampling_params(const torch::Tensor& do_sample) {
   SamplingParameters params;
-  params.do_sample = do_sample;
+  params.do_sample() = do_sample;
   if (do_sample.defined()) {
-    params.selected_token_idxes =
+    params.selected_token_idxes() =
         arange_indices(do_sample.size(0), torch::Device(torch::kCPU));
   }
-  params.sampling_mode = sampling_mode_from_do_sample(do_sample);
+  params.sampling_mode() = sampling_mode_from_do_sample(do_sample);
   return params;
 }
 
 // All-greedy batch; do_sample stays undefined as in production.
 inline SamplingParameters make_sampling_params(int64_t batch_size) {
   SamplingParameters params;
-  params.selected_token_idxes =
+  params.selected_token_idxes() =
       arange_indices(batch_size, torch::Device(torch::kCPU));
   return params;
 }
@@ -60,7 +60,7 @@ inline SamplingParameters make_sampling_params(int64_t batch_size) {
 inline SamplingParameters make_sampling_params(int64_t batch_size,
                                                SamplingMode mode) {
   SamplingParameters params = make_sampling_params(batch_size);
-  params.sampling_mode = mode;
+  params.sampling_mode() = mode;
   return params;
 }
 
@@ -68,8 +68,8 @@ inline SamplingParameters make_rejection_params(const torch::Tensor& do_sample,
                                                 bool logprobs = false,
                                                 int64_t max_top_logprobs = 0) {
   SamplingParameters params = make_sampling_params(do_sample);
-  params.logprobs = logprobs;
-  params.max_top_logprobs = max_top_logprobs;
+  params.logprobs() = logprobs;
+  params.max_top_logprobs() = max_top_logprobs;
   return params;
 }
 

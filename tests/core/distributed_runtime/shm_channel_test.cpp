@@ -377,11 +377,11 @@ TEST_F(ShmChannelTest, RecPreflightRejectsUnsupportedFieldsBeforePublishing) {
                                     ForwardType::RAW_INPUT);
   ASSERT_TRUE(is_creator);
   RecForwardInput input;
-  input.decoder_sampling_params.selected_token_idxes =
+  input.decoder_sampling_params.selected_token_idxes() =
       torch::tensor({0}, torch::kInt32);
   EXPECT_FALSE(ForwardSharedMemoryManager::can_write_input(input, kInputBytes));
   EXPECT_FALSE(writer.input_write(input));
-  input.decoder_sampling_params.selected_token_idxes = torch::Tensor();
+  input.decoder_sampling_params.selected_token_idxes() = torch::Tensor();
   input.step_decode.emplace();
   EXPECT_FALSE(ForwardSharedMemoryManager::can_write_input(input, kInputBytes));
   EXPECT_FALSE(writer.input_write(input));

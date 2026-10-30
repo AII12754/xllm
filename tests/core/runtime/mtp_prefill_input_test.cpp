@@ -40,7 +40,7 @@ class MtpPrefillInputTest : public ::testing::Test {
         TaskPipelineTestPeer::create_mtp_input(
             {{8, 2, 2}, /*hidden_size=*/3}, torch::kBFloat16, device_, input_)
             .ok());
-    sampling_.selected_token_idxes = torch::tensor({3}, torch::kInt32);
+    sampling_.selected_token_idxes() = torch::tensor({3}, torch::kInt32);
     hidden_ = torch::arange(12, torch::kFloat32)
                   .view({4, 3})
                   .to(device_, torch::kBFloat16);
@@ -208,7 +208,7 @@ TEST_F(MtpPrefillInputTest, ShiftAndBootstrapRespectChunkBoundaries) {
 
 TEST_F(MtpPrefillInputTest, SamplingOrderControlsPublicationOrder) {
   extra_[0] = -1;
-  sampling_.selected_token_idxes = torch::tensor({3, 2}, torch::kInt32);
+  sampling_.selected_token_idxes() = torch::tensor({3, 2}, torch::kInt32);
   samples_ = torch::tensor({{90}, {80}}, torch::kInt64).to(device_);
   run();
   const auto rows =
@@ -248,7 +248,7 @@ TEST_F(MtpPrefillInputTest, RejectedSamplingLeavesActiveMappingAndStorage) {
   const void* tokens = input_->tokens().data_ptr();
   const auto before = input_->tokens().cpu();
   Stream prepare(device_);
-  sampling_.selected_token_idxes = torch::tensor({1}, torch::kInt32);
+  sampling_.selected_token_idxes() = torch::tensor({1}, torch::kInt32);
   EXPECT_FALSE(TaskPipelineTestPeer::prepare_mtp_prefill(
                    *input_, host(), batch_, extra_, sampling_, prepare)
                    .ok());
@@ -258,7 +258,7 @@ TEST_F(MtpPrefillInputTest, RejectedSamplingLeavesActiveMappingAndStorage) {
   EXPECT_EQ(rows[0], 1U);
   EXPECT_EQ(input_->tokens().data_ptr(), tokens);
   EXPECT_TRUE(torch::equal(input_->tokens().cpu(), before));
-  sampling_.selected_token_idxes = torch::tensor({3}, torch::kInt32);
+  sampling_.selected_token_idxes() = torch::tensor({3}, torch::kInt32);
   extra_[0] = -1;
   EXPECT_FALSE(TaskPipelineTestPeer::prepare_mtp_prefill(
                    *input_, host(), batch_, extra_, sampling_, prepare)
@@ -277,7 +277,7 @@ TEST_F(MtpPrefillInputTest, DecodeRowsCanRefreshStateDuringPeerPrefill) {
       tokens, positions, slots, q, kv, ends, blocks_, 2};
   const ModelInputBatch batch{BatchForwardType::DECODE, 2, 82, false};
   SamplingParameters sampling;
-  sampling.selected_token_idxes = torch::tensor({0, 1}, torch::kInt32);
+  sampling.selected_token_idxes() = torch::tensor({0, 1}, torch::kInt32);
   Stream prepare(device_);
   ASSERT_TRUE(TaskPipelineTestPeer::prepare_mtp_prefill(
                   *input_, view, batch, extra, sampling, prepare)
@@ -320,7 +320,7 @@ TEST_F(MtpPrefillInputTest, BorrowedHiddenSurvivesProducerReleaseAndSlotReuse) {
       input_->model_params().embedding.input_embedding.cpu(), expected));
   TaskPipelineTestPeer::context_release(*state_);
   extra_[0] = -1;
-  sampling_.selected_token_idxes = torch::tensor({2, 3}, torch::kInt32);
+  sampling_.selected_token_idxes() = torch::tensor({2, 3}, torch::kInt32);
   samples_ = torch::tensor({{80}, {90}}, torch::kInt64).to(device_);
   hidden_ = torch::full(
       {4, 3},

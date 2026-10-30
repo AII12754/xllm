@@ -133,10 +133,10 @@ void JsonObjectDecodeContinuation::advance_constraints(
     input.json_object_errors.push_back(
         {sequence_id, "prior token violates json_object grammar"});
   }
-  input.sampling_params.filter_bitmask =
+  input.sampling_params.filter_bitmask() =
       constraints.build_filter_bitmask(device);
   // Prefer compact bitmask; clear dense float mask to avoid duplicate H2D.
-  input.sampling_params.filter_mask = torch::Tensor();
+  input.sampling_params.filter_mask() = torch::Tensor();
 }
 
 template <typename Input>
