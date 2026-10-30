@@ -944,7 +944,7 @@ add_subdirectory(tests)
 
 # Keep the test-only control out of unrelated libraries and normal builds.
 if(BUILD_NPU_SAMPLING_ABLATION)
-  foreach(sampling_target IN ITEMS sampler speculative runtime
+  foreach(sampling_target IN ITEMS sampler speculative runtime tilelang_kernels
                                    npu_sampling_benchmark sampler_test)
     if(TARGET ${sampling_target})
       target_compile_definitions(${sampling_target}

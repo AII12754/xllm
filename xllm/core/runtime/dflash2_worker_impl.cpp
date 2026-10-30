@@ -22,6 +22,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <memory>
 #include <utility>
 
 #include "common/metrics.h"
@@ -141,9 +142,10 @@ DraftProposal sample_dflash2_path(const DFlash2CandidateOutput& candidates,
   }
 
   if (sparse_distribution) {
-    return DraftProposal::from_sparse(std::move(token_ids),
-                                      candidates.candidate_ids.clone(),
-                                      std::move(draft_logits));
+    return DraftProposal(
+        std::move(token_ids),
+        std::make_unique<SparseDraftDistribution>(
+            candidates.candidate_ids.clone(), std::move(draft_logits)));
   }
   return DraftProposal(std::move(token_ids), std::move(draft_logits));
 }
@@ -224,16 +226,15 @@ DraftProposal DFlash2WorkerImpl::run_decode_draft(
        num_speculative_tokens,
        draft_output->selected_hidden.size(-1)});
 
-  DraftProposal draft_proposal;
-  {
+  DraftProposal draft_proposal = [&] {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     DFlash2CandidateOutput candidates =
         draft_impl_->dflash2_candidates(hidden_states, unary_logits, anchors);
-    draft_proposal = sample_dflash2_path(candidates,
-                                         draft_sampling_params,
-                                         selector_noise,
-                                         unary_logits.size(/*dim=*/-1));
-  }
+    return sample_dflash2_path(candidates,
+                               draft_sampling_params,
+                               selector_noise,
+                               unary_logits.size(/*dim=*/-1));
+  }();
   draft_proposal.keep_alive() = take_retained_inputs(*draft_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               draft_timer.elapsed_seconds());

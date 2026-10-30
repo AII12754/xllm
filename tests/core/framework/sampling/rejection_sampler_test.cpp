@@ -28,6 +28,7 @@ limitations under the License.
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <tuple>
 
 #include "core/framework/sampling/npu_sampling_policy.h"
@@ -379,6 +380,77 @@ TEST_P(SparseDraftTest, PreservesRoundedTopLogprobTieIds) {
   EXPECT_TRUE(torch::equal(actual.top_logprobs, expected_values));
 }
 
+TEST_P(SparseDraftTest, GrammarRejectionDoesNotReplacePointMassProposal) {
+  const auto options = torch::TensorOptions().device(std::get<0>(GetParam()));
+  const auto ids_options = options.dtype(torch::kInt64);
+  const torch::Tensor tokens = torch::tensor({{1, 2}, {1, 2}}, ids_options);
+  const DraftProposal proposal(tokens);
+  const torch::Tensor invalid = torch::tensor({{true, false}, {false, true}},
+                                              options.dtype(torch::kBool));
+  const torch::Tensor target =
+      torch::full({6, 4}, -INFINITY, options)
+          .scatter_(1,
+                    torch::tensor({{1}, {2}, {3}, {1}, {2}, {3}}, ids_options),
+                    0.0F);
+  SamplingParameters params;
+  params.sampling_mode = SamplingMode::RANDOM;
+  const SampleOutput masked =
+      rejection_sample(params, proposal, target.clone(), invalid);
+  EXPECT_TRUE(
+      torch::equal(masked.next_tokens,
+                   torch::tensor({{1, -1, -1}, {1, 2, -1}}, ids_options)));
+  const SampleOutput unmasked =
+      rejection_sample(params, proposal, target.clone());
+  EXPECT_TRUE(torch::equal(unmasked.next_tokens,
+                           torch::tensor({{1, 2, 3}, {1, 2, 3}}, ids_options)));
+  EXPECT_TRUE(torch::equal(proposal.token_ids(), tokens));
+}
+
+TEST_P(SparseDraftTest, PointMassMatchesOneHotDenseVerification) {
+  const auto options = torch::TensorOptions().device(std::get<0>(GetParam()));
+  for (const int64_t rows : {1, 8}) {
+    const torch::Tensor tokens =
+        torch::tensor({{1, 2}}, options.dtype(torch::kInt64)).repeat({rows, 1});
+    // Include a forced rejection alongside nontrivial acceptance probabilities.
+    tokens.select(0, 0).select(0, 1).fill_(-1);
+    const torch::Tensor dense_logits =
+        torch::full({rows, 2, 4}, -INFINITY, options)
+            .scatter_(-1, tokens.clamp_min(0).unsqueeze(-1), 0.0F);
+    const torch::Tensor target =
+        torch::tensor({{{0.1F, 0.2F, 0.3F, 0.4F}, {0.4F, 0.3F, 0.2F, 0.1F}}},
+                      options)
+            .repeat({rows, 1, 1});
+    const DraftProposal point_mass(tokens);
+    const DraftProposal dense(tokens, dense_logits);
+    for (const int64_t seed : {1, 42, 100}) {
+      EXPECT_TRUE(torch::equal(sample_sparse_draft(point_mass, target, seed),
+                               sample_sparse_draft(dense, target, seed)));
+    }
+  }
+}
+
+TEST_P(SparseDraftTest, SelectedLogprobsPreserveLargeCommonOffsets) {
+  const auto options = torch::TensorOptions()
+                           .device(std::get<0>(GetParam()))
+                           .dtype(torch::kBFloat16);
+  const torch::Tensor tokens =
+      torch::zeros({64, 2}, options.dtype(torch::kInt64));
+  SamplingParameters params;
+  params.sampling_mode = SamplingMode::GREEDY;
+  params.logprobs = true;
+  for (const float offset : {8192.0F, 1e8F}) {
+    torch::Tensor logits = torch::full({192, 65536}, offset, options);
+    const torch::Tensor expected =
+        torch::log_softmax(logits.view({64, 3, 65536}), -1, torch::kFloat32)
+            .select(-1, 0);
+    const SampleOutput actual =
+        rejection_sample(params, DraftProposal(tokens), logits);
+    EXPECT_TRUE(torch::allclose(actual.logprobs, expected, 1e-5, 5e-6));
+    EXPECT_TRUE(torch::equal(actual.next_tokens,
+                             torch::zeros({64, 3}, tokens.options())));
+  }
+}
+
 TEST_P(SparseDraftTest, MatchesDenseWideVocabularyVerification) {
   const auto options = torch::TensorOptions()
                            .device(std::get<0>(GetParam()))
@@ -413,7 +485,10 @@ TEST_P(SparseDraftTest, MatchesDenseWideVocabularyVerification) {
 #endif
   torch::manual_seed(42);
   const SampleOutput actual = rejection_sample(
-      params, DraftProposal::from_sparse(tokens, ids, small_logits), target);
+      params,
+      DraftProposal(
+          tokens, std::make_unique<SparseDraftDistribution>(ids, small_logits)),
+      target);
   EXPECT_TRUE(torch::equal(actual.next_tokens, expected.next_tokens));
   EXPECT_TRUE(torch::allclose(actual.logprobs, expected.logprobs, 1e-5, 5e-6));
 }
@@ -440,8 +515,9 @@ TEST_P(SparseDraftTest, MatchesDenseSupportAndSentinelRecovery) {
       {{{0.0F, 1.0F, 0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F, 0.0F}},
        {{0.0F, 0.0F, 0.0F, 0.0F, 1.0F}, {0.0F, 0.0F, 1.0F, 0.0F, 0.0F}}},
       options);
-  const DraftProposal sparse =
-      DraftProposal::from_sparse(tokens, candidates, sparse_logits);
+  const DraftProposal sparse = DraftProposal(
+      tokens,
+      std::make_unique<SparseDraftDistribution>(candidates, sparse_logits));
   const torch::Tensor sparse_result =
       sample_sparse_draft(sparse, target_probs, 123);
   const torch::Tensor dense_result = sample_sparse_draft(
@@ -478,7 +554,9 @@ TEST_P(SparseDraftTest, MatchesDenseRandomRejection) {
     const torch::Tensor dense_result = sample_sparse_draft(
         DraftProposal(tokens, dense_logits), target_probs, seed);
     const torch::Tensor sparse_result = sample_sparse_draft(
-        DraftProposal::from_sparse(tokens, candidates, sparse_logits),
+        DraftProposal(tokens,
+                      std::make_unique<SparseDraftDistribution>(candidates,
+                                                                sparse_logits)),
         target_probs,
         seed);
     EXPECT_TRUE(torch::equal(sparse_result, dense_result));
@@ -505,7 +583,9 @@ TEST_P(SparseDraftTest, RecoveredDistributionMatchesTarget) {
     const torch::Tensor tokens =
         candidates.gather(-1, selected.unsqueeze(-1)).squeeze(-1);
     const torch::Tensor output = sample_sparse_draft(
-        DraftProposal::from_sparse(tokens, candidates, logits),
+        DraftProposal(
+            tokens,
+            std::make_unique<SparseDraftDistribution>(candidates, logits)),
         target,
         100 + round);
     counts.add_(output.select(1, 0).cpu().bincount({}, 4));

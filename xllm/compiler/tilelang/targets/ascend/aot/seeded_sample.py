@@ -15,14 +15,14 @@
 import tilelang
 from compiler.tilelang.common.spec import DispatchField, TilelangKernel, register_kernel
 
+from xllm.python.kernels_npu.tilelang import sampling_common
 from xllm.python.kernels_npu.tilelang import seeded_sample as kernel_impl
 from xllm.python.kernels_npu.tilelang import utils as tilelang_utils
 from xllm.python.kernels_npu.tilelang.seeded_sample import (
-    SEEDED_SAMPLE_PASS_CONFIGS,
     build_seeded_sample_kernel,
 )
 
-DEPENDENCY_MODULES = (kernel_impl, tilelang_utils)
+DEPENDENCY_MODULES = (kernel_impl, sampling_common, tilelang_utils)
 
 
 @register_kernel
@@ -34,6 +34,6 @@ class SeededSampleKernel(TilelangKernel):
     def generate_source(task_count: int) -> str:
         tilelang.disable_cache()
         kernel = build_seeded_sample_kernel(task_count)
-        with tilelang.tvm.transform.PassContext(opt_level=3, config=SEEDED_SAMPLE_PASS_CONFIGS):
+        with tilelang.tvm.transform.PassContext(opt_level=3, config=sampling_common.SAMPLING_PASS_CONFIGS):
             lowered = tilelang.engine.lower(kernel)
         return lowered.kernel_source

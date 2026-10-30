@@ -12,49 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Request-seeded categorical selection from nonnegative row weights."""
+"""A-only ablation kernel for request-seeded sampling from row weights."""
 
 import tilelang.language as T
 from tilelang import tvm
 
-from .utils import DEFAULT_ASCEND_PASS_CONFIGS
-
-MAX_ROWS = 4096
-MAX_VOCAB = 262144
-TILE_SIZE = 4096
-MAX_CHUNKS = MAX_VOCAB // TILE_SIZE
-SEEDED_SAMPLE_PASS_CONFIGS = {
-    **DEFAULT_ASCEND_PASS_CONFIGS,
-    "tl.ascend_auto_cross_core_sync": False,
-    "tl.ascend_auto_cv_combine": False,
-}
-
-
-@T.macro
-def select_categorical_half(
-    half: int,
-    tile: tvm.tir.Buffer,
-    reduced: tvm.tir.Buffer,
-    right: tvm.tir.Buffer,
-    scratch: tvm.tir.Buffer,
-    state: tvm.tir.Buffer,
-    choice: tvm.tir.Buffer,
-) -> None:
-    T.tile.fill(scratch, 0.0)
-    T.copy(tile[choice[1] : choice[1] + half], scratch[:half])
-    T.reduce_sum(scratch, reduced, dim=0)
-    T.set_flag("v", "s", 7)
-    T.wait_flag("v", "s", 7)
-    T.tile.fill(scratch, 0.0)
-    T.copy(tile[choice[1] + half : choice[1] + 2 * half], scratch[:half])
-    T.reduce_sum(scratch, right, dim=0)
-    T.set_flag("v", "s", 7)
-    T.wait_flag("v", "s", 7)
-    if right[0] > 0.0 and (state[3] >= reduced[0] or reduced[0] == 0.0):
-        state[3] = T.min(T.max(state[3] - reduced[0], 0.0), right[0] * (1.0 - 2.0**-24))
-        choice[1] = choice[1] + half
-    else:
-        state[3] = T.min(state[3], reduced[0] * (1.0 - 2.0**-24))
+from .sampling_common import (
+    MAX_CHUNKS,
+    MAX_ROWS,
+    MAX_VOCAB,
+    TILE_SIZE,
+    select_categorical_chunk,
+    select_categorical_tile,
+)
 
 
 def build_seeded_sample_kernel(task_count: int = 48) -> tvm.tir.PrimFunc:
@@ -111,37 +81,9 @@ def build_seeded_sample_kernel(task_count: int = 48) -> tvm.tir.PrimFunc:
                             chunks[chunk] = reduced[0]
                             state[0] = state[0] + reduced[0]
 
-                        uniform = T.alloc_var("float32", 0.0)
-                        if (rng_flags & 1) == 0 and (rng_flags & 2) != 0:
-                            uniform = uniforms[row]
-                        if (rng_flags & 1) != 0:
-                            if seeds[row] == -1 and (rng_flags & 2) != 0:
-                                uniform = uniforms[row]
-                            if seeds[row] != -1:
-                                value = T.alloc_var(
-                                    "uint64",
-                                    T.Cast("uint64", seeds[row])
-                                    + T.Cast("uint64", offsets[row])
-                                    * ((T.uint64(0x9E3779B9) << 32) | T.uint64(0x7F4A7C15)),
-                                )
-                                value = (value ^ (value >> 30)) * ((T.uint64(0xBF58476D) << 32) | T.uint64(0x1CE4E5B9))
-                                value = (value ^ (value >> 27)) * ((T.uint64(0x94D049BB) << 32) | T.uint64(0x133111EB))
-                                value = value ^ (value >> 31)
-                                uniform = T.Cast("float32", T.Cast("int32", value >> 40)) * (1.0 / (1 << 24))
-
-                        # Half-open intervals; clamp rounding at the last row
-                        # endpoint. Positive lower bounds give one owner even
-                        # when independently rounded interval ends disagree.
-                        state[1] = T.min(uniform * state[0], state[0] * (1.0 - 2.0**-24))
-                        state[2] = 0.0
-                        choice[0] = 0
-                        state[3] = 0.0
-                        for chunk in T.serial(n_chunks):
-                            if chunks[chunk] > 0.0 and state[2] <= state[1]:
-                                choice[0] = chunk
-                                state[3] = T.min(T.max(state[1] - state[2], 0.0), chunks[chunk] * (1.0 - 2.0**-24))
-                            state[2] = state[2] + chunks[chunk]
-
+                        select_categorical_chunk(
+                            seeds, offsets, uniforms, row, rng_flags, n_chunks, chunks, state, choice
+                        )
                         count = T.min(TILE_SIZE, vocab - choice[0] * TILE_SIZE)
                         T.tile.fill(tile, 0.0)
                         T.copy(
@@ -154,21 +96,7 @@ def build_seeded_sample_kernel(task_count: int = 48) -> tvm.tir.PrimFunc:
                         )
                         # Reduce a binary tree in UB. The final 32 values are
                         # scalar to avoid unsupported sub-block vector slices.
-                        choice[1] = 0
-                        select_categorical_half(2048, tile, reduced, right, scratch, state, choice)
-                        select_categorical_half(1024, tile, reduced, right, scratch, state, choice)
-                        select_categorical_half(512, tile, reduced, right, scratch, state, choice)
-                        select_categorical_half(256, tile, reduced, right, scratch, state, choice)
-                        select_categorical_half(128, tile, reduced, right, scratch, state, choice)
-                        select_categorical_half(64, tile, reduced, right, scratch, state, choice)
-                        select_categorical_half(32, tile, reduced, right, scratch, state, choice)
-                        choice[2] = choice[1]
-                        state[2] = 0.0
-                        for column in T.serial(32):
-                            weight = tile[choice[1] + column]
-                            if weight > 0.0 and state[2] <= state[3]:
-                                choice[2] = choice[1] + column
-                            state[2] = state[2] + weight
+                        select_categorical_tile(tile, reduced, right, scratch, state, choice)
                         result[0] = T.Cast("int64", choice[0] * TILE_SIZE + choice[2])
                         T.copy(result[:1], output[row : row + 1])
 

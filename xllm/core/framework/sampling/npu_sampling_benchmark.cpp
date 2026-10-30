@@ -26,6 +26,7 @@ limitations under the License.
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <string_view>
 
@@ -118,7 +119,7 @@ void ordinary_sampling(benchmark::State& state) {
   state.counters["vocab"] = static_cast<double>(vocab);
 }
 
-void sparse_verification(benchmark::State& state) {
+void verification(benchmark::State& state, bool point_mass) {
   auto generator = at_npu::detail::getDefaultNPUGenerator(0);
   generator.set_current_seed(42);
   const int64_t rows = state.range(0);
@@ -142,12 +143,16 @@ void sparse_verification(benchmark::State& state) {
   params.logprobs = state.range(4) != 0;
   configure(mask);
   const auto execute = [&]() {
+    if (point_mass) {
+      return rejection_sample(params, DraftProposal(tokens), working);
+    }
     // Include both compact-q production and verification. The dense leg uses
     // one scatter, conservatively cheaper than the worker's per-step scatters.
     const DraftProposal proposal =
         (mask & 16) != 0
-            ? DraftProposal::from_sparse(
-                  tokens, ids.clone(), small_logits.clone())
+            ? DraftProposal(tokens,
+                            std::make_unique<SparseDraftDistribution>(
+                                ids.clone(), small_logits.clone()))
             : DraftProposal(tokens,
                             torch::full({rows, steps, vocab},
                                         -std::numeric_limits<float>::infinity(),
@@ -178,10 +183,20 @@ void sparse_verification(benchmark::State& state) {
   state.counters["peak_extra_bytes"] = static_cast<double>(
       c10_npu::NPUCachingAllocator::getDeviceStats(0).allocated_bytes[0].peak -
       allocated_before);
-  state.counters["dense_q_bytes"] =
-      static_cast<double>(rows * steps * vocab * 4);
-  state.counters["sparse_q_bytes"] =
-      static_cast<double>(rows * steps * kSupport * 12);
+  if (!point_mass) {
+    state.counters["dense_q_bytes"] =
+        static_cast<double>(rows * steps * vocab * 4);
+    state.counters["sparse_q_bytes"] =
+        static_cast<double>(rows * steps * kSupport * 12);
+  }
+}
+
+void sparse_verification(benchmark::State& state) {
+  verification(state, /*point_mass=*/false);
+}
+
+void point_mass_verification(benchmark::State& state) {
+  verification(state, /*point_mass=*/true);
 }
 
 BENCHMARK(ordinary_sampling)
@@ -199,6 +214,14 @@ BENCHMARK(sparse_verification)
                    {0, 8, 16, 24, 32, 40, 48, 56},
                    {248320},
                    {0, 1}})
+    ->ArgNames({"B", "S", "mask", "V", "logprobs"})
+    ->UseRealTime()
+    ->Unit(benchmark::kMicrosecond);
+// Keep deterministic draft costs visible even when D/G do not dispatch.
+// Mask 0 still uses the current interface; compare executable revisions when
+// assessing changes shared by every ablation variant.
+BENCHMARK(point_mass_verification)
+    ->ArgsProduct({{1, 2, 8, 32}, {1, 7}, {0, 56}, {49152, 248320}, {0, 1}})
     ->ArgNames({"B", "S", "mask", "V", "logprobs"})
     ->UseRealTime()
     ->Unit(benchmark::kMicrosecond);

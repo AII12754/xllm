@@ -58,7 +58,6 @@ torch::Tensor seeded_sample(const torch::Tensor& weights,
   CHECK_EQ(weights.scalar_type(), torch::kFloat32);
   CHECK_EQ(weights.dim(), 2);
   CHECK_EQ(weights.stride(1), 1);
-  CHECK_GE(weights.size(0), 0);
   CHECK_LE(weights.size(0), kMaxRows);
   CHECK_GT(weights.size(1), 0);
   CHECK_LE(weights.size(1), kMaxVocab);

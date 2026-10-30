@@ -17,48 +17,94 @@ limitations under the License.
 
 #include <torch/types.h>
 
-#include <variant>
+#include <cstdint>
 
 namespace xllm {
 
-// Value-semantic strategy for q. Representation details stay outside the
-// sampler. Normalizers belong to one verify call: producers populate logits
-// after creation.
-class DraftDistribution final {
+// Verification operations for the draft distribution q. Producers finish
+// populating proposal tokens and distribution tensors before publishing them.
+class DraftDistribution {
  public:
-  DraftDistribution() = default;
-  explicit DraftDistribution(torch::Tensor logits);
-  static DraftDistribution from_sparse(torch::Tensor candidate_ids,
-                                       torch::Tensor logits);
+  virtual ~DraftDistribution() = default;
 
-  // FP32 [batch, steps] normalizers, undefined for a deterministic draft.
-  torch::Tensor logsumexp() const;
-  // Subtract normalized log q(token_ids) from log_p in place.
-  void subtract_log_prob(torch::Tensor& log_p,
-                         const torch::Tensor& token_ids,
-                         const torch::Tensor& lse) const;
+  // FP32 [batch, steps] normalizers; undefined for a point mass.
+  virtual torch::Tensor logsumexp() const = 0;
+  // Replace log_p [batch, steps] with log(p/q) at the proposed tokens.
+  // token_ids are their nonnegative gather indices; the verifier separately
+  // rejects negative sentinel positions. This is a proposal operation, not
+  // an arbitrary-token probability query.
+  virtual void apply_acceptance(torch::Tensor& log_p,
+                                const torch::Tensor& token_ids,
+                                const torch::Tensor& lse) const = 0;
   // Replace log_p [batch, vocab] with log((p - q)+) at the selected steps.
-  // A negative rejected token removes q entirely, recovering directly from p.
+  // Negative rejected tokens disable q, recovering directly from p.
+  virtual void apply_residual(torch::Tensor& log_p,
+                              const torch::Tensor& steps,
+                              const torch::Tensor& rejected_tokens,
+                              const torch::Tensor& lse) const = 0;
+
+  // Metadata-only compatibility check, performed when a proposal is built.
+  void validate(const torch::Tensor& token_ids) const;
+
+ protected:
+  DraftDistribution(const torch::Tensor& values, int64_t rank);
+
+ private:
+  int64_t batch_size_;
+  int64_t num_steps_;
+  torch::Device device_{torch::kCPU};
+};
+
+class PointMassDraftDistribution final : public DraftDistribution {
+ public:
+  // q is concentrated at each proposal token. The proposal owns those tokens;
+  // this representation needs only their metadata, with no probability buffer.
+  explicit PointMassDraftDistribution(const torch::Tensor& token_ids);
+
+  torch::Tensor logsumexp() const override;
+  void apply_acceptance(torch::Tensor& log_p,
+                        const torch::Tensor& token_ids,
+                        const torch::Tensor& lse) const override;
   void apply_residual(torch::Tensor& log_p,
                       const torch::Tensor& steps,
                       const torch::Tensor& rejected_tokens,
-                      const torch::Tensor& lse) const;
+                      const torch::Tensor& lse) const override;
+};
 
-  void validate(const torch::Tensor& token_ids) const;
-  // Producer view for preallocated dense buffers; undefined for other forms.
-  torch::Tensor dense_logits() const;
+class DenseDraftDistribution final : public DraftDistribution {
+ public:
+  explicit DenseDraftDistribution(torch::Tensor logits);
+
+  torch::Tensor logsumexp() const override;
+  void apply_acceptance(torch::Tensor& log_p,
+                        const torch::Tensor& token_ids,
+                        const torch::Tensor& lse) const override;
+  void apply_residual(torch::Tensor& log_p,
+                      const torch::Tensor& steps,
+                      const torch::Tensor& rejected_tokens,
+                      const torch::Tensor& lse) const override;
 
  private:
-  struct Deterministic {};
-  struct Dense {
-    torch::Tensor logits;
-  };
-  struct Sparse {
-    torch::Tensor token_ids;
-    torch::Tensor logits;
-  };
-  explicit DraftDistribution(Sparse sparse);
-  std::variant<Deterministic, Dense, Sparse> storage_;
+  torch::Tensor logits_;
+};
+
+class SparseDraftDistribution final : public DraftDistribution {
+ public:
+  // IDs are unique within each support row and index the target vocabulary.
+  SparseDraftDistribution(torch::Tensor candidate_ids, torch::Tensor logits);
+
+  torch::Tensor logsumexp() const override;
+  void apply_acceptance(torch::Tensor& log_p,
+                        const torch::Tensor& token_ids,
+                        const torch::Tensor& lse) const override;
+  void apply_residual(torch::Tensor& log_p,
+                      const torch::Tensor& steps,
+                      const torch::Tensor& rejected_tokens,
+                      const torch::Tensor& lse) const override;
+
+ private:
+  torch::Tensor candidate_ids_;
+  torch::Tensor logits_;
 };
 
 }  // namespace xllm

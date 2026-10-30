@@ -22,6 +22,7 @@ limitations under the License.
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <tuple>
 
 #if defined(USE_NPU)
 #include <torch_npu/csrc/aten/NPUGeneratorImpl.h>
@@ -133,10 +134,12 @@ SampleOutput sample(torch::Tensor& logits,
 #endif
   const torch::Tensor raw_logits =
       compact_logprobs ? logits.clone() : torch::Tensor();
-  torch::Tensor raw_lse;
+  torch::Tensor raw_max;
+  torch::Tensor raw_log_sum;
 #if defined(USE_NPU)
   if (compact_logprobs) {
-    raw_lse = kernel::npu::tilelang::row_logsumexp(logits);
+    std::tie(raw_max, raw_log_sum) =
+        kernel::npu::tilelang::row_log_normalization(logits);
   }
 #endif
   const torch::Tensor raw_logprobs =
@@ -176,14 +179,17 @@ SampleOutput sample(torch::Tensor& logits,
         (!params.seeds.defined() || params.has_unseeded_sample)
             ? torch::rand({logits.size(0)}, uniform_options)
             : torch::Tensor();
-    if (npu_sampling_enabled(NpuSamplingOptimization::FUSED_LOGITS)) {
-      samples = kernel::npu::tilelang::sampling_logits(
-          logits, params.seeds, params.seed_offsets, uniforms);
-    } else {
+#if defined(XLLM_NPU_SAMPLING_ABLATION)
+    if (!npu_sampling_enabled(NpuSamplingOptimization::FUSED_LOGITS)) {
       const torch::Tensor weights =
           torch::softmax(logits, /*dim=*/-1, torch::kFloat32);
       samples = kernel::npu::tilelang::seeded_sample(
           weights, params.seeds, params.seed_offsets, uniforms);
+    } else
+#endif
+    {
+      samples = kernel::npu::tilelang::sampling_logits(
+          logits, params.seeds, params.seed_offsets, uniforms);
     }
     if (params.sampling_mode == SamplingMode::MIXED) {
       samples = torch::where(
@@ -241,7 +247,8 @@ SampleOutput sample(torch::Tensor& logits,
       output.logprobs = raw_logits.gather(/*dim=*/-1, samples.view({-1, 1}))
                             .to(torch::kFloat32)
                             .view({-1})
-                            .sub(raw_lse);
+                            .sub(raw_max)
+                            .sub_(raw_log_sum);
       return output;
     }
     if (::xllm::ModelConfig::get_instance().enable_qwen3_reranker()) {

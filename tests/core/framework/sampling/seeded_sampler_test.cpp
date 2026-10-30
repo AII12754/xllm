@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch_npu/csrc/aten/NPUGeneratorImpl.h>
 
 #include <array>
+#include <cmath>
 #include <limits>
 
 #include "core/framework/sampling/logits_processor.h"
@@ -81,7 +82,9 @@ TEST(SeededSamplerTest, NpuRequestsAreReproducibleAndIsolated) {
   EXPECT_TRUE(torch::equal(before, global_generator.get_state()));
 }
 
-TEST(SeededSamplerTest, NpuCategoricalHandlesTailsZerosAndUniformEndpoints) {
+#if defined(XLLM_NPU_SAMPLING_ABLATION)
+TEST(SeededSamplerTest,
+     NpuWeightsSamplingHandlesTailsZerosAndUniformEndpoints) {
   const torch::Device device(torch::kPrivateUse1, 0);
   for (const int64_t vocab : {int64_t{1},
                               int64_t{31},
@@ -116,13 +119,20 @@ TEST(SeededSamplerTest, NpuCategoricalHandlesTailsZerosAndUniformEndpoints) {
   }
 }
 
+#endif
+
 TEST(SeededSamplerTest, NpuLogitsSamplingHandlesDtypesTailsAndMissingSeeds) {
   const torch::Device device(torch::kPrivateUse1, 0);
   constexpr int64_t kRows = 49;
   for (const torch::ScalarType dtype :
        {torch::kFloat32, torch::kBFloat16, torch::kFloat16}) {
-    for (const int64_t vocab :
-         {int64_t{1}, int64_t{33}, int64_t{4097}, int64_t{248320}}) {
+    for (const int64_t vocab : {int64_t{1},
+                                int64_t{31},
+                                int64_t{33},
+                                int64_t{4095},
+                                int64_t{4096},
+                                int64_t{4097},
+                                int64_t{248320}}) {
       torch::Tensor storage = torch::full(
           {kRows, vocab + 8}, -std::numeric_limits<float>::infinity());
       torch::Tensor logits = storage.narrow(1, 0, vocab);
@@ -144,6 +154,88 @@ TEST(SeededSamplerTest, NpuLogitsSamplingHandlesDtypesTailsAndMissingSeeds) {
   }
 }
 
+TEST(SeededSamplerTest,
+     NpuLogitsSelectionMatchesIndependentDoublePrecisionCdf) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  constexpr int64_t kRows = 49;
+  for (const torch::ScalarType dtype :
+       {torch::kFloat32, torch::kBFloat16, torch::kFloat16}) {
+    for (const int64_t vocab : {int64_t{1},
+                                int64_t{33},
+                                int64_t{4097},
+                                int64_t{65539},
+                                int64_t{248320}}) {
+      // Deterministic nonuniform rows, padding, zero-mass chunks and tail IDs.
+      const torch::Tensor columns = torch::arange(vocab, torch::kFloat64);
+      const torch::Tensor rows =
+          torch::arange(kRows, torch::kFloat64).unsqueeze(1);
+      torch::Tensor values = (columns * 0.37 + rows * 0.73).sin().mul(3.0);
+      values.masked_fill_(columns.remainder(11).eq(3), -INFINITY);
+      if (vocab > 4096) {
+        values.select(0, 0).narrow(0, 0, 4096).fill_(-INFINITY);
+      }
+      torch::Tensor storage = torch::empty({kRows, vocab + 8}, dtype);
+      storage.narrow(1, 0, vocab).copy_(values);
+      // The reference uses the actual quantized input, not its FP64 precursor.
+      const torch::Tensor quantized =
+          storage.narrow(1, 0, vocab).to(torch::kFloat64);
+      const torch::Tensor cdf = torch::softmax(quantized, -1).cumsum(-1);
+      torch::Tensor uniforms = torch::linspace(0.0, 1.0, kRows);
+      uniforms.select(0, kRows - 1).fill_(1.0F - 0x1p-24F);
+      const torch::Tensor selected = kernel::npu::tilelang::sampling_logits(
+                                         storage.to(device).narrow(1, 0, vocab),
+                                         {},
+                                         {},
+                                         uniforms.to(device))
+                                         .cpu()
+                                         .unsqueeze(1);
+      ASSERT_TRUE(
+          selected.ge(0).logical_and(selected.lt(vocab)).all().item<bool>());
+      EXPECT_TRUE(
+          torch::isfinite(quantized.gather(1, selected)).all().item<bool>());
+      const torch::Tensor upper = cdf.gather(1, selected).squeeze(1);
+      const torch::Tensor lower = cdf.gather(1, (selected - 1).clamp_min(0))
+                                      .masked_fill_(selected.eq(0), 0)
+                                      .squeeze(1);
+      const torch::Tensor u = uniforms.to(torch::kFloat64);
+      EXPECT_LE((lower - u).clamp_min(0).max().item<double>(), 2e-6)
+          << "vocab=" << vocab << ", dtype=" << dtype;
+      EXPECT_LE((u - upper).clamp_min(0).max().item<double>(), 2e-6)
+          << "vocab=" << vocab << ", dtype=" << dtype;
+    }
+  }
+}
+
+TEST(SeededSamplerTest, NpuCompactLogprobsAreInvariantToLargeCommonOffsets) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  constexpr int64_t kRows = 128;
+  constexpr int64_t kVocab = 65536;
+  SamplingParameters params;
+  params.sampling_mode = SamplingMode::GREEDY;
+  params.logprobs = true;
+  for (const torch::ScalarType dtype :
+       {torch::kFloat32, torch::kBFloat16, torch::kFloat16}) {
+    for (const float offset : {0.0F, 8192.0F, 60000.0F, 1e8F}) {
+      if (dtype == torch::kFloat16 && offset > 65504.0F) {
+        continue;
+      }
+      torch::Tensor logits =
+          torch::full({kRows, kVocab},
+                      offset,
+                      torch::TensorOptions().device(device).dtype(dtype));
+      const SampleOutput actual = sample(logits, params);
+      EXPECT_TRUE(
+          torch::allclose(actual.logprobs,
+                          torch::full({kRows},
+                                      -std::log(kVocab),
+                                      logits.options().dtype(torch::kFloat32)),
+                          /*rtol=*/1e-5,
+                          /*atol=*/5e-6))
+          << "offset=" << offset << ", dtype=" << dtype;
+    }
+  }
+}
+
 TEST(SeededSamplerTest, NpuCategoricalPreservesSupportAndDistribution) {
   const torch::Device device(torch::kPrivateUse1, 0);
   constexpr int64_t kRows = 4096;
@@ -153,15 +245,21 @@ TEST(SeededSamplerTest, NpuCategoricalPreservesSupportAndDistribution) {
       torch::arange(kRows, torch::TensorOptions().dtype(torch::kInt64))
           .to(device);
   const torch::Tensor offsets = torch::zeros_like(seeds);
-  const torch::Tensor actual = kernel::npu::tilelang::seeded_sample(
-      weights, seeds, offsets, torch::empty({kRows}, weights.options()));
-  const torch::Tensor counts = actual.cpu().bincount({}, 4);
-  constexpr std::array<double, 4> kProbabilities = {0.1, 0.3, 0.0, 0.6};
-  for (int64_t token = 0; token < 4; ++token) {
-    const double observed = counts[token].item<double>() / kRows;
-    EXPECT_NEAR(observed, kProbabilities[token], 0.025);
-  }
-  EXPECT_EQ(counts[2].item<int64_t>(), 0);
+  const auto check_distribution = [](const torch::Tensor& samples) {
+    const torch::Tensor counts = samples.cpu().bincount({}, 4);
+    constexpr std::array<double, 4> kProbabilities = {0.1, 0.3, 0.0, 0.6};
+    for (int64_t token = 0; token < 4; ++token) {
+      const double observed = counts[token].item<double>() / kRows;
+      EXPECT_NEAR(observed, kProbabilities[token], 0.025);
+    }
+    EXPECT_EQ(counts[2].item<int64_t>(), 0);
+  };
+  check_distribution(kernel::npu::tilelang::sampling_logits(
+      weights.log(), seeds, offsets, {}));
+#if defined(XLLM_NPU_SAMPLING_ABLATION)
+  check_distribution(
+      kernel::npu::tilelang::seeded_sample(weights, seeds, offsets, {}));
+#endif
 }
 
 TEST(SeededSamplerTest,

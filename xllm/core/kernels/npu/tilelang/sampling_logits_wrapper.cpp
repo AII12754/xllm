@@ -65,9 +65,11 @@ torch::Tensor run_sampling_logits(const torch::Tensor& logits,
   }
 
   const c10_npu::NPUGuard guard(logits.device());
-  torch::Tensor output = torch::empty(
-      {logits.size(0)},
-      logits.options().dtype(normalize_only ? torch::kFloat32 : torch::kInt64));
+  torch::Tensor output =
+      normalize_only ? torch::empty({logits.size(0), 2},
+                                    logits.options().dtype(torch::kFloat32))
+                     : torch::empty({logits.size(0)},
+                                    logits.options().dtype(torch::kInt64));
   if (logits.size(0) == 0) {
     return output;
   }
@@ -120,8 +122,12 @@ torch::Tensor sampling_logits(const torch::Tensor& logits,
                              /*normalize_only=*/false);
 }
 
-torch::Tensor row_logsumexp(const torch::Tensor& logits) {
-  return run_sampling_logits(logits, {}, {}, {}, /*normalize_only=*/true);
+std::tuple<torch::Tensor, torch::Tensor> row_log_normalization(
+    const torch::Tensor& logits) {
+  const torch::Tensor values =
+      run_sampling_logits(logits, {}, {}, {}, /*normalize_only=*/true);
+  return {values.select(/*dim=*/1, /*index=*/0),
+          values.select(/*dim=*/1, /*index=*/1)};
 }
 
 }  // namespace xllm::kernel::npu::tilelang
