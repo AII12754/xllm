@@ -87,9 +87,9 @@ DEFINE_int64(max_linear_state_cache_slots,
 
 DEFINE_uint32(xxh3_128bits_seed, 1024, "Default XXH3 128-bits hash seed.");
 
-DEFINE_bool(enable_virtual_memory,
+DEFINE_bool(enable_vmm_kvcache,
             false,
-            "Whether to enable virtual memory for model weights and KV cache "
+            "Whether to enable virtual memory for KV cache "
             "with the physical page pool.");
 
 DEFINE_int64(
@@ -111,7 +111,7 @@ void KVCacheConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_in_batch_prefix_cache);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_linear_state_cache_slots);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(xxh3_128bits_seed);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_virtual_memory);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_vmm_kvcache);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(vmm_elastic);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(vmm_memory_reserve_bytes);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(vmm_startup_timeout_ms);
@@ -134,7 +134,7 @@ void KVCacheConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_in_batch_prefix_cache);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_linear_state_cache_slots);
   XLLM_CONFIG_ASSIGN_FROM_JSON(xxh3_128bits_seed);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_virtual_memory);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_vmm_kvcache);
   XLLM_CONFIG_ASSIGN_FROM_JSON(vmm_elastic);
   XLLM_CONFIG_ASSIGN_FROM_JSON(vmm_memory_reserve_bytes);
   XLLM_CONFIG_ASSIGN_FROM_JSON(vmm_startup_timeout_ms);
@@ -171,7 +171,7 @@ void KVCacheConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, xxh3_128bits_seed);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_virtual_memory);
+      config_json, default_config, enable_vmm_kvcache);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, vmm_elastic);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
@@ -204,7 +204,7 @@ void KVCacheConfig::validate() const {
   CHECK_GE(max_memory_utilization_, 0.0);
   CHECK_GT(phy_page_granularity_size_, 0);
   CHECK_GE(max_cache_size_, 0);
-  if (!enable_virtual_memory_ || !vmm_elastic_) {
+  if (!enable_vmm_kvcache_ || !vmm_elastic_) {
     CHECK_GT(max_memory_utilization_, 0.0)
         << "Only elastic VMM supports an unset utilization ceiling (0)";
   }

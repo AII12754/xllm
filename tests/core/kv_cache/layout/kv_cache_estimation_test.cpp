@@ -24,9 +24,12 @@ limitations under the License.
 #include "core/kv_cache/layout/deepseek_v4_cache_policy.h"
 #include "framework/model/model_args.h"
 #include "runtime/options.h"
+#include "tests/core/kv_cache/dcp_indexer_test_fixture.h"
 
 namespace xllm {
 namespace {
+
+class DcpIndexerEstimationTest : public test::DcpIndexerConfigTest {};
 
 ModelArgs make_standard_args() {
   ModelArgs model_args;
@@ -85,6 +88,43 @@ TEST(KVCacheEstimationTest, RuntimeBudgetCapsBeforeVlmEncoderReservation) {
       KVCacheEstimator(model_args).estimate(runtime_options, context);
 
   // min(8 MiB - 20%, 5 MiB) - 1 MiB = 4 MiB.
+  EXPECT_EQ(capacity.cache_size_in_bytes(), 4 * 1024 * 1024);
+}
+
+TEST(KVCacheEstimationTest, SleepingWeightsKeepTheirFutureDeviceCapacity) {
+  ModelArgs model_args = make_standard_args();
+  runtime::Options runtime_options;
+  runtime_options.max_memory_utilization(0.9).block_size(16);
+
+  constexpr int64_t kGiB = 1024LL * 1024 * 1024;
+  KVCacheEstimateContext context;
+  context.dtype = torch::kFloat16;
+  context.worker_memory = {{80 * kGiB, 80 * kGiB}};
+  // The residency coordinator includes TP rounding and its safety pages.
+  context.reserved_memory_bytes = 10 * kGiB;
+
+  const KVCacheCapacity capacity =
+      KVCacheEstimator(model_args).estimate(runtime_options, context);
+
+  // Keep both the 10 GiB weight demand and the 8 GiB utilization headroom.
+  EXPECT_EQ(capacity.cache_size_in_bytes(), 62 * kGiB);
+}
+
+TEST(KVCacheEstimationTest, SleepingWeightReservationPrecedesExplicitKvCap) {
+  ModelArgs model_args = make_standard_args();
+  runtime::Options runtime_options;
+  runtime_options.max_memory_utilization(1.0)
+      .max_cache_size(4 * 1024 * 1024)
+      .block_size(16);
+
+  KVCacheEstimateContext context;
+  context.dtype = torch::kFloat16;
+  context.worker_memory = {{16 * 1024 * 1024, 16 * 1024 * 1024}};
+  context.reserved_memory_bytes = 8 * 1024 * 1024;
+
+  const KVCacheCapacity capacity =
+      KVCacheEstimator(model_args).estimate(runtime_options, context);
+
   EXPECT_EQ(capacity.cache_size_in_bytes(), 4 * 1024 * 1024);
 }
 
@@ -400,6 +440,34 @@ TEST(KVCacheEstimationTest, ReservesLinearAttentionState) {
   EXPECT_EQ(capacity.n_blocks(), 254);
 }
 
+TEST(KVCacheEstimationTest, MultimodalRuntimeReservesMtpCheckpoints) {
+  ModelArgs model_args = make_linear_attention_args();
+  model_args.model_type("qwen3_5");
+  runtime::Options runtime_options;
+  runtime_options.block_size(16)
+      .max_seqs_per_batch(8)
+      .max_linear_state_cache_slots(16)
+      .num_speculative_tokens(4);
+
+  KVCacheEstimateContext context;
+  context.dtype = torch::kFloat16;
+  context.world_size = 1;
+  context.virtual_memory_cache_size = 1024 * 1024;
+  context.is_multimodal = true;
+
+  const KVCacheCapacity capacity =
+      KVCacheEstimator(model_args).estimate(runtime_options, context);
+
+  EXPECT_EQ(capacity.linear_ssm_checkpoint_stride(), 5);
+  EXPECT_EQ(capacity.linear_conv_state_len(), 6);
+
+  runtime_options.num_speculative_tokens(0);
+  const KVCacheCapacity without_mtp =
+      KVCacheEstimator(model_args).estimate(runtime_options, context);
+  EXPECT_EQ(without_mtp.linear_ssm_checkpoint_stride(), 1);
+  EXPECT_EQ(without_mtp.linear_conv_state_len(), 2);
+}
+
 #if defined(USE_MLU)
 TEST(KVCacheEstimationTest, KPoolReservesSpeculativeTailWithRequestState) {
   ModelArgs args = make_linear_attention_args();
@@ -431,6 +499,84 @@ TEST(KVCacheEstimationTest, KPoolReservesSpeculativeTailWithRequestState) {
   EXPECT_EQ(speculative.n_blocks(), capacity.n_blocks());
 }
 #endif
+
+TEST(KVCacheEstimationTest, SharedKPoolPlanAlignsStateBeforeBudgeting) {
+  // Supply the compressed-tail layout directly: backend estimators select
+  // different layouts, while the shared planner operates on capacities.
+  KVCacheCapacity target_cap;
+  target_cap.kpool_layout(KPoolCacheLayout::COMPRESSED_WITH_TAIL)
+      .block_size(32)
+      .n_layers(2)
+      .num_full_attention_layers(2)
+      .num_indexer_layers(2)
+      .slot_size(64)
+      .index_slot_size(16)
+      .num_linear_state_blocks(4)
+      .kpool_tail_len(16)
+      .kpool_tail_slot_size(2048)
+      .linear_cache_size_in_bytes(16384)
+      .cache_size_in_bytes(65536);
+
+  for (const int32_t draft_kpool : {4, 32}) {
+    for (const int64_t draft_slots : {3, 5}) {
+      SCOPED_TRACE(::testing::Message() << "draft_kpool=" << draft_kpool
+                                        << ", draft_slots=" << draft_slots);
+      ModelArgs draft_args;
+      draft_args.index_head_dim(64).index_kpool(draft_kpool);
+      KVCacheCapacity draft_cap;
+      draft_cap.kpool_layout(KPoolCacheLayout::COMPRESSED_WITH_TAIL)
+          .block_size(32)
+          .n_layers(1)
+          .num_full_attention_layers(1)
+          .num_indexer_layers(1)
+          .slot_size(128)
+          .index_slot_size(draft_kpool == 4 ? 32 : 4)
+          .num_linear_state_blocks(draft_slots)
+          .kpool_tail_len(draft_kpool)
+          .kpool_tail_slot_size(draft_kpool == 4 ? 1024 : 8192)
+          .linear_cache_size_in_bytes(draft_slots *
+                                      (draft_kpool == 4 ? 1024 : 8192))
+          .cache_size_in_bytes(131072);
+      const SharedKPoolPlan plan =
+          plan_shared_kpool(target_cap, draft_cap, draft_args);
+
+      EXPECT_EQ(plan.target.num_linear_state_blocks(), 4);
+      EXPECT_EQ(plan.draft.num_linear_state_blocks(), 4);
+      EXPECT_EQ(plan.draft.kpool_tail_len(), draft_kpool == 4 ? 16 : 32);
+      EXPECT_EQ(plan.draft.kpool_tail_slot_size(),
+                draft_kpool == 4 ? 4096 : 8192);
+      EXPECT_EQ(plan.draft.linear_cache_size_in_bytes(),
+                draft_kpool == 4 ? 16384 : 32768);
+      EXPECT_EQ(plan.target.n_blocks(), draft_kpool == 4 ? 3 : 1);
+      EXPECT_EQ(plan.draft.n_blocks(), plan.target.n_blocks());
+
+      EXPECT_EQ(plan.target.cache_size_in_bytes(), 65536);
+      EXPECT_EQ(plan.draft.cache_size_in_bytes(), 65536);
+      EXPECT_EQ(plan.target.kpool_tail_len(), target_cap.kpool_tail_len());
+    }
+  }
+}
+
+TEST(KVCacheEstimationTest, SharedKPoolPlanRejectsInsufficientMemory) {
+  ModelArgs draft_args;
+  draft_args.index_kpool(4).index_head_dim(16);
+  KVCacheCapacity capacity;
+  capacity.block_size(16)
+      .slot_size(64)
+      .index_slot_size(8)
+      .num_full_attention_layers(1)
+      .num_indexer_layers(1)
+      .num_linear_state_blocks(5)
+      .kpool_tail_len(16)
+      .kpool_tail_slot_size(1024)
+      .linear_cache_size_in_bytes(5120)
+      .cache_size_in_bytes(10240);
+  EXPECT_DEATH(plan_shared_kpool(capacity, capacity, draft_args),
+               "target and draft KPool request state");
+  capacity.cache_size_in_bytes(10241);
+  EXPECT_DEATH(plan_shared_kpool(capacity, capacity, draft_args),
+               "no memory for a shared KPool block");
+}
 
 TEST(KVCacheEstimationTest, LinearStateCapacityVariants) {
   struct TestCase {
@@ -573,6 +719,33 @@ TEST(KVCacheEstimationTest, Qwen35MtpExpandsConvStateLen) {
   EXPECT_EQ(capacity.linear_ssm_checkpoint_stride(), 2);
   EXPECT_EQ(capacity.linear_slot_size(), 448);
   EXPECT_EQ(capacity.linear_cache_size_in_bytes(), 8960);
+}
+
+TEST(KVCacheEstimationTest, GlmMtpAllocatesFrameworkCheckpointsOnlyForDecode) {
+  for (const std::string& model_type : {"glm5_3_flash", "glm5_next"}) {
+    ModelArgs model_args = make_standard_args();
+    model_args.model_type(model_type)
+        .full_attention_interval(2)
+        .linear_num_key_heads(2)
+        .linear_num_value_heads(2)
+        .linear_key_head_dim(4)
+        .linear_value_head_dim(8)
+        .linear_conv_kernel_dim(3);
+    KVCacheEstimateOptions options = make_estimate_options();
+    options.n_local_linear_k_heads = 2;
+    options.n_local_linear_v_heads = 2;
+    options.num_speculative_tokens = 3;
+    const KVCacheCapacity decode =
+        estimate_kv_cache_capacity(model_args, options);
+    EXPECT_EQ(decode.linear_conv_state_len(), 5);
+    EXPECT_EQ(decode.linear_ssm_checkpoint_stride(), 4);
+    options.instance_role = InstanceRole::PREFILL;
+    const KVCacheCapacity prefill =
+        estimate_kv_cache_capacity(model_args, options);
+    EXPECT_EQ(prefill.linear_conv_state_len(), 2);
+    EXPECT_EQ(prefill.linear_ssm_checkpoint_stride(), 1);
+    EXPECT_GT(decode.linear_slot_size(), prefill.linear_slot_size());
+  }
 }
 
 TEST(KVCacheEstimationTest, Qwen35TextMtpUsesSsmCheckpointStride) {
@@ -1063,5 +1236,30 @@ TEST(KVCacheEstimationTest, PhysicalHeadWidthControlsCacheBudget) {
   EXPECT_EQ(capacity.slot_size(), 2 * 2 * 128 * 2);
   EXPECT_EQ(model_args.head_dim(), 96);
 }
+
+TEST_P(DcpIndexerEstimationTest, IncludesAllIndexerBytes) {
+  ModelArgs model_args = make_standard_args();
+  model_args.index_n_heads(1).index_head_dim(16);
+  KVCacheEstimateOptions options = make_estimate_options();
+  options.indexer_cache_dtype = "auto";
+  const KVCacheCapacity ordinary =
+      estimate_kv_cache_capacity(model_args, options);
+  EXPECT_EQ(ordinary.index_slot_size(), 32 * expected_factor());
+
+  options.indexer_cache_dtype = "int8";
+  const KVCacheCapacity quantized =
+      estimate_kv_cache_capacity(model_args, options);
+  EXPECT_EQ(quantized.index_slot_size(), 20 * expected_factor());
+  EXPECT_EQ(quantized.slot_size(), ordinary.slot_size());
+
+  model_args.index_n_heads(0);
+  const KVCacheCapacity absent =
+      estimate_kv_cache_capacity(model_args, options);
+  EXPECT_EQ(absent.index_slot_size(), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(KvSplits,
+                         DcpIndexerEstimationTest,
+                         ::testing::Values(1, 2, 4, 0));
 
 }  // namespace xllm

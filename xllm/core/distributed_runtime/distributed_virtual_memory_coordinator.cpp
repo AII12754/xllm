@@ -179,11 +179,13 @@ void DistributedVirtualMemoryCoordinator::setup_worker_memory_rpc(
 int64_t DistributedVirtualMemoryCoordinator::init_physical_page_pools(
     double max_memory_utilization,
     int64_t max_cache_size,
-    bool max_memory_utilization_configured) {
+    bool max_memory_utilization_configured,
+    int64_t reserved_memory_bytes) {
   CHECK(std::isfinite(max_memory_utilization));
   CHECK_GE(max_memory_utilization, 0.0);
   CHECK_LE(max_memory_utilization, 1.0);
   CHECK_GE(max_cache_size, 0);
+  CHECK_GE(reserved_memory_bytes, 0);
   const int64_t page_size =
       KVCacheConfig::get_instance().phy_page_granularity_size();
   CHECK_GT(page_size, 0);
@@ -209,7 +211,8 @@ int64_t DistributedVirtualMemoryCoordinator::init_physical_page_pools(
                                      max_memory_utilization,
                                      max_memory_utilization_configured,
                                      lazy,
-                                     max_cache_size);
+                                     max_cache_size,
+                                     reserved_memory_bytes);
 
     const int64_t num_pages = capacity.maximum_bytes / page_size;
     const int64_t initial_pages = capacity.initial_bytes / page_size;
@@ -305,7 +308,8 @@ int64_t DistributedVirtualMemoryCoordinator::init_physical_page_pools(
                                      max_memory_utilization,
                                      max_memory_utilization_configured,
                                      lazy,
-                                     max_cache_size);
+                                     max_cache_size,
+                                     reserved_memory_bytes);
     // Apply each worker's ratio before reducing so heterogeneous devices keep
     // their own configured arena ceiling.
     min_capacity_bytes = std::min(min_capacity_bytes, capacity.maximum_bytes);

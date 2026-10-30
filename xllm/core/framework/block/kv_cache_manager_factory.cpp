@@ -44,17 +44,40 @@ KVCacheCapacity KVCacheManagerFactory::estimate_capacity(
     torch::ScalarType dtype,
     int64_t world_size,
     const std::vector<std::shared_ptr<WorkerClient>>& worker_clients,
-    bool is_multimodal) {
+    bool is_multimodal,
+    int64_t reserved_memory_bytes) {
   KVCacheEstimateContext context;
   context.dtype = dtype;
   context.world_size = world_size;
   context.is_multimodal = is_multimodal;
+  context.reserved_memory_bytes = reserved_memory_bytes;
   context.linear_state_cache_block_limit =
       get_npu_linear_state_cache_block_limit(model_args.model_type());
   const KVCacheConfig& config = KVCacheConfig::get_instance();
-  if (config.enable_virtual_memory() && !is_multimodal) {
+  if (config.enable_vmm_kvcache()) {
+    auto& coordinator = DistributedVirtualMemoryCoordinator::get_instance();
     const auto& phy_pool = PhysicalPagePool::get_instance();
-    CHECK(phy_pool.is_initialized()) << "PhysicalPagePool not initialized";
+    if (!phy_pool.is_initialized()) {
+      const int64_t encoder_cache_reserved_bytes =
+          is_multimodal ? options.max_encoder_cache_size() * 1024 * 1024 : 0;
+      CHECK_GT(coordinator.init_physical_page_pools(
+                   config.max_memory_utilization(),
+                   config.max_cache_size(),
+                   config.max_memory_utilization_configured(),
+                   encoder_cache_reserved_bytes),
+               0)
+          << "Failed to initialize KV cache physical page pools";
+    }
+    if (!coordinator.is_initialized()) {
+      coordinator.init_page_budget(phy_pool.num_total(),
+                                   options.dp_size(),
+                                   static_cast<int32_t>(worker_clients.size()),
+                                   config.phy_page_granularity_size(),
+                                   /*enable_prealloc=*/true);
+    }
+    coordinator.set_model_parallel_strategy(options.model_id(),
+                                            options.dp_size(),
+                                            static_cast<int32_t>(world_size));
     context.virtual_memory_cache_size =
         static_cast<int64_t>(phy_pool.num_total()) *
         config.phy_page_granularity_size();
@@ -99,19 +122,19 @@ KVCacheManagerFactoryResult KVCacheManagerFactory::create(
     std::optional<HostCacheValidationOptions> host_validation_options) {
   CHECK_GT(world_size, 0) << "world_size must be greater than 0";
   CHECK_GT(dp_size, 0) << "dp_size must be greater than 0";
-  CHECK(!options.enable_virtual_memory() ||
+  CHECK(!options.enable_vmm_kvcache() ||
         (!options.enable_host_offload() &&
          (!host_validation_options.has_value() ||
           host_validation_options->host_blocks_factor <= 1.0)))
       << "Virtual memory does not support host KV cache offload; set "
          "--host_blocks_factor=0.";
-  if (options.enable_virtual_memory() && options.enable_prefix_cache()) {
+  if (options.enable_vmm_kvcache() && options.enable_prefix_cache()) {
     LOG(WARNING) << "Virtual memory does not support prefix caching; "
                     "disabling prefix caching for this KV cache manager.";
     options.enable_prefix_cache(false);
   }
 #if defined(USE_NPU)
-  CHECK(!options.enable_virtual_memory() ||
+  CHECK(!options.enable_vmm_kvcache() ||
         !use_npu_nz_kv_cache_layout(model_args.model_type()))
       << "Virtual memory does not support the NPU NZ KV cache layout.";
 #endif
@@ -151,7 +174,7 @@ KVCacheManagerFactoryResult KVCacheManagerFactory::create(
   }
 
   VmmKVPageAllocator* page_allocator = nullptr;
-  if (options.enable_virtual_memory()) {
+  if (options.enable_vmm_kvcache()) {
     CHECK(shape.has_value_cache_shape());
     CHECK_EQ(kv_cache_capacity.scale_slot_size(), 0)
         << "Virtual memory does not support quantized KV cache";

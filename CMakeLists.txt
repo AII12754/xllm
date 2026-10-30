@@ -17,8 +17,8 @@ option(USE_DCU "Enable DCU support" OFF)
 option(USE_MACA "Enable MACA support" OFF)
 option(USE_ETCD "Build Mooncake etcd support" ON)
 option(STORE_USE_ETCD "Build Mooncake Store etcd support" ${USE_ETCD})
-# xlite is an NPU-only backend; it requires USE_NPU=ON.
-option(USE_XLITE "Enable xlite NPU backend" ${USE_NPU})
+# xlite is an opt-in NPU backend; it requires USE_NPU=ON.
+option(USE_XLITE "Enable xlite NPU backend" OFF)
 add_compile_definitions(YLT_ENABLE_IBV)
 add_definitions(-DYLT_ENABLE_IBV)
 set(YLT_ENABLE_IBV ON)

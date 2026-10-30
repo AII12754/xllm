@@ -225,12 +225,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step(const LlmForwardInput& input) {
 
 std::optional<ForwardOutput> LLMWorkerImpl::step_for_schedule_overlap(
     const LlmForwardInput& input) {
-  // The worker thread orders checkpoint restores after the preceding chunk's
-  // writes on compute_stream_, rather than preparing them on prepare_stream_.
-  if (has_request_state_cache()) {
-    c10::StreamGuard restore_guard = compute_stream_->set_stream_guard();
-    try_restore_linear_state_slots(ModelParamsView(input.input_params));
-  }
+  prepare_schedule_overlap(input);
   return execute_no_sync_on_stream(
       input, *compute_stream_, ForwardCompletion::RECORD_EVENT);
 }
@@ -240,7 +235,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     ForwardSyncPolicy sync_policy,
     ForwardCompletion completion) {
   MULTI_MODEL_STEP_LOCK(
-      ::xllm::KVCacheConfig::get_instance().enable_virtual_memory());
+      ::xllm::LoadConfig::get_instance().enable_vmm_weights());
 
   Timer timer;
   auto& sampling_params = input.sampling_params;
@@ -364,7 +359,17 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     output.logprobs = sampling_params.logprobs;
     output.max_top_logprobs = sampling_params.max_top_logprobs;
     if (!input.skip_sampling_for_logits_only) {
-      auto sample_output = sample(logits, sampling_params);
+      auto sample_output = [&]() {
+        if (!sampling_params.min_token_positions.defined()) {
+          return sample(logits, sampling_params);
+        }
+        SamplingParameters target_sampling = sampling_params;
+        const auto selected_positions = input.positions.index_select(
+            /*dim=*/0, sampling_params.selected_token_idxes.to(torch::kInt64));
+        target_sampling.min_tokens_remaining =
+            sampling_params.min_token_positions - selected_positions;
+        return sample(logits, target_sampling);
+      }();
       // beam search kernel
       BeamSearchOutput beam_search_output;
       if (sampling_params.use_beam_search &&
@@ -389,8 +394,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
         !input.input_params.meta.batch_forward_type.is_decode() &&
         !is_spec_draft_;
     output_spec_hidden_states(output.sample_output,
-                              model_output.hidden_states,
-                              model_output.aux_hidden_states,
+                              model_output,
                               lm_head_selected_token_idxes,
                               selected_hidden,
                               is_target_prefill,
@@ -405,11 +409,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
 #endif
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
     wait_kv_push();
-    output.retained_inputs.emplace_back(
-        std::make_shared<LlmForwardInput>(input.clone()));
-    if (completion == ForwardCompletion::RECORD_EVENT) {
-      output.ready_event = device_.current_stream()->record_event_or_sync();
-    }
+    finalize_no_sync_output(output, input, completion);
     return output;
   }
   if (should_sync_default_stream) {

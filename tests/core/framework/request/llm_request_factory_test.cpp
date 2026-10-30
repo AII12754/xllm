@@ -551,33 +551,20 @@ TEST_F(LLMRequestFactoryTest, ContextErrorRetainsServiceCallbackOwnership) {
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
-TEST_F(LLMRequestFactoryTest, OverlapErrorRetainsServiceCallbackOwnership) {
-  options_.enable_schedule_overlap(true);
+TEST_F(LLMRequestFactoryTest, OverlapAcceptsBadWords) {
+  options_.enable_task_pipeline(false).enable_schedule_overlap(true);
   auto factory = make_factory();
+  CallbackCapture capture;
   RequestParams params;
-  params.service_request_id = "attempt-overlap";
-  params.source_xservice_addr = "127.0.0.1:9000";
   params.bad_words = {"bad"};
-  bool called = false;
-  auto request = factory->create(
-      /*prompt=*/"hello",
-      /*prompt_tokens=*/std::nullopt,
-      params,
-      /*call=*/std::nullopt,
-      [&called, &params](RequestOutput output) {
-        called = true;
-        EXPECT_EQ(output.service_request_id, params.service_request_id);
-        EXPECT_EQ(output.target_xservice_addr, params.source_xservice_addr);
-        EXPECT_TRUE(output.status.has_value());
-        if (output.status.has_value()) {
-          EXPECT_EQ(output.status->message(),
-                    "bad_words requires enable_schedule_overlap=false");
-        }
-        return false;
-      });
-  EXPECT_EQ(request, nullptr);
-  EXPECT_TRUE(called);
-  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+  auto request = factory->create("hello",
+                                 std::nullopt,
+                                 params,
+                                 std::nullopt,
+                                 make_capture_callback(&capture));
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(capture.called);
+  EXPECT_FALSE(request->state().sampling_param.bad_words_token_ids.empty());
 }
 
 TEST_F(LLMRequestFactoryTest,
@@ -777,6 +764,71 @@ TEST_F(LLMRequestFactoryTest, TaskPipelineAcceptsOrdinaryRequest) {
   ASSERT_NE(request, nullptr);
   EXPECT_FALSE(capture.called);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+}
+
+TEST_F(LLMRequestFactoryTest, MtpMinimumLengthIsIndependentOfTaskPipeline) {
+  for (const bool pipeline : {false, true}) {
+    for (const bool overlap : {false, true}) {
+      SCOPED_TRACE(::testing::Message()
+                   << "pipeline=" << pipeline << ", overlap=" << overlap);
+      options_.enable_task_pipeline(pipeline)
+          .enable_schedule_overlap(overlap)
+          .num_speculative_tokens(4)
+          .speculative_algorithm("MTP");
+      auto factory = make_factory(/*vocab_size=*/1000, /*max_position=*/65536);
+      CallbackCapture capture;
+      RequestParams params;
+      params.max_tokens = 2048;
+      params.min_tokens = 2048;
+      auto request = factory->create("hello",
+                                     std::nullopt,
+                                     params,
+                                     std::nullopt,
+                                     make_capture_callback(&capture));
+      ASSERT_NE(request, nullptr);
+      EXPECT_FALSE(capture.called);
+      EXPECT_EQ(request->state().sampling_param.min_tokens, 2048U);
+      EXPECT_TRUE(request->state().sampling_param.device_min_tokens);
+    }
+  }
+}
+
+TEST_F(LLMRequestFactoryTest, MtpSamplingControlsAreIndependentOfOverlap) {
+  for (const bool overlap : {false, true}) {
+    SCOPED_TRACE(overlap);
+    options_.enable_task_pipeline(false)
+        .enable_schedule_overlap(overlap)
+        .num_speculative_tokens(4)
+        .speculative_algorithm("MTP");
+    auto factory = make_factory(/*vocab_size=*/1000, /*max_position=*/65536);
+    CallbackCapture capture;
+    RequestParams params;
+    params.max_tokens = 64;
+    params.min_tokens = 16;
+    params.seed = 42;
+    params.bad_words = {"bad"};
+    params.logit_bias = {{1, 2.0F}};
+    params.allowed_token_ids = std::vector<int32_t>{1, 2, 3};
+    params.frequency_penalty = 0.5F;
+    params.presence_penalty = 0.5F;
+    params.repetition_penalty = 1.1F;
+    params.top_k = 10;
+    params.top_p = 0.9F;
+    params.min_p = 0.1F;
+    params.logprobs = true;
+    params.top_logprobs = 5;
+    auto request = factory->create("hello",
+                                   std::nullopt,
+                                   params,
+                                   std::nullopt,
+                                   make_capture_callback(&capture));
+    ASSERT_NE(request, nullptr);
+    EXPECT_FALSE(capture.called);
+    const auto& sampling = request->state().sampling_param;
+    EXPECT_EQ(sampling.seed, 42);
+    EXPECT_TRUE(sampling.device_min_tokens);
+    EXPECT_FALSE(sampling.bad_words_token_ids.empty());
+  }
 }
 
 TEST_F(LLMRequestFactoryTest, LegacyJsonObjectReachesGrammarValidation) {

@@ -532,6 +532,61 @@ TYPED_TEST(ScheduleOverlapTest, ConstrainedContinuationAdvancesGrammar) {
   worker.get_last_step_result();
 }
 
+TYPED_TEST(ScheduleOverlapTest, NewConstrainedSequenceStartsWithoutPriorRow) {
+  JsonObjectGrammar grammar({"{", "}", "stop"}, /*stop_token_ids=*/{2});
+  OverlapTestWorker worker({token_output(0), token_output(1)},
+                           /*driver=*/true,
+                           OverlapTestWorker::ContinuationMode::MODEL_MANAGED);
+  auto first = worker.step_async(step_input<TypeParam>(/*decode=*/false));
+  ASSERT_TRUE(std::move(first).get().has_value());
+  worker.get_last_step_result();
+
+  auto input = step_input<TypeParam>(/*decode=*/true);
+  input.sample_sequence_ids = {"request#new"};
+  input.sample_prior_output_rows = {-1};
+  input.json_object_states = {grammar.initial_state()};
+  auto step = worker.step_async(input);
+  const auto output = std::move(step).get();
+  ASSERT_TRUE(output.has_value());
+  EXPECT_TRUE(output->json_object_errors.empty());
+  EXPECT_TRUE(worker.executed_grammar_initialized());
+  EXPECT_TRUE(worker.executed_grammar_tokens().empty());
+  ASSERT_TRUE(worker.executed_filter_bitmask().defined());
+  EXPECT_TRUE(torch::equal(worker.executed_filter_bitmask().to(torch::kCPU),
+                           torch::tensor({{1 << 0}}, torch::kInt32)));
+  EXPECT_EQ(worker.continuation_count(), 1);
+  worker.get_last_step_result();
+}
+
+TYPED_TEST(ScheduleOverlapTest, MixedConstrainedSequencesAdvancePriorRow) {
+  JsonObjectGrammar grammar({"{", "}", "stop"}, /*stop_token_ids=*/{2});
+  ForwardOutput next_output;
+  next_output.sample_output.next_tokens = torch::tensor({1, 0}, torch::kInt64);
+  OverlapTestWorker worker({token_output(0), std::move(next_output)},
+                           /*driver=*/true,
+                           OverlapTestWorker::ContinuationMode::MODEL_MANAGED);
+  auto first = worker.step_async(step_input<TypeParam>(/*decode=*/false));
+  ASSERT_TRUE(std::move(first).get().has_value());
+  worker.get_last_step_result();
+
+  auto input = step_input<TypeParam>(/*decode=*/true);
+  input.token_ids = torch::tensor({-1, 7}, torch::kInt32);
+  input.input_params.embedding.request_ids = {"request", "new"};
+  input.sample_sequence_ids = {"request#0", "new#0"};
+  input.sample_prior_output_rows = {0, -1};
+  input.json_object_states = {grammar.initial_state(), grammar.initial_state()};
+  auto step = worker.step_async(input);
+  const auto output = std::move(step).get();
+  ASSERT_TRUE(output.has_value());
+  EXPECT_TRUE(output->json_object_errors.empty());
+  EXPECT_EQ(worker.executed_grammar_tokens(), std::vector<int32_t>({0}));
+  ASSERT_TRUE(worker.executed_filter_bitmask().defined());
+  EXPECT_TRUE(torch::equal(worker.executed_filter_bitmask().to(torch::kCPU),
+                           torch::tensor({{1 << 1}, {1 << 0}}, torch::kInt32)));
+  EXPECT_EQ(worker.continuation_count(), 1);
+  worker.get_last_step_result();
+}
+
 TYPED_TEST(ScheduleOverlapTest, NonDriverContinuesWithoutHostConsumption) {
   OverlapTestWorker worker({token_output(17), token_output(23)},
                            /*driver=*/false);

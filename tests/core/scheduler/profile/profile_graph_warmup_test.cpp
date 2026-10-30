@@ -65,11 +65,11 @@ class ScopedDecodeGraphConfigSnapshot final {
 class ScopedVmmConfigSnapshot final {
  public:
   ScopedVmmConfigSnapshot()
-      : enabled_(KVCacheConfig::get_instance().enable_virtual_memory()),
+      : enabled_(KVCacheConfig::get_instance().enable_vmm_kvcache()),
         elastic_(KVCacheConfig::get_instance().vmm_elastic()) {}
 
   ~ScopedVmmConfigSnapshot() {
-    KVCacheConfig::get_instance().enable_virtual_memory(enabled_).vmm_elastic(
+    KVCacheConfig::get_instance().enable_vmm_kvcache(enabled_).vmm_elastic(
         elastic_);
   }
 
@@ -968,7 +968,7 @@ TEST(GraphWarmupTest, ElasticEagerWarmupExercisesEveryDpAndDrainsOverlap) {
   ScopedDecodeGraphConfigSnapshot execution_snapshot;
   ScopedVmmConfigSnapshot cache_snapshot;
   ExecutionConfig::get_instance().enable_graph(false);
-  KVCacheConfig::get_instance().enable_virtual_memory(true).vmm_elastic(true);
+  KVCacheConfig::get_instance().enable_vmm_kvcache(true).vmm_elastic(true);
   RecordingProfileEngine engine(/*overlap=*/true, /*dp_size=*/2);
   const auto used_blocks = engine.block_manager_pool()->num_used_blocks();
   ProfileManager::Options options;
@@ -1003,7 +1003,7 @@ TEST(GraphWarmupTest, ElasticDecodeOnlyEagerWarmupIsNotSkipped) {
   ScopedDecodeGraphConfigSnapshot execution_snapshot;
   ScopedVmmConfigSnapshot cache_snapshot;
   ExecutionConfig::get_instance().enable_graph(false);
-  KVCacheConfig::get_instance().enable_virtual_memory(true).vmm_elastic(true);
+  KVCacheConfig::get_instance().enable_vmm_kvcache(true).vmm_elastic(true);
   RecordingProfileEngine engine;
   ProfileManager::Options options;
   options.max_tokens_per_batch(20).max_seqs_per_batch(4).instance_role(
@@ -1023,7 +1023,7 @@ TEST(GraphWarmupTest, ElasticWarmupAllocatesDespiteStaleCapacitySnapshot) {
   ScopedDecodeGraphConfigSnapshot execution_snapshot;
   ScopedVmmConfigSnapshot cache_snapshot;
   ExecutionConfig::get_instance().enable_graph(false);
-  KVCacheConfig::get_instance().enable_virtual_memory(true).vmm_elastic(true);
+  KVCacheConfig::get_instance().enable_vmm_kvcache(true).vmm_elastic(true);
   for (bool overlap : {false, true}) {
     RecordingProfileEngine engine(overlap,
                                   /*dp_size=*/2,
@@ -1062,7 +1062,7 @@ TEST(GraphWarmupTest, ElasticGraphWarmupCannotBeDeferredToServing) {
   auto& config = ExecutionConfig::get_instance();
   const bool previous_disabled = config.disable_graph_warmup();
   config.enable_graph(true).disable_graph_warmup(true);
-  KVCacheConfig::get_instance().enable_virtual_memory(true).vmm_elastic(true);
+  KVCacheConfig::get_instance().enable_vmm_kvcache(true).vmm_elastic(true);
   EXPECT_DEATH(
       {
         RecordingProfileEngine engine;

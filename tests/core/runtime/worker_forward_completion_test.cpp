@@ -226,7 +226,7 @@ class WorkerForwardCompletionTest
       LoadConfig::get_instance().enable_rolling_load(),
       false};
   ScopedConfigValue<bool> virtual_memory_{
-      KVCacheConfig::get_instance().enable_virtual_memory(),
+      KVCacheConfig::get_instance().enable_vmm_kvcache(),
       false};
   ScopedConfigValue<bool> eplb_{EPLBConfig::get_instance().enable_eplb(),
                                 false};

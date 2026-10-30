@@ -255,20 +255,24 @@ class ModelResidencyCoordinatorTest : public ::testing::Test {
                     .register_model(model_id_, /*num_layers=*/2));
 
     auto& load_config = LoadConfig::get_instance();
+    saved_enable_vmm_weights_ = load_config.enable_vmm_weights();
+    load_config.enable_vmm_weights(true);
     saved_enable_rolling_load_ = load_config.enable_rolling_load();
     saved_cached_layers_ = load_config.rolling_load_num_cached_layers();
     load_config.enable_rolling_load(false);
-    const auto& cache_config = KVCacheConfig::get_instance();
-    saved_enable_virtual_memory_ = cache_config.enable_virtual_memory();
+    auto& cache_config = KVCacheConfig::get_instance();
+    saved_enable_vmm_kvcache_ = cache_config.enable_vmm_kvcache();
     saved_vmm_elastic_ = cache_config.vmm_elastic();
+    cache_config.enable_vmm_kvcache(true).vmm_elastic(false);
   }
 
   void TearDown() override {
     LoadConfig::get_instance()
+        .enable_vmm_weights(saved_enable_vmm_weights_)
         .enable_rolling_load(saved_enable_rolling_load_)
         .rolling_load_num_cached_layers(saved_cached_layers_);
     KVCacheConfig::get_instance()
-        .enable_virtual_memory(saved_enable_virtual_memory_)
+        .enable_vmm_kvcache(saved_enable_vmm_kvcache_)
         .vmm_elastic(saved_vmm_elastic_);
   }
 
@@ -349,9 +353,10 @@ class ModelResidencyCoordinatorTest : public ::testing::Test {
   std::string model_id_;
 
  private:
+  bool saved_enable_vmm_weights_ = false;
   bool saved_enable_rolling_load_ = false;
   int32_t saved_cached_layers_ = 0;
-  bool saved_enable_virtual_memory_ = false;
+  bool saved_enable_vmm_kvcache_ = false;
   bool saved_vmm_elastic_ = true;
 };
 
@@ -367,7 +372,7 @@ TEST_F(ModelResidencyCoordinatorTest,
 
 TEST_F(ModelResidencyCoordinatorTest,
        ElasticRemoteWakeupRejectsBeforeRestoringModelResources) {
-  KVCacheConfig::get_instance().enable_virtual_memory(true).vmm_elastic(true);
+  KVCacheConfig::get_instance().enable_vmm_kvcache(true).vmm_elastic(true);
   ResumePageBackend backend;
   ScopedResumePageAllocator injected_pages(backend);
   auto& memory = DistributedVirtualMemoryCoordinator::get_instance();
@@ -428,6 +433,64 @@ TEST_F(ModelResidencyCoordinatorTest,
   ASSERT_EQ(weight_segments.size(), 1);
   ASSERT_EQ(weight_segments.count("existing"), 1);
   expect_weight_segments(weight_segments.at("existing"), {{7, 11}});
+}
+
+TEST_F(ModelResidencyCoordinatorTest,
+       KvOnlyDoesNotRequireWeightMetadataOrReserveWeightPages) {
+  LoadConfig::get_instance().enable_vmm_weights(false);
+  auto worker = std::make_shared<RecordingWorkerClient>(model_id_);
+  auto coordinator = make_coordinator(/*enabled=*/true, make_manager({worker}));
+  const MetadataModelLoader model_loader{};
+  auto& memory = DistributedVirtualMemoryCoordinator::get_instance();
+  const auto free_pages = memory.get_worker_free_page_counts();
+
+  EXPECT_TRUE(coordinator.initialize_model(model_loader,
+                                           /*num_layers=*/2,
+                                           /*dp_size=*/1,
+                                           /*tp_size=*/1,
+                                           MasterStatus::WAKEUP));
+  EXPECT_EQ(memory.get_weight_page_count(model_id_), 0);
+  EXPECT_EQ(memory.get_worker_free_page_counts(), free_pages);
+  EXPECT_TRUE(coordinator.finish_initialization(MasterStatus::DEEP_SLEEP));
+  EXPECT_FALSE(coordinator.sleep(MasterStatus::DEEP_SLEEP));
+  EXPECT_FALSE(
+      coordinator.wakeup(make_wakeup_options(MasterStatus::DEEP_SLEEP)));
+  EXPECT_FALSE(coordinator.is_suspended());
+  EXPECT_EQ(worker->sleep_calls_, 0);
+  EXPECT_EQ(worker->wakeup_calls_, 0);
+}
+
+TEST_F(ModelResidencyCoordinatorTest,
+       WeightOnlyRestoresResidencyWithoutVirtualKvTensors) {
+  KVCacheConfig::get_instance().enable_vmm_kvcache(false);
+  const std::string model_id = model_id_ + "_weights_only";
+  auto worker = std::make_shared<RecordingWorkerClient>(model_id);
+  auto coordinator = make_coordinator(
+      /*enabled=*/true, make_manager({worker}), model_id);
+  MetadataModelLoader model_loader{};
+  model_loader.total_weight_size_ = 1;
+  auto& memory = DistributedVirtualMemoryCoordinator::get_instance();
+  const auto free_pages = memory.get_worker_free_page_counts();
+
+  ASSERT_TRUE(coordinator.initialize_model(model_loader,
+                                           /*num_layers=*/2,
+                                           /*dp_size=*/1,
+                                           /*tp_size=*/1,
+                                           MasterStatus::DEEP_SLEEP));
+  EXPECT_EQ(memory.get_weight_page_count(model_id), 21);
+  ASSERT_TRUE(coordinator.finish_initialization(MasterStatus::DEEP_SLEEP));
+  EXPECT_TRUE(coordinator.is_suspended());
+  // Empty the recorded weight demand to exercise worker acknowledgements
+  // without requiring a physical allocator or a device in this unit test.
+  memory.set_weight_page_count(model_id, /*num_pages=*/0);
+  EXPECT_TRUE(
+      coordinator.wakeup(make_wakeup_options(MasterStatus::DEEP_SLEEP)));
+  EXPECT_FALSE(coordinator.is_suspended());
+  EXPECT_EQ(worker->wakeup_calls_, 1);
+  EXPECT_EQ(memory.get_worker_free_page_counts(), free_pages);
+  EXPECT_TRUE(coordinator.sleep(MasterStatus::DEEP_SLEEP));
+  EXPECT_TRUE(coordinator.is_suspended());
+  EXPECT_EQ(worker->sleep_calls_, 1);
 }
 
 TEST_F(ModelResidencyCoordinatorTest,
@@ -969,7 +1032,7 @@ TEST_F(ModelResidencyCoordinatorTest, WakeupExceptionPreservesPendingState) {
 }
 
 TEST_F(ModelResidencyCoordinatorTest, WakeupRetryRejectsChangedOptions) {
-  KVCacheConfig::get_instance().enable_virtual_memory(true).vmm_elastic(false);
+  KVCacheConfig::get_instance().enable_vmm_kvcache(true).vmm_elastic(false);
   auto first = std::make_shared<RecordingWorkerClient>(model_id_);
   auto second = std::make_shared<RecordingWorkerClient>(model_id_);
   first->wakeup_result_ = false;

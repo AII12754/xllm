@@ -255,8 +255,15 @@ RPCs to a KV extension service without interpreting their messages. The
 schema still contains KV messages, so this boundary removes C++ domain and
 target dependencies rather than completing protocol separation.
 
-The options are `enable_virtual_memory` and `worker_memory_master_node_addr`.
-When virtual memory is enabled with `nnodes > 1`, rank 0 listens on
+`enable_vmm_kvcache` selects the virtual KV Cache backend, while
+`enable_vmm_weights` selects VMM weight loading and implies the manual loader.
+Both default to `false` and can be enabled independently: KV-only VMM keeps
+the configured weight loader, and weight-only VMM keeps physical KV Cache.
+Shared VMM resources and settings are initialized when either flag is enabled;
+enabling both shares their pool and page budget. Model sleep, wakeup and fork
+require `enable_vmm_weights=true`.
+
+When either VMM flag is enabled with `nnodes > 1`, rank 0 listens on
 `worker_memory_master_node_addr` to collect worker memory RPC server endpoints.
 Each worker registers its endpoint there, and rank 0 connects to those endpoints
 to dispatch memory operations. This registration service is separate from the
@@ -265,13 +272,14 @@ Explicit CLI settings override JSON configuration.
 
 ### Elastic virtual KV
 
-`enable_virtual_memory=false` keeps the original physical-cache implementation.
-When virtual memory is enabled, `vmm_elastic=true` selects demand-backed physical
+`enable_vmm_kvcache=false` keeps the original physical-cache implementation.
+When either VMM flag is enabled, `vmm_elastic=true` selects demand-backed physical
 pages. The pool reserves stable page IDs and virtual addresses at startup, but
 commits physical handles only for active KV mappings and weight reservations.
 Idle KV pages are unmapped and their backing is released after their last block
 is returned; live pages, the padding block, weights, and transfer leases remain
-pinned. `vmm_elastic=false` retains the fixed, eagerly resident VMM arena.
+pinned. Only the consumers enabled by the two VMM flags use these pages.
+`vmm_elastic=false` uses a fixed, eagerly resident VMM arena. Weight VMM currently supports the LLM backend. Weight-only VMM requires `vmm_elastic=true`; a fixed weight pool would consume the memory needed by the physical KV Cache.
 
 `max_memory_utilization` and `max_cache_size` are optional growth ceilings,
 shared by KV and weight pages. Elastic mode reserves stable virtual addresses

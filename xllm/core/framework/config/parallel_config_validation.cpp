@@ -23,6 +23,7 @@ limitations under the License.
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
@@ -137,7 +138,8 @@ std::optional<std::string> validate_context_parallel_config(
               .empty() &&
           options.host_blocks_factor() <= 1.0 &&
           !options.enable_kvcache_store() &&
-          !KVCacheConfig::get_instance().enable_virtual_memory() &&
+          !KVCacheConfig::get_instance().enable_vmm_kvcache() &&
+          !LoadConfig::get_instance().enable_vmm_weights() &&
           !options.enable_disagg_pd() &&
           options.instance_role() == InstanceRole::DEFAULT &&
           options.draft_model_path().value_or("").empty() &&

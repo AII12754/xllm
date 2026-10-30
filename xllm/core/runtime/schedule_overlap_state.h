@@ -68,7 +68,10 @@ class ScheduleOverlapState final {
   }
   bool has_tokens() const { return has_tokens_; }
 
-  bool has_request_overlap(const std::vector<std::string>& request_ids) const;
+  // Returns whether the cached output can provide continuation tokens for the
+  // current request set. The request matching and token availability are one
+  // state decision, so evaluate them under one lock.
+  bool can_reuse_tokens(const std::vector<std::string>& request_ids) const;
 
  private:
   void retire_prior_inputs() const;

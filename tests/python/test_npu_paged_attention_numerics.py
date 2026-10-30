@@ -38,6 +38,159 @@ _OUTPUT_RTOL = 0.02
 _OUTPUT_ATOL = 1e-3
 
 
+@pytest.mark.parametrize("policy", ["dspark", "dspark_causal", "dflash2"])
+@pytest.mark.parametrize("kv_heads,dimension", [(4, 64), (1, 128)])
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("qk_scale", [0.1, 1.0])
+@torch.inference_mode()
+def test_windowed_draft_attention_matches_global_reference_across_long_contexts(
+    policy: str, kv_heads: int, dimension: int, graph: bool, qk_scale: float
+) -> None:
+    from xllm.python.attention.backend import LayerCache
+    from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
+    from xllm.python.layers.attention import Attention
+
+    device = torch.device("npu:0")
+    batch, width, heads, page_size, source_pages = 2, 8, 4, 128, 514
+    generator = torch.Generator().manual_seed(71029)
+    shape = (batch * source_pages, page_size, kv_heads, dimension)
+    key_host = (torch.randn(shape, generator=generator) * qk_scale).to(torch.bfloat16)
+    value_host = torch.empty(shape, dtype=torch.bfloat16)
+    query_host = (torch.randn((batch * width, heads, dimension), generator=generator) * qk_scale).to(torch.bfloat16)
+    table_host = torch.randperm(batch * source_pages, generator=generator).to(torch.int32).view(batch, source_pages)
+    global_positions = torch.arange(source_pages * page_size).view(source_pages, page_size, 1, 1)
+    head_bias = torch.arange(kv_heads).view(1, 1, -1, 1) * 0.2
+    channel_bias = torch.arange(dimension).remainder(7).view(1, 1, 1, -1) * 0.03
+    for row in range(batch):
+        # A slowly varying global-position signal distinguishes a true sliding
+        # window from an accidentally unmasked full prefix at BF16 tolerance.
+        logical_values = torch.sin((global_positions + row * 47) / 512.0) + head_bias + channel_bias
+        value_host.index_copy_(0, table_host[row].to(torch.int64), logical_values.to(torch.bfloat16))
+    key, value, query = key_host.to(device), value_host.to(device), query_host.to(device)
+    backend = NpuPagedAttentionBackend(heads, kv_heads, dimension, dimension**-0.5, 2048, False, device, torch.bfloat16)
+    backend.bind_kv_caches([LayerCache(key=key, value=value)])
+    layer = Attention(
+        heads,
+        kv_heads,
+        dimension,
+        dimension**-0.5,
+        2048,
+        0,
+        causal=policy == "dspark_causal",
+        fia_sparse_mode=4 if policy == "dflash2" else 0,
+        fia_pre_tokens=2047,
+        fia_next_tokens=width - 1,
+        fia_use_attention_mask=True,
+    )
+    slots = []
+
+    def forward(metadata: SimpleNamespace) -> torch.Tensor:
+        backend.prepare(metadata)
+        return backend._prefill(query, query, query, key, value, metadata, batch * width, layer)
+
+    def original_forward(metadata: SimpleNamespace) -> torch.Tensor:
+        # Match the pre-windowing BNSD path on the same physical KV cache.
+        # The independent CPU oracle below checks both implementations.
+        backend.prepare(metadata)
+        mask = backend._block_attention_mask(metadata.prepared_attention_state, layer)
+        q = query.view(batch, width, heads, dimension).transpose(1, 2).contiguous()
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q,
+            key.view(key.shape[0], page_size, -1),
+            value.view(value.shape[0], page_size, -1),
+            atten_mask=mask,
+            block_table=metadata.block_table,
+            actual_seq_lengths=[width] * batch,
+            actual_seq_lengths_kv=[source_pages * page_size] * batch,
+            num_heads=heads,
+            num_key_value_heads=kv_heads,
+            scale=dimension**-0.5,
+            input_layout="BNSD",
+            block_size=page_size,
+            sparse_mode=0,
+            pre_tokens=2147483647,
+            next_tokens=2147483647,
+            softmax_lse_flag=False,
+        )
+        return output.transpose(1, 2).reshape(batch * width, heads * dimension)
+
+    pool = torch.npu.graph_pool_handle() if graph else None
+    for _ in range(2):
+        metadata = SimpleNamespace(
+            slot_mapping=torch.full((batch * width,), -1, dtype=torch.int32, device=device),
+            q_seq_lens=torch.full((batch,), width, dtype=torch.int32, device=device),
+            q_cu_seq_lens_host_values=[width, 2 * width],
+            block_table=table_host.to(device),
+            kv_seq_lens=torch.full((batch,), width, dtype=torch.int32, device=device),
+            kv_seq_lens_host_values=[source_pages * page_size] * batch,
+            is_prefill=False,
+            is_chunked_prefill=True,
+            is_spec_verify=False,
+            has_kv_shard=False,
+        )
+        metadata.prepared_attention_state = backend.prepare_metadata(metadata, device_kv_lengths=True)
+        captured = None
+        output = None
+        original_graph = None
+        original_output = None
+        if graph:
+            forward(metadata)
+            original_forward(metadata)
+            torch.npu.synchronize()
+            captured = torch.npu.NPUGraph()
+            with torch.npu.graph(captured, pool=pool):
+                output = forward(metadata)
+            original_graph = torch.npu.NPUGraph()
+            with torch.npu.graph(original_graph, pool=pool):
+                original_output = original_forward(metadata)
+            torch.npu.synchronize()
+        slots.append((metadata, captured, output, original_graph, original_output))
+
+    for length in (8, 127, 129, 4095, 4097, 16383, 16385, 32767, 32769, 65535, 65537, 137):
+        for slot, (metadata, captured, output, original_graph, original_output) in enumerate(slots):
+            lengths = [length, max(width, length - 127)]
+            # The second Slot has a different logical-to-physical mapping.
+            # Replacing table contents must not require another capture.
+            table = table_host if slot == 0 else table_host.flip(1)
+            metadata.block_table.copy_(table.to(device))
+            metadata.kv_seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+            if captured is None:
+                actual = forward(metadata)
+            else:
+                captured.replay()
+                actual = output
+            actual_host = actual.float().cpu().view(batch, width, heads, dimension)
+            if original_graph is None:
+                original = original_forward(metadata)
+            else:
+                original_graph.replay()
+                original = original_output
+            original_host = original.float().cpu().view(batch, width, heads, dimension)
+            torch.testing.assert_close(actual_host, original_host, rtol=_OUTPUT_RTOL, atol=_OUTPUT_ATOL)
+            for row, kv_length in enumerate(lengths):
+                anchor = kv_length - width
+                for column in range(width):
+                    if policy == "dflash2":
+                        lower = max(0, anchor + column - 2047)
+                        upper = min(kv_length, anchor + column + width)
+                    else:
+                        lower = max(0, anchor - 2048)
+                        upper = anchor + column + 1 if policy == "dspark_causal" else kv_length
+                    positions = torch.arange(lower, upper, dtype=torch.int64)
+                    physical_pages = table[row, positions // page_size].to(torch.int64)
+                    offsets = positions % page_size
+                    keys = key_host[physical_pages, offsets].float().repeat_interleave(heads // kv_heads, dim=1)
+                    values = value_host[physical_pages, offsets].float().repeat_interleave(heads // kv_heads, dim=1)
+                    q = query_host[row * width + column].float()
+                    scores = torch.einsum("hd,thd->ht", q, keys) * dimension**-0.5
+                    expected = torch.einsum("ht,thd->hd", scores.softmax(-1), values)
+                    torch.testing.assert_close(actual_host[row, column], expected, rtol=_OUTPUT_RTOL, atol=_OUTPUT_ATOL)
+                    torch.testing.assert_close(
+                        original_host[row, column], expected, rtol=_OUTPUT_RTOL, atol=_OUTPUT_ATOL
+                    )
+    torch.npu.synchronize()
+
+
 @pytest.mark.parametrize("graph", [False, True])
 def test_live_device_attention_excludes_rejected_kv_tail(graph: bool) -> None:
     from xllm.python.attention.backend import LayerCache

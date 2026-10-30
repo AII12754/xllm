@@ -184,7 +184,7 @@ bool DisaggPDServiceImpl::append_virtual_kv_cache_offsets(
     const std::vector<int32_t>& block_ids,
     proto::DisaggResponse* response) {
   if (block_manager_ == nullptr ||
-      !block_manager_->options().enable_virtual_memory() || block_ids.empty()) {
+      !block_manager_->options().enable_vmm_kvcache() || block_ids.empty()) {
     return true;
   }
 
@@ -272,7 +272,7 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
         has_linear_attention_layers(engine_->model_args()),
         resp,
         block_manager_ != nullptr &&
-                block_manager_->options().enable_virtual_memory()
+                block_manager_->options().enable_vmm_kvcache()
             ? &virtual_memory_block_ids
             : nullptr);
     if (!append_virtual_kv_cache_offsets(sequence->dp_rank(),

@@ -55,9 +55,9 @@ void ScheduleOverlap::prepare_continuation_impl(WorkerImpl& worker,
   }
 
   const bool reuse_tokens =
-      state_.has_tokens() &&
-      (input.json_object_states.empty() ||
-       state_.has_request_overlap(input.input_params.embedding.request_ids));
+      input.json_object_states.empty()
+          ? state_.has_tokens()
+          : state_.can_reuse_tokens(input.input_params.embedding.request_ids);
   // Only the continuation runs under this guard. Model execution retains its
   // own stream selection, including composite speculative workers.
   Stream& compute_stream = *worker.compute_stream_;
@@ -67,7 +67,10 @@ void ScheduleOverlap::prepare_continuation_impl(WorkerImpl& worker,
   const ForwardOutput empty_output;
   const ForwardOutput& prior_output =
       state_.has_tokens() ? state_.prior_output() : empty_output;
-  if (reuse_tokens) {
+  // JSON continuation owns its prior-output dependency because it is also
+  // invoked directly by task-pipeline workers.  Keep the wait here only for
+  // the plain token-replacement path to avoid enqueueing the same event twice.
+  if (reuse_tokens && input.json_object_states.empty()) {
     CHECK(compute_stream.wait_event(prior_output.ready_event))
         << "failed to wait last step output before overlap continuation";
   }
@@ -76,6 +79,27 @@ void ScheduleOverlap::prepare_continuation_impl(WorkerImpl& worker,
                                         state_.sample_sequence_ids(),
                                         worker.device_,
                                         compute_stream);
+  const auto& sampling = input.sampling_params;
+  const bool needs_sampling_history = sampling.bad_words.defined() ||
+                                      sampling.seeds.defined() ||
+                                      sampling.repetition_penalties.defined() ||
+                                      sampling.frequency_penalties.defined();
+  if (needs_sampling_history &&
+      prior_output.sample_output.next_tokens.defined()) {
+    for (size_t row = 0; row < input.sample_prior_output_rows.size(); ++row) {
+      const int32_t prior_row = input.sample_prior_output_rows[row];
+      if (prior_row < 0) {
+        continue;
+      }
+      CHECK_LT(static_cast<size_t>(prior_row),
+               state_.sample_sequence_ids().size());
+      CHECK_EQ(input.sample_sequence_ids[row],
+               state_.sample_sequence_ids()[prior_row]);
+    }
+    advance_sampling_history(input.sampling_params,
+                             prior_output.sample_output.next_tokens,
+                             input.sample_prior_output_rows);
+  }
   if (reuse_tokens &&
       !worker.prepare_model_decode_continuation(input, prior_output)) {
     replace_tokens(

@@ -109,9 +109,8 @@ struct MtpContextPublication {
 // streams or independently retiring execution object lives here.
 struct TaskExecutionPipeline::SpeculativeSlot {
   struct PackedVerify {
-    // Fixed recurrent verification uses the full-width plan without confidence
-    // evaluation, calibration or adaptive feedback. Both modes borrow this
-    // packed graph layout and the same request-scoped recurrent kernel.
+    // Adaptive verification alone owns packed inputs, confidence and feedback.
+    // Fixed blocks use regular request-major Slot inputs instead.
     VerifyBudgetPlan plan;
     uint64_t generation = 0;
     uint32_t max_kv_length = 0;

@@ -41,6 +41,7 @@ class LoadConfig final {
     static const OptionCategory kOptionCategory = {
         "LOAD OPTIONS",
         {"enable_manual_loader",
+         "enable_vmm_weights",
          "enable_rolling_load",
          "rolling_load_num_cached_layers",
          "rolling_load_num_rolling_slots",
@@ -49,6 +50,8 @@ class LoadConfig final {
   }
 
   PROPERTY(bool, enable_manual_loader) = false;
+
+  PROPERTY(bool, enable_vmm_weights) = false;
 
   PROPERTY(bool, enable_rolling_load) = false;
 

@@ -73,7 +73,7 @@ struct KVCacheCreateOptions {
   // model_id are required for VirtualMemory mode
   PROPERTY(std::string, model_id);
   PROPERTY(std::string, model_type);
-  PROPERTY(bool, enable_virtual_memory) = false;
+  PROPERTY(bool, enable_vmm_kvcache) = false;
   PROPERTY(bool, enable_linear_attention) = false;
   PROPERTY(bool, enable_lighting_indexer) = false;
   // Empty keeps the legacy full allocation. Otherwise false means that the

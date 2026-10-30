@@ -106,16 +106,21 @@ SamplingParameters SamplingInputBuilder::build() {
   bool need_constraints = false;
   bool need_seed = false;
   bool need_device_min_tokens = false;
+  size_t max_words = 0;
+  size_t max_word_length = 0;
   int64_t vocab_size = 0;
   for (const auto* params : params_) {
     need_constraints = need_constraints || !params->logit_bias.empty() ||
                        params->allowed_token_ids.has_value() ||
-                       (params->min_tokens > 0 && !params->device_min_tokens) ||
-                       !params->bad_words_token_ids.empty();
+                       (params->min_tokens > 0 && !params->device_min_tokens);
     need_device_min_tokens =
         need_device_min_tokens ||
         (params->device_min_tokens && params->min_tokens > 0);
     need_seed = need_seed || params->seed.has_value();
+    max_words = std::max(max_words, params->bad_words_token_ids.size());
+    for (const auto& word : params->bad_words_token_ids) {
+      max_word_length = std::max(max_word_length, word.size());
+    }
     vocab_size = std::max(vocab_size, params->vocab_size);
   }
   if (need_constraints) {
@@ -145,20 +150,41 @@ SamplingParameters SamplingInputBuilder::build() {
           }
         }
       }
-      const Slice<int32_t> output =
-          sequence == nullptr
-              ? Slice<int32_t>()
-              : sequence->tokens().slice(sequence->num_prompt_tokens());
-      for (const auto& word : params.bad_words_token_ids) {
-        const size_t prefix = word.size() - 1;
-        if (output.size() < prefix) {
-          continue;
-        }
-        if (prefix == 0 ||
-            std::equal(word.begin(), word.end() - 1, output.end() - prefix)) {
-          rows[row][word.back()] = blocked;
-        }
+    }
+  }
+  if (max_words > 0) {
+    result.bad_words = torch::full({static_cast<int64_t>(size()),
+                                    static_cast<int64_t>(max_words),
+                                    static_cast<int64_t>(max_word_length)},
+                                   -1,
+                                   torch::kInt64);
+    result.bad_word_suffix =
+        torch::full({static_cast<int64_t>(size()),
+                     static_cast<int64_t>(max_word_length - 1)},
+                    -1,
+                    torch::kInt64);
+    auto words = result.bad_words.accessor<int64_t, 3>();
+    auto suffixes = result.bad_word_suffix.accessor<int64_t, 2>();
+    for (size_t row = 0; row < size(); ++row) {
+      const auto& bad_words = params_[row]->bad_words_token_ids;
+      for (size_t index = 0; index < bad_words.size(); ++index) {
+        const auto& word = bad_words[index];
+        std::copy(word.begin(),
+                  word.end(),
+                  words[row][index].data() + max_word_length - word.size());
       }
+      const Sequence* sequence = sequences_[row];
+      if (sequence == nullptr) {
+        continue;
+      }
+      const size_t generated = sequence->num_valid_generated_tokens();
+      const size_t length = std::min(generated, max_word_length - 1);
+      const auto output = sequence->tokens().slice(
+          sequence->num_prompt_tokens() + generated - length,
+          sequence->num_prompt_tokens() + generated);
+      std::copy(output.begin(),
+                output.end(),
+                suffixes[row].data() + max_word_length - 1 - length);
     }
   }
   if (need_device_min_tokens) {
@@ -212,7 +238,7 @@ SamplingParameters SamplingInputBuilder::build() {
           sequence == nullptr
               ? 0
               : (static_cast<uint64_t>(sequence->index()) << 32) +
-                    sequence->num_generated_tokens();
+                    sequence->num_valid_generated_tokens();
       offsets.emplace_back(static_cast<int64_t>(offset));
     }
     result.seeds = make_pinned_cpu_tensor(seeds);

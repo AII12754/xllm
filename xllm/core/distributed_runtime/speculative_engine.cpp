@@ -20,9 +20,11 @@ limitations under the License.
 #include <algorithm>
 #include <memory>
 #include <type_traits>
+#include <utility>
 
 #include "common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/eplb/eplb_controller.h"
 #include "core/kv_cache/layout/kv_cache_estimation.h"
@@ -120,6 +122,15 @@ bool SpeculativeEngineBase<TargetEngine>::init_model(
 
   model_args_ = engine_->model_args();
 
+  if ((KVCacheConfig::get_instance().enable_vmm_kvcache() ||
+       LoadConfig::get_instance().enable_vmm_weights()) &&
+      draft_engine_ != nullptr && !should_skip_external_draft_kv_cache()) {
+    LOG(ERROR) << "Virtual memory does not support an external speculative "
+                  "draft engine because target and draft would register the "
+                  "same model_id.";
+    return false;
+  }
+
   if (use_draft_engine_) {
     if (!draft_engine_->init_model(/*master_status=*/MasterStatus::WAKEUP,
                                    prepare_model)) {
@@ -171,14 +182,6 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache(
         }
       };
 
-  if (KVCacheConfig::get_instance().enable_virtual_memory() &&
-      draft_engine_ != nullptr && !should_skip_external_draft_kv_cache()) {
-    LOG(ERROR) << "Virtual memory does not support an external speculative "
-                  "draft engine because target and draft would register the "
-                  "same model_id.";
-    return false;
-  }
-
   if (!use_draft_engine_) {
     return allocate_target_cache(target_kv_cache_cap);
   }
@@ -198,6 +201,17 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache(
     draft_kv_cache_cap.n_blocks() = target_kv_cache_cap.n_blocks();
     return allocate_target_cache(target_kv_cache_cap) &&
            draft_engine_->allocate_kv_cache(draft_kv_cache_cap,
+                                            std::move(transfer_coordinator));
+  }
+
+  if (target_kv_cache_cap.kpool_tail_slot_size() > 0 &&
+      draft_kv_cache_cap.kpool_tail_slot_size() > 0) {
+    const SharedKPoolPlan plan =
+        plan_shared_kpool(std::move(target_kv_cache_cap),
+                          std::move(draft_kv_cache_cap),
+                          draft_engine_->model_args());
+    return allocate_target_cache(plan.target) &&
+           draft_engine_->allocate_kv_cache(plan.draft,
                                             std::move(transfer_coordinator));
   }
 
@@ -250,12 +264,6 @@ int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
 
   const int64_t block_size = target_kv_cache_cap.block_size();
   CHECK_GT(block_size, 0) << "kv cache block size must be greater than 0";
-
-  if (target_kv_cache_cap.kpool_tail_slot_size() > 0 &&
-      draft_kv_cache_cap.kpool_tail_slot_size() > 0) {
-    return estimate_shared_kpool_blocks(
-        target_kv_cache_cap, draft_kv_cache_cap, draft_engine_->model_args());
-  }
 
   const int64_t cache_size_in_bytes =
       std::min(target_kv_cache_cap.cache_size_in_bytes(),

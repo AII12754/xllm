@@ -40,11 +40,56 @@ limitations under the License.
 #include "core/framework/config/distributed_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/platform/device_name_utils.h"
+#include "core/platform/npu/native_host_path.h"
+#include "core/platform/npu/vendor_paths.h"
 
 namespace py = pybind11;
 
 namespace xllm {
 namespace {
+bool configure_bundled_npu_ops() {
+  static const int32_t kStartupAnchor = 0;
+  std::error_code error;
+  const std::filesystem::path host = native_host_path(&kStartupAnchor, error);
+  if (error) {
+    LOG(ERROR) << "cannot locate the native host for bundled NPU ops: "
+               << error.message();
+    return false;
+  }
+  namespace fs = std::filesystem;
+  const fs::path bundle = host.parent_path() / "opp/vendors/custom_xllm_math";
+  if (!fs::exists(bundle)) {
+    return true;
+  }
+  if (!fs::is_regular_file(bundle / "op_api/lib/libcust_opapi.so") ||
+      !fs::is_directory(bundle / "op_impl") ||
+      fs::is_empty(bundle / "op_impl") ||
+      !fs::is_directory(bundle / "op_proto") ||
+      fs::is_empty(bundle / "op_proto")) {
+    LOG(ERROR) << "incomplete bundled NPU ops under " << bundle
+               << "; reinstall the xllm wheel";
+    return false;
+  }
+  std::vector<std::string> existing;
+  const char* custom = std::getenv("ASCEND_CUSTOM_OPP_PATH");
+  if (custom != nullptr) {
+    existing = absl::StrSplit(custom, ':', absl::SkipEmpty());
+  }
+  const char* opp = std::getenv("ASCEND_OPP_PATH");
+  const fs::path system_vendors =
+      opp == nullptr || *opp == '\0' ? fs::path{} : fs::path(opp) / "vendors";
+  const bool is_python = ModelConfig::is_python_model_impl(
+      ModelConfig::get_instance().model_impl());
+  const std::string paths = absl::StrJoin(
+      bundled_npu_vendor_paths(bundle, system_vendors, existing, is_python),
+      ":");
+  if (::setenv("ASCEND_CUSTOM_OPP_PATH", paths.c_str(), /*overwrite=*/1) != 0) {
+    LOG(ERROR) << "cannot register bundled NPU ops: " << std::strerror(errno);
+    return false;
+  }
+  return true;
+}
+
 // Initialize Python interpreter and torch_npu runtime early, before any NPU
 // tensor allocation. torch_npu (post4+) calls PyGILState_Ensure inside
 // empty_with_format(), so Python must be alive before the first NPU op.
@@ -606,6 +651,9 @@ class VendorConfigLock {
 }  // namespace
 
 bool initialize_npu_startup() {
+  if (!configure_bundled_npu_ops()) {
+    return false;
+  }
   VendorConfigLock vendor_lock;
   if (vendor_lock.unsettled()) {
     LOG(ERROR) << "refusing to start: vendor config rewrite failed or "

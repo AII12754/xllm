@@ -241,6 +241,77 @@ void apply_temperatures(torch::Tensor& logits,
   logits.div_(unsqueezed_temperatures);
 }
 
+namespace {
+
+void apply_prefix_penalties(torch::Tensor& logits,
+                            const SamplingParameters& params) {
+  if (!params.prefix_tokens.defined() ||
+      (!params.repetition_penalties.defined() &&
+       !params.frequency_penalties.defined())) {
+    return;
+  }
+  const auto& prefix = params.prefix_tokens;
+  for (int64_t column = 0; column < prefix.size(1); ++column) {
+    const torch::Tensor token = prefix.select(1, column).unsqueeze(1);
+    const torch::Tensor index = token.clamp_min(0);
+    const torch::Tensor in_base = params.unique_token_ids.eq(token);
+    const torch::Tensor valid_base =
+        torch::arange(params.unique_token_ids.size(1), index.options())
+            .unsqueeze(0)
+            .lt(params.unique_token_ids_lens.unsqueeze(1));
+    const torch::Tensor in_prefix =
+        prefix.narrow(1, 0, column).eq(token).any(/*dim=*/1, /*keepdim=*/true);
+    if (params.repetition_penalties.defined()) {
+      const torch::Tensor fresh = token.ge(0).logical_and(
+          (in_base.logical_and(valid_base).any(1, true).logical_or(in_prefix))
+              .logical_not());
+      const torch::Tensor scores = logits.gather(1, index);
+      const torch::Tensor penalty = params.repetition_penalties.unsqueeze(1);
+      torch::Tensor delta =
+          torch::where(scores < 0, scores * penalty, scores / penalty) - scores;
+      delta.masked_fill_(torch::isfinite(scores).logical_not(), 0);
+      logits.scatter_add_(
+          1, index, torch::where(fresh, delta, 0).to(logits.scalar_type()));
+    }
+    if (params.frequency_penalties.defined()) {
+      const torch::Tensor seen =
+          in_base.logical_and(params.unique_token_counts.gt(0))
+              .any(1, true)
+              .logical_or(in_prefix);
+      const torch::Tensor penalty =
+          params.frequency_penalties.unsqueeze(1) +
+          params.presence_penalties.unsqueeze(1) * seen.logical_not();
+      logits.scatter_add_(
+          1,
+          index,
+          torch::where(token.ge(0), -penalty, 0).to(logits.scalar_type()));
+    }
+  }
+}
+
+void apply_bad_words(torch::Tensor& logits, const SamplingParameters& params) {
+  if (!params.bad_words.defined()) {
+    return;
+  }
+  const int64_t width = params.bad_words.size(2);
+  const torch::Tensor ids = params.bad_words.select(2, width - 1);
+  torch::Tensor matches = ids.ge(0);
+  if (width > 1) {
+    const torch::Tensor prefixes = params.bad_words.narrow(2, 0, width - 1);
+    matches.logical_and_(
+        prefixes.lt(0)
+            .logical_or(prefixes.eq(params.bad_word_suffix.unsqueeze(1)))
+            .all(/*dim=*/2));
+  }
+  const torch::Tensor bias =
+      torch::zeros(ids.sizes(), logits.options())
+          .masked_fill(matches.logical_and(ids.ge(0)),
+                       -std::numeric_limits<float>::infinity());
+  logits.scatter_add_(/*dim=*/1, ids.clamp_min(0), bias);
+}
+
+}  // namespace
+
 void apply_sampling_penalties(torch::Tensor& logits,
                               const SamplingParameters& params) {
   if (params.logits_bias.defined()) {
@@ -265,6 +336,8 @@ void apply_sampling_penalties(torch::Tensor& logits,
                                        params.frequency_penalties,
                                        params.presence_penalties);
   }
+  apply_prefix_penalties(logits, params);
+  apply_bad_words(logits, params);
 }
 
 void process_logits(torch::Tensor& logits,

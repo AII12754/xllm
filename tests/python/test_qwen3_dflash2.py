@@ -237,6 +237,7 @@ def test_dflash2_model_uses_band_attention_and_shared_target_weights() -> None:
     assert attention.fia_pre_tokens == config.sliding_window - 1
     assert attention.fia_next_tokens == config.block_size - 1
     assert attention.fia_use_attention_mask
+    assert attention.sliding_window == config.sliding_window
 
 
 def test_checkpoint_preserves_draft_owned_vocabulary_weights(

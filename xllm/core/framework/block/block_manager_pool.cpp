@@ -32,9 +32,9 @@ namespace {
 
 size_t total_admission_blocks(const BlockManager& manager,
                               BlockType type,
-                              bool enable_virtual_memory) {
+                              bool enable_vmm_kvcache) {
   size_t total_blocks = manager.num_total_blocks();
-  if (type == BlockType::KV && enable_virtual_memory && total_blocks > 0) {
+  if (type == BlockType::KV && enable_vmm_kvcache && total_blocks > 0) {
     // VMM includes the padding block in its configured total. Ordinary
     // BlockManagerImpl leaves already exclude that block.
     --total_blocks;
@@ -57,7 +57,7 @@ BlockManagerPool::BlockManagerPool(const Options& options,
     // its residency needs a separate observer at PD transfer completion.
     CHECK(!options_.enable_disagg_pd() || !options_.instance_is_decode())
         << "KV events in disaggregated PD require a PREFILL instance";
-    CHECK(options_.enable_prefix_cache() && !options_.enable_virtual_memory() &&
+    CHECK(options_.enable_prefix_cache() && !options_.enable_vmm_kvcache() &&
           !options_.enable_linear_state() && options_.manager_types().empty() &&
           options_.hasher_type() == BlockHasherType::TEXT &&
           !options_.enable_kvcache_store())
@@ -89,7 +89,7 @@ BlockManagerPool::BlockManagerPool(const Options& options,
       .compress_ratios(options_.compress_ratios())
       .max_seqs_per_batch(options_.max_seqs_per_batch())
       .hasher_type(options_.hasher_type())
-      .enable_virtual_memory(options_.enable_virtual_memory())
+      .enable_vmm_kvcache(options_.enable_vmm_kvcache())
       .num_layers(options_.num_layers())
       .slot_size(options_.slot_size())
       .virtual_block_bytes(options_.virtual_block_bytes())
@@ -106,7 +106,7 @@ BlockManagerPool::BlockManagerPool(const Options& options,
     }
     // The pool always holds a CompositeBlockManager. Its KV leaf is a flat
     // BlockManagerImpl, or a VmmKVBlockManager when
-    // enable_virtual_memory (the builder picks); SWA / C4 / C128 come from
+    // enable_vmm_kvcache (the builder picks); SWA / C4 / C128 come from
     // manager_types; the LINEAR leaf is added by the builder when
     // enable_linear_state. The per-sequence EMBEDDING resource leaf is appended
     // here under the EMBEDDING key when spec decode needs it. Every leaf is
@@ -308,7 +308,7 @@ bool BlockManagerPool::exceeds_total_capacity(Sequence* sequence,
           num_tokens / block_size + (num_tokens % block_size != 0);
       if (required_blocks >
           total_admission_blocks(
-              *entry.leaf, type, options_.enable_virtual_memory())) {
+              *entry.leaf, type, options_.enable_vmm_kvcache())) {
         fits_rank = false;
         break;
       }
@@ -382,7 +382,7 @@ bool BlockManagerPool::exceeds_total_capacity(
         continue;
       }
       const size_t capacity = total_admission_blocks(
-          *entry.leaf, type, options_.enable_virtual_memory());
+          *entry.leaf, type, options_.enable_vmm_kvcache());
       remaining_slots[dp_rank] =
           std::min(remaining_slots[dp_rank], capacity / required_blocks);
     }
@@ -529,7 +529,7 @@ uint32_t BlockManagerPool::num_blocks() const { return options_.num_blocks(); }
 size_t BlockManagerPool::admission_capacity(int32_t dp_rank) const {
   CHECK_GE(dp_rank, 0);
   CHECK_LT(static_cast<size_t>(dp_rank), block_managers_.size());
-  if (!options_.enable_virtual_memory()) {
+  if (!options_.enable_vmm_kvcache()) {
     // Preserve the original physical-cache scheduler's configured capacity.
     return num_blocks();
   }
@@ -601,7 +601,7 @@ void BlockManagerPool::deallocate_without_cache(Sequence* sequence) {
 }
 
 void BlockManagerPool::reserve_virtual_memory_padding_blocks() {
-  if (!options_.enable_virtual_memory()) {
+  if (!options_.enable_vmm_kvcache()) {
     return;
   }
   // The virtual memory KV leaf is a CompositeBlockManager leaf now; fan the

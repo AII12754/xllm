@@ -296,12 +296,14 @@ DECLARE_int32(max_global_tpot_ms);
 
 DECLARE_int32(max_requests_per_batch);
 
-DECLARE_bool(enable_virtual_memory);
+DECLARE_bool(enable_vmm_kvcache);
 
 DECLARE_int64(phy_page_granularity_size);
 
 // --- load config ---
 DECLARE_bool(enable_manual_loader);
+
+DECLARE_bool(enable_vmm_weights);
 
 DECLARE_bool(enable_rolling_load);
 

@@ -108,6 +108,48 @@ Token SampleOutput::token_at(int64_t output_idx, int64_t token_idx) const {
   return token_at_offset(*this, output_idx * next_tokens.size(1) + token_idx);
 }
 
+torch::Tensor append_token_suffix(const torch::Tensor& suffix,
+                                  const torch::Tensor& tokens) {
+  CHECK_EQ(suffix.dim(), 2);
+  CHECK_EQ(tokens.dim(), 2);
+  CHECK_EQ(suffix.size(0), tokens.size(0));
+  if (suffix.size(1) == 0 || tokens.size(1) == 0) {
+    return suffix;
+  }
+  const torch::Tensor lengths = tokens.ge(0).sum(/*dim=*/1, /*keepdim=*/true);
+  const torch::Tensor columns =
+      torch::arange(suffix.size(1), lengths.options());
+  return torch::cat({suffix, tokens.to(suffix.options())}, /*dim=*/1)
+      .gather(/*dim=*/1, lengths + columns);
+}
+
+void advance_sampling_history(SamplingParameters& params,
+                              const torch::Tensor& prior_tokens,
+                              const std::vector<int32_t>& output_rows) {
+  if (!prior_tokens.defined() || output_rows.empty() ||
+      (!params.bad_words.defined() && !params.seeds.defined() &&
+       !params.repetition_penalties.defined() &&
+       !params.frequency_penalties.defined())) {
+    return;
+  }
+  CHECK_EQ(output_rows.size(), params.num_sample_seqs());
+  const torch::Tensor rows =
+      torch::tensor(output_rows, torch::kInt64).to(prior_tokens.device());
+  const torch::Tensor tokens =
+      prior_tokens.dim() == 1 ? prior_tokens.unsqueeze(1) : prior_tokens;
+  params.prefix_tokens =
+      tokens.index_select(/*dim=*/0, rows.clamp_min(0)).to(torch::kInt64);
+  params.prefix_tokens.masked_fill_(rows.lt(0).unsqueeze(1), -1);
+  if (params.bad_word_suffix.defined()) {
+    params.bad_word_suffix =
+        append_token_suffix(params.bad_word_suffix, params.prefix_tokens);
+  }
+  if (params.seed_offsets.defined()) {
+    params.seed_offsets =
+        params.seed_offsets + params.prefix_tokens.ge(0).sum(/*dim=*/1);
+  }
+}
+
 void SamplingParameters::init(
     const std::vector<const RequestSamplingParam*>& req_sampling_params,
     const std::vector<int32_t>& selected_token_idxes,
@@ -313,6 +355,10 @@ SamplingParameters SamplingParameters::to(const torch::Device& device,
   params.top_p = safe_to(top_p, options, true);
   params.min_p = safe_to(min_p, options, true);
   params.seed_offsets = safe_to(seed_offsets, device, true);
+  params.bad_words = safe_to(bad_words, device, true);
+  params.bad_word_suffix = safe_to(bad_word_suffix, device, true);
+  params.prefix_tokens = safe_to(prefix_tokens, device, true);
+
   params.seeds = safe_to(seeds, device, true);
   params.logits_bias = safe_to(logits_bias, device, true);
   params.min_token_positions = safe_to(min_token_positions, device, true);

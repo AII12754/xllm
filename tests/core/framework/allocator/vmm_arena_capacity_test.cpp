@@ -189,5 +189,50 @@ TEST(VmmArenaCapacityTest, RoundReserveUpBeforeRoundingPageCapacityDown) {
   EXPECT_EQ(capacity.initial_bytes / kPageSize, 0);
 }
 
+TEST(VmmArenaCapacityTest, ReserveEncoderCacheOutsideFixedPool) {
+  const VmmArenaCapacity capacity = calculate_vmm_arena_capacity(
+      /*available_memory=*/40,
+      /*total_memory=*/80,
+      /*max_memory_utilization=*/0.8,
+      /*max_memory_utilization_configured=*/true,
+      /*lazy=*/false,
+      /*max_cache_size=*/20,
+      /*reserved_memory_bytes=*/8);
+
+  EXPECT_EQ(capacity.maximum_bytes, 12);
+  EXPECT_EQ(capacity.initial_bytes, 12);
+  EXPECT_EQ(capacity.growth_memory_reserve_bytes, 24);
+}
+
+TEST(VmmArenaCapacityTest, PreserveEncoderCacheDuringElasticGrowth) {
+  const VmmArenaCapacity capacity = calculate_vmm_arena_capacity(
+      /*available_memory=*/20,
+      /*total_memory=*/80,
+      /*max_memory_utilization=*/0.8,
+      /*max_memory_utilization_configured=*/true,
+      /*lazy=*/true,
+      /*max_cache_size=*/0,
+      /*reserved_memory_bytes=*/8);
+
+  EXPECT_EQ(capacity.maximum_bytes, 56);
+  EXPECT_EQ(capacity.initial_bytes, 0);
+  EXPECT_EQ(capacity.growth_memory_reserve_bytes, 24);
+}
+
+TEST(VmmArenaCapacityTest, EncoderReservationCanExhaustCacheLimit) {
+  const VmmArenaCapacity capacity = calculate_vmm_arena_capacity(
+      /*available_memory=*/40,
+      /*total_memory=*/80,
+      /*max_memory_utilization=*/1.0,
+      /*max_memory_utilization_configured=*/false,
+      /*lazy=*/true,
+      /*max_cache_size=*/4,
+      /*reserved_memory_bytes=*/8);
+
+  EXPECT_EQ(capacity.maximum_bytes, 0);
+  EXPECT_EQ(capacity.initial_bytes, 0);
+  EXPECT_EQ(capacity.growth_memory_reserve_bytes, 8);
+}
+
 }  // namespace
 }  // namespace xllm

@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/distributed_runtime/model_residency_coordinator.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config_validation.h"
 #include "core/framework/config/speculative_config.h"
@@ -271,8 +272,8 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
     draft_model_residency_coordinator_ =
         std::make_unique<ModelResidencyCoordinator>(
             ModelResidencyCoordinator::Options{
-                .enabled =
-                    KVCacheConfig::get_instance().enable_virtual_memory(),
+                .enabled = KVCacheConfig::get_instance().enable_vmm_kvcache() ||
+                           LoadConfig::get_instance().enable_vmm_weights(),
                 .model_id = engine_options.model_id()},
             speculative_engine_->get_distributed_worker_manager());
   } else {

@@ -79,10 +79,11 @@ void ScheduleOverlapState::shutdown() {
   condition_.notify_all();
 }
 
-bool ScheduleOverlapState::has_request_overlap(
+bool ScheduleOverlapState::can_reuse_tokens(
     const std::vector<std::string>& request_ids) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return detail::has_request_id_overlap(request_ids, request_ids_);
+  return has_tokens_ &&
+         detail::has_request_id_overlap(request_ids, request_ids_);
 }
 
 void ScheduleOverlapState::retire_prior_inputs() const {

@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "core/framework/allocator/virtual_memory/physical_page_pool.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/kv_cache/linear_state_restore.h"
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
@@ -668,7 +669,9 @@ void TaskExecutionPipeline::observe_execution_memory(uint32_t slot_id) {
     return;
   }
   const auto& cache_config = KVCacheConfig::get_instance();
-  if (!cache_config.enable_virtual_memory() || !cache_config.vmm_elastic()) {
+  if ((!cache_config.enable_vmm_kvcache() &&
+       !LoadConfig::get_instance().enable_vmm_weights()) ||
+      !cache_config.vmm_elastic()) {
     return;
   }
   if (is_warmup) {

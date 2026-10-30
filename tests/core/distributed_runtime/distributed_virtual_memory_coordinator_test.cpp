@@ -438,6 +438,34 @@ TEST_F(ElasticPoolInitializationTest,
 }
 
 TEST_F(ElasticPoolInitializationTest,
+       PreserveEncoderCacheReservationOnEveryWorker) {
+  const int64_t page_size =
+      KVCacheConfig::get_instance().phy_page_granularity_size();
+  TransactionTestServer first(
+      MappingFailure::NONE, 10, 20 * page_size, 80 * page_size);
+  TransactionTestServer second(
+      MappingFailure::NONE, 10, 36 * page_size, 40 * page_size);
+  ASSERT_EQ(first.start(), 0);
+  ASSERT_EQ(second.start(), 0);
+  auto coordinator = DistributedVirtualMemoryCoordinatorTestPeer::create();
+  DistributedVirtualMemoryCoordinatorTestPeer::connect(
+      *coordinator, {first.address(), second.address()});
+
+  EXPECT_EQ(coordinator->init_physical_page_pools(
+                /*max_memory_utilization=*/0.8,
+                /*max_cache_size=*/0,
+                /*max_memory_utilization_configured=*/true,
+                /*reserved_memory_bytes=*/2 * page_size),
+            30);
+  EXPECT_EQ(first.service().initialized_pages(), 30);
+  EXPECT_EQ(second.service().initialized_pages(), 30);
+  EXPECT_EQ(first.service().initial_pages(), 2);
+  EXPECT_EQ(second.service().initial_pages(), 2);
+  EXPECT_EQ(first.service().growth_memory_reserve_bytes(), 18 * page_size);
+  EXPECT_EQ(second.service().growth_memory_reserve_bytes(), 10 * page_size);
+}
+
+TEST_F(ElasticPoolInitializationTest,
        ZeroRatioAllowsFullDeviceAddressCapacity) {
   const int64_t page_size =
       KVCacheConfig::get_instance().phy_page_granularity_size();

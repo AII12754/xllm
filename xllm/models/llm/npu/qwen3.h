@@ -529,6 +529,8 @@ REGISTER_MODEL_ARGS_WITH_VARNAME(qwen3_atb, qwen3_atb, [&] {
   LOAD_ARG_OR(tie_word_embeddings, "tie_word_embeddings", false);
 
   LOAD_ARG_OR(use_sliding_window, "use_sliding_window", false);
+  LOAD_ARG_OR(sliding_window, "sliding_window", -1);
+  LOAD_ARG_OR(sliding_window_non_causal, "sliding_window_non_causal", false);
   LOAD_ARG_OR(max_window_layers, "max_window_layers", 28);
 
   // DSpark: low-rank dim of the Markov head (top-level config key, like vLLM's

@@ -187,7 +187,7 @@ def test_reflected_dspark_rope_matches_hf_rope() -> None:
     assert not torch.equal(cache[31], RotaryEmbedding(128, 32, cfg.rope_theta).cos_sin_cache[31])
 
 
-def _verify_builder() -> Qwen3_5GdnMetadataBuilder:
+def _verify_builder(checkpoint_stride: int = 8) -> Qwen3_5GdnMetadataBuilder:
     cfg = make_linear_config(
         linear_num_key_heads=1,
         linear_num_value_heads=1,
@@ -200,8 +200,8 @@ def _verify_builder() -> Qwen3_5GdnMetadataBuilder:
             LayerCache(
                 key=None,
                 value=None,
-                conv=torch.zeros(3, 10, 384, dtype=torch.bfloat16),
-                ssm=torch.zeros(24, 1, 128, 128),
+                conv=torch.zeros(3, checkpoint_stride + 2, 384, dtype=torch.bfloat16),
+                ssm=torch.zeros(3 * checkpoint_stride, 1, 128, 128),
             )
         ]
     )
@@ -317,7 +317,8 @@ def test_verify_graph_requires_maps_only_for_dense_kernel(packed_kernel: bool) -
     assert actual.packed_to_dense is None and actual.dense_to_packed is None
 
 
-def test_verify_routes_to_checkpointed_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("width", [2, 4, 6, 7, 8, 17])
+def test_fixed_verify_routes_to_dense_kernel_without_host_lengths(monkeypatch: pytest.MonkeyPatch, width: int) -> None:
     cfg = make_linear_config(
         linear_num_key_heads=1,
         linear_num_value_heads=1,
@@ -326,30 +327,33 @@ def test_verify_routes_to_checkpointed_kernel(monkeypatch: pytest.MonkeyPatch) -
     )
     layer = NpuQwen3_5GatedDeltaNet(cfg, 0, torch.bfloat16, torch.device("cpu"))
     layer.out_proj = nn.Identity()
-    builder = _verify_builder()
+    builder = _verify_builder(width)
     states = torch.tensor([1, 2], dtype=torch.int32)
     metadata = builder.build(
         SimpleNamespace(
-            slot_mapping=torch.arange(16, dtype=torch.int32),
-            q_seq_lens_host=torch.tensor([8, 8], dtype=torch.int32),
+            slot_mapping=torch.arange(2 * width, dtype=torch.int32),
+            q_seq_lens_host=None,
             linear_state_indices=states,
-            num_accepted_tokens=torch.tensor([2, 7], dtype=torch.int32),
-            num_accepted_tokens_host_values=(2, 7),
+            num_accepted_tokens=torch.tensor([1, width], dtype=torch.int32),
+            num_accepted_tokens_host_values=(),
             is_dummy=False,
             is_spec_verify=True,
         )
     )
-    verify = MagicMock(return_value=torch.ones(2, 8, 1, 128, dtype=torch.bfloat16))
+    verify = MagicMock(return_value=torch.ones(2, width, 1, 128, dtype=torch.bfloat16))
     monkeypatch.setattr(kernels, "mega_gdn_mtp_decode", verify, raising=False)
+    varlen = MagicMock(side_effect=AssertionError("fixed verification must not invoke the varlen kernel"))
+    monkeypatch.setattr(kernels, "mega_gdn_mtp_decode_varlen", varlen, raising=False)
     context = ForwardContext(None, torch.device("cpu"), None, [])
     context.layer_shared_cache[GdnMetadata] = metadata
     with forward_context(context):
-        output = layer(torch.zeros(16, 8, dtype=torch.bfloat16))
-    assert output.shape == (16, 128)
+        output = layer(torch.zeros(2 * width, 8, dtype=torch.bfloat16))
+    assert output.shape == (2 * width, 128)
+    varlen.assert_not_called()
     args = verify.call_args.args
-    assert args[0].shape == (2, 8, 384)
+    assert args[0].shape == (2, width, 384)
     torch.testing.assert_close(args[9], states)
-    torch.testing.assert_close(args[11], torch.tensor([2, 7], dtype=torch.int32))
+    torch.testing.assert_close(args[11], torch.tensor([1, width], dtype=torch.int32))
 
 
 @pytest.mark.parametrize("padding_value", [77.0, float("nan")], ids=["finite", "nonfinite"])

@@ -231,19 +231,24 @@ Block 值类型编译为 `kv_cache_block_types`，供 request 和 prefix cache �
 KV 扩展 service，不解释其消息。schema 仍包含 KV 消息，因此当前拆分消除了 C++
 领域与构建目标依赖，协议层尚未完全分离。
 
-配置使用 `enable_virtual_memory`、`worker_memory_master_node_addr`。
-启用虚拟内存且 `nnodes > 1` 时，rank 0 在 `worker_memory_master_node_addr`
+`enable_vmm_kvcache` 选择虚拟 KV Cache 后端，`enable_vmm_weights` 选择 VMM
+权重加载并隐式启用 manual loader。两者默认为 `false`，可以独立启用：仅启用
+KV VMM 时继续使用配置的权重加载器，仅启用权重 VMM 时继续使用物理 KV Cache。
+任一开关启用后都会初始化共享 VMM 资源，并应用 VMM 配置；两者同时启用时共享
+物理页池和页预算。模型休眠、唤醒和 fork 需要 `enable_vmm_weights=true`。权重 VMM 目前仅支持 LLM 后端。仅启用权重 VMM 时要求 `vmm_elastic=true`，避免固定权重页池占用物理 KV Cache 所需的显存。
+
+任一 VMM 开关启用且 `nnodes > 1` 时，rank 0 在 `worker_memory_master_node_addr`
 监听，收集各 worker 的内存 RPC 服务地址。各 worker 在此注册自己的服务地址，
 rank 0 再连接这些地址，派发内存操作。这套注册服务独立于 `master_node_addr`
 配置的执行 worker 注册服务。显式 CLI 参数优先于 JSON 配置。
 
 ### 弹性虚拟 KV
 
-`enable_virtual_memory=false` 继续使用原有物理 cache 实现。启用虚拟内存后，
+`enable_vmm_kvcache=false` 继续使用原有物理 cache 实现。任一 VMM 开关启用后，
 `vmm_elastic=true` 使用按需物化的物理页：启动时只建立稳定页 ID 和虚拟地址，
 活跃 KV 映射及权重预留才分配物理句柄。KV 页最后一个 block 归还后才解除映射并
 释放物理 backing；活跃页、padding block、权重及持有传输 lease 的页仍被固定。
-`vmm_elastic=false` 保留原有启动时整体驻留的 VMM 池。
+只有对应 VMM 开关启用的资源才使用这些页。`vmm_elastic=false` 使用固定整体驻留的 VMM 池。
 
 `max_memory_utilization` 和 `max_cache_size` 是 KV 与权重共享的可选扩张上限。
 弹性模式预留最多覆盖设备总显存的稳定虚拟地址，再按显式配置的正数 ratio 和字节

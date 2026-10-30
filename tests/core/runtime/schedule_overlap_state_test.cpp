@@ -47,7 +47,6 @@ TEST(ScheduleOverlapStateTest, ConsumedOutputRemainsAvailableForContinuation) {
   EXPECT_TRUE(state.has_tokens());
   EXPECT_TRUE(state.prior_output().sample_output.next_tokens.defined());
   EXPECT_EQ(state.request_ids(), (std::vector<std::string>{"request"}));
-  EXPECT_TRUE(state.has_request_overlap({"new", "request"}));
   EXPECT_EQ(state.sample_sequence_ids(),
             (std::vector<std::string>{"sequence"}));
 
@@ -59,8 +58,16 @@ TEST(ScheduleOverlapStateTest, ConsumedOutputRemainsAvailableForContinuation) {
   EXPECT_EQ(state.request_ids(), (std::vector<std::string>{"next_request"}));
   EXPECT_EQ(state.sample_sequence_ids(),
             (std::vector<std::string>{"next_sequence"}));
-  EXPECT_FALSE(state.has_request_overlap({"request"}));
-  EXPECT_TRUE(state.has_request_overlap({"next_request"}));
+}
+
+TEST(ScheduleOverlapStateTest, ChecksContinuationTokensAndRequestOwnership) {
+  ScheduleOverlapState state(/*publish_to_host=*/true,
+                             /*retain_tokenless_output=*/false);
+  EXPECT_FALSE(state.can_reuse_tokens({"request"}));
+
+  ASSERT_TRUE(state.record(token_output(7), {"request"}, {"sequence"}));
+  EXPECT_TRUE(state.can_reuse_tokens({"request", "next"}));
+  EXPECT_FALSE(state.can_reuse_tokens({"other"}));
 }
 
 TEST(ScheduleOverlapStateTest,
@@ -83,8 +90,6 @@ TEST(ScheduleOverlapStateTest,
   EXPECT_EQ(state.request_ids(), (std::vector<std::string>{"next_request"}));
   EXPECT_EQ(state.sample_sequence_ids(),
             (std::vector<std::string>{"next_sequence"}));
-  EXPECT_FALSE(state.has_request_overlap({"prior_request"}));
-  EXPECT_TRUE(state.has_request_overlap({"next_request"}));
 }
 
 TEST(ScheduleOverlapStateTest, EmptyPublicationClearsPriorContinuation) {

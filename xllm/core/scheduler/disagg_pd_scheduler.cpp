@@ -241,7 +241,7 @@ void DisaggPDScheduler::register_instance_info(const std::string& server_name) {
 
   // Get total physical pages per worker (for etcd registration)
 #if defined(USE_NPU)
-  if (::xllm::KVCacheConfig::get_instance().enable_virtual_memory()) {
+  if (::xllm::KVCacheConfig::get_instance().enable_vmm_kvcache()) {
     auto& memory_coordinator =
         DistributedVirtualMemoryCoordinator::get_instance();
     if (memory_coordinator.is_initialized()) {
@@ -1393,7 +1393,7 @@ bool DisaggPDScheduler::exceeds_decode_capacity(Sequence* sequence) const {
   const BlockManagerPool* block_manager = engine_->block_manager_pool();
   CHECK(block_manager != nullptr);
   const BlockManagerPool::Options& block_options = block_manager->options();
-  if (block_options.enable_virtual_memory() ||
+  if (block_options.enable_vmm_kvcache() ||
       !block_options.manager_types().empty() ||
       (block_options.enable_host_offload() &&
        options_.instance_role() != InstanceRole::DECODE)) {

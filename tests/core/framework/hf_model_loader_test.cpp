@@ -697,6 +697,32 @@ TEST(HFModelLoaderTest, Qwen3DSparkFieldsFromTorchConfig) {
   EXPECT_TRUE(args.confidence_head_with_markov());
 }
 
+TEST(HFModelLoaderTest, Qwen3DSparkPreservesSlidingWindowVisibility) {
+  std::vector<std::string> model_types = {"qwen3"};
+#if defined(USE_NPU)
+  model_types.emplace_back("qwen3_atb");
+#endif
+  for (const std::string& model_type : model_types) {
+    ModelArgsLoader loader = ModelRegistry::get_model_args_loader(model_type);
+    ASSERT_NE(loader, nullptr);
+    JsonReader reader;
+    ASSERT_TRUE(reader.parse_text(R"json({
+      "speculators_model_type": "dspark",
+      "sliding_window_non_causal": true,
+      "transformer_layer_config": {
+        "model_type": "qwen3",
+        "sliding_window": 2048,
+        "use_sliding_window": true
+      }
+    })json"));
+    normalize_config_torch_dtype(reader);
+    ModelArgs args;
+    ASSERT_TRUE(loader(reader, &args));
+    EXPECT_EQ(args.sliding_window(), 2048);
+    EXPECT_TRUE(args.sliding_window_non_causal());
+  }
+}
+
 TEST(HFModelLoaderTest, Qwen38DSparkPreservesYarnGeometry) {
   auto loader = ModelRegistry::get_model_args_loader("qwen3");
   ASSERT_NE(loader, nullptr);

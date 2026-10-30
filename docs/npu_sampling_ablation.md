@@ -1,7 +1,10 @@
 # NPU sampling: implementation and validation
 
-This report covers the local changes on `perf/npu-sampling-pipeline`, based on
-xLLM `9dee07ef4ab6d8130794ceb538e2c6c049d49ed2`. DeepInfer was inspected at
+The cleanup measurements in this report describe the snapshot committed as
+`b3c3b5429b0dabfb1debaf878a63cd049a4130ed`, originally based on xLLM
+`9dee07ef4ab6d8130794ceb538e2c6c049d49ed2`. Subsequent integration with `main`
+preserves its sampling controls and acceptance-count outputs; these timings
+are not measurements of that integrated build. DeepInfer was inspected at
 `553741557a57df44a46fb3ab72b6aafeaf945337`. Tests use Ascend 910B2, CANN 9.0.0,
 PyTorch 2.9.0 and torch_npu 2.9.0.post2. Native tests use physical device 4;
 serving measurements use devices 4–7.
@@ -19,7 +22,7 @@ standalone reference and the mutable ablation control.
 | A | 1 | Batched sampling | Batch seeded categorical draws on device; avoid copying seed/offset controls back to the host and constructing a generator per sampled request. |
 | B | 2 | Random-row filtering | Compact random rows before temperature/min-p/top-k/top-p processing in supported ordinary mixed batches; scatter results back. Penalties and grammar still run for every row. |
 | C | 4 | Fused logits sampling | Fuse normalization and categorical selection, avoiding a vocabulary-sized FP32 probability tensor. Requires A for ordinary sampling. Existing filtering stays separate. |
-| D | 8 | Compact normalization | Keep the row maximum and shifted log-sum-exp separately for stable selected-score gathering; reuse both in verification. Preserve full log-softmax for top-logprob requests. |
+| D | 8 | Compact normalization | Keep the row maximum and shifted log-sum-exp separately for stable selected-score gathering and verification. Raw model logprobs use their own normalization, before penalties or filtering. Preserve full log-softmax for top-logprob requests. |
 | E | 16 | Sparse DFlash2 | Preserve the DFlash2 selector's existing candidate support through proposal construction, transport, acceptance and exact residual recovery. |
 | G | 32 | Verification sampling | Use the shared fused categorical kernel for bonus/recovery tokens in supported verifier batches. Acceptance/prefix handling stays in the existing verifier. |
 
@@ -76,7 +79,7 @@ The macros inline during AOT compilation. Their module is included in both
 AOT dependency fingerprints. Numerical contracts remain on the production API;
 there is no additional runtime dispatch layer.
 
-## Current local validation
+## Cleanup validation before main integration
 
 The cleanup isolates the A-only reference at build time, removes its Torch
 registration, and extracts shared kernel logic. The generated weight sampler
@@ -91,6 +94,7 @@ instrumented build, while fused boundary and distribution coverage remains.
 The production service and sampler contain neither the weight-sampler symbol
 nor the mutable mask; the production kernel archive excludes its objects.
 Clang-format 20.1.6, repository pre-commit checks, and diff checks pass.
+These results cover the cleanup snapshot, not the subsequent main integration.
 Results, commands, and source/binary identities are recorded under
 `local/npu_sampling/review_revision/redundancy_cleanup/`.
 
@@ -101,6 +105,30 @@ dense/sparse recovery, point-mass acceptance, sentinels, proposal lifetime,
 packed inputs, slot reuse, configuration, and task-pipeline transport.
 The weight-only endpoint test belongs to the instrumented build; the
 production fused sampler retains distribution and vocabulary-boundary tests.
+
+## Main integration validation
+
+The integration with `main` at `8c5b8e8c` preserves raw-model logprobs before
+sampling transforms, draft-prefix penalties, and int32 accepted-token counts.
+Seeded verification uses the ordinary sampler at each logical token offset,
+so both paths select the same supported NPU implementation. Rejection gathers
+clamp the full-acceptance count to a valid draft index and convert it to int64.
+The integration also fixes an upstream calibration-loop variable rename that
+otherwise prevents the task-pipeline runtime from compiling.
+
+The integrated production build passes 309 cases: 46 sampler, 37 CPU controls,
+150 speculative pipeline, 51 slot-buffer, 18 packed-input, and seven
+speculative-metrics cases. Two new NPU regressions cover ordinary/verification
+seed alignment in random and mixed batches, zero-length drafts, grammar rejection, full
+acceptance counts, and raw logprobs under bias/top-k for both compact and
+full top-logprob reporting. Clang-format 20.1.6 and repository pre-commit
+checks pass. Commands, logs, and source/binary identities are recorded under
+`local/npu_sampling/review_revision/main_integration/`.
+
+The runtime's updated `dspark_greedy_verify_commit` TileLang kernel is
+regenerated from the integrated source. Native performance, instrumented
+ablation tests, and real-model E2E have not been rerun on this integration;
+the timings elsewhere in this report retain their stated earlier versions.
 
 ## Native performance
 

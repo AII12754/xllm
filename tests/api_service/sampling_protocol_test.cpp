@@ -106,6 +106,34 @@ TEST(SamplingProtocolTest, RejectsInvalidControlsBeforeGeneration) {
   }
 }
 
+TEST(SamplingProtocolTest, FullVocabularyLogprobsSurviveProtobufDecoding) {
+  for (const auto endpoint :
+       {OpenAIEndpoint::CHAT, OpenAIEndpoint::COMPLETION}) {
+    auto request = generation_request(endpoint);
+    if (endpoint == OpenAIEndpoint::CHAT) {
+      request.update({{"logprobs", true}, {"top_logprobs", -1}});
+    } else {
+      request["logprobs"] = -1;
+    }
+    const auto [status, body] =
+        normalize_openai_request(request.dump(), endpoint, "model");
+    ASSERT_TRUE(status.ok()) << status.message();
+    if (endpoint == OpenAIEndpoint::CHAT) {
+      proto::ChatRequest decoded;
+      const Status parsed = decode_chat_request(body, &decoded);
+      ASSERT_TRUE(parsed.ok()) << parsed.message();
+      EXPECT_EQ(decoded.top_logprobs(), -1);
+    } else {
+      proto::CompletionRequest decoded;
+      std::string error;
+      json2pb::Json2PbOptions options;
+      ASSERT_TRUE(json2pb::JsonToProtoMessage(body, &decoded, options, &error))
+          << error;
+      EXPECT_EQ(decoded.logprobs(), -1);
+    }
+  }
+}
+
 TEST(SamplingProtocolTest, NullControlsUseDefaultsAndTinyTemperatureIsClamped) {
   auto request = generation_request(OpenAIEndpoint::CHAT);
   request.update({{"seed", nullptr},

@@ -44,6 +44,7 @@ if(USE_NPU)
     SRCS
       py_causal_lm_test.cpp
     DEPS
+      :model_loader
       models
       GTest::gtest_main
     ENVIRONMENT

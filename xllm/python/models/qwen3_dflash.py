@@ -75,7 +75,7 @@ class DFlashQwen3Config(Qwen3Config):
                 "beta_slow": d["rope_scaling_beta_slow"],
                 "attention_factor": d["rope_scaling_attn_factor"],
             }
-        if normalized_config.get("sliding_window") is None:
+        if normalized_config.get("sliding_window") is None or d.get("use_sliding_window") is False:
             normalized_config["sliding_window"] = 0
 
         base = Qwen3Config.from_dict(normalized_config)
@@ -172,18 +172,24 @@ class DFlashQwen3Model(Qwen3Model):
         device: torch.device,
         *,
         decoder_layer_type: type[Qwen3DecoderLayer] = Qwen3DecoderLayer,
+        causal: bool = False,
     ) -> None:
         super().__init__(
             cfg,
             dtype,
             device,
-            causal=False,
+            causal=causal,
             create_embedding=False,
             decoder_layer_type=decoder_layer_type,
         )
         self.cfg = cfg
         self.dtype = dtype
         self.device = device
+        for layer in self.layers:
+            # Standard block drafts use an explicit mask. Specialized draft
+            # layers retain their own FIA policy, such as DFlash2's band mode.
+            if layer.self_attn.attn.fia_sparse_mode is None:
+                layer.self_attn.attn.fia_sparse_mode = 0
         self.fc = DFlashContextProjection(
             cfg.hidden_size,
             cfg.tp_size,

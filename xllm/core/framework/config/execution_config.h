@@ -71,6 +71,7 @@ class ExecutionConfig final {
          "enable_graph",
          "enable_unified_mtp_graph",
          "disable_graph_warmup",
+         "block_draft_graph_warmup_max_kv_len",
          "enable_graph_double_buffer",
          "enable_graph_mode_decode_no_padding",
          "enable_prefill_piecewise_graph",
@@ -103,6 +104,9 @@ class ExecutionConfig final {
   PROPERTY(bool, enable_unified_mtp_graph) = false;
 
   PROPERTY(bool, disable_graph_warmup) = false;
+
+  // Zero covers the full model context; -1 keeps lazy KV-capacity capture.
+  PROPERTY(int32_t, block_draft_graph_warmup_max_kv_len) = 0;
 
   PROPERTY(bool, enable_graph_double_buffer) = true;
 

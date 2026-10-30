@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
@@ -172,7 +173,9 @@ ProfileManager::ProfileManager(
     const auto& execution_config = ::xllm::ExecutionConfig::get_instance();
     const auto& cache_config = KVCacheConfig::get_instance();
     const bool elastic_vmm =
-        cache_config.enable_virtual_memory() && cache_config.vmm_elastic();
+        (cache_config.enable_vmm_kvcache() ||
+         LoadConfig::get_instance().enable_vmm_weights()) &&
+        cache_config.vmm_elastic();
     if (execution_config.enable_graph()) {
       if (execution_config.disable_graph_warmup()) {
         CHECK(!elastic_vmm)

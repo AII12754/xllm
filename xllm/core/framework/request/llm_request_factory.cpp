@@ -232,8 +232,7 @@ RequestSamplingParam LLMRequestFactory::build_sampling_param(
   // Shared field mapping (and the best_of > n logprobs rule) lives on
   // RequestParams; layer the LLM-specific rules on top.
   RequestSamplingParam sampling_param = sp.to_sampling_param(best_of);
-  sampling_param.device_min_tokens =
-      options_->enable_task_pipeline() && sp.min_tokens > 0;
+  sampling_param.device_min_tokens = sp.min_tokens > 0;
   sampling_param.json_object =
       ServiceConfig::get_instance().enable_json_object_output() &&
       sp.response_format == ResponseFormatType::JSON_OBJECT;
@@ -417,21 +416,15 @@ std::shared_ptr<Request> LLMRequestFactory::create(
     return nullptr;
   }
   if (options_->num_speculative_tokens() > 0 &&
+      !SpeculativeConfig::is_mtp_algorithm(options_->speculative_algorithm()) &&
       (sp.seed.has_value() ||
-       (sp.min_tokens > 0 && !options_->enable_task_pipeline()) ||
+       (sp.min_tokens > 0 && !sampling_param.device_min_tokens) ||
        !sp.bad_words.empty())) {
     CALLBACK_WITH_ERROR(
         StatusCode::INVALID_ARGUMENT,
         "seed, min_tokens and bad_words require num_speculative_tokens=0",
         sp.service_request_id,
         sp.source_xservice_addr);
-    return nullptr;
-  }
-  if (options_->enable_schedule_overlap() && !sp.bad_words.empty()) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "bad_words requires enable_schedule_overlap=false",
-                        sp.service_request_id,
-                        sp.source_xservice_addr);
     return nullptr;
   }
   if (const auto error =

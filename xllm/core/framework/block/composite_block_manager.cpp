@@ -124,13 +124,13 @@ std::unique_ptr<BlockManager> maybe_concurrent(
 std::unique_ptr<BlockManager> make_kv_leaf(const BlockManager::Options& kv_opts,
                                            int32_t dp_rank,
                                            VmmKVPageAllocator* page_allocator) {
-  if (!kv_opts.enable_virtual_memory()) {
+  if (!kv_opts.enable_vmm_kvcache()) {
     return std::make_unique<BlockManagerImpl>(kv_opts);
   }
   CHECK_GT(kv_opts.num_layers(), 0)
-      << "num_layers must be set when enable_virtual_memory is true";
+      << "num_layers must be set when enable_vmm_kvcache is true";
   CHECK_GT(kv_opts.slot_size(), 0)
-      << "slot_size must be set when enable_virtual_memory is true";
+      << "slot_size must be set when enable_vmm_kvcache is true";
   CHECK(page_allocator != nullptr)
       << "Virtual memory KV cache requires a page allocator";
   const size_t page_size = page_allocator->page_size();
@@ -373,7 +373,7 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     BlockManager::Options kv_opts = options;
     kv_opts.block_type(BlockType::KV);
     const bool kv_prefix_cache =
-        prefix_cache_on && !options.enable_virtual_memory() && kv_participates;
+        prefix_cache_on && !options.enable_vmm_kvcache() && kv_participates;
     kv_opts.enable_prefix_cache(kv_prefix_cache);
     leaves.emplace(
         BlockType::KV,

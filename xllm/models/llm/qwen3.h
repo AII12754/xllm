@@ -347,6 +347,7 @@ REGISTER_MODEL_ARGS(qwen3, [&] {
 
   LOAD_ARG_OR(use_sliding_window, "use_sliding_window", false);
   LOAD_ARG_OR(sliding_window, "sliding_window", -1);
+  LOAD_ARG_OR(sliding_window_non_causal, "sliding_window_non_causal", false);
   LOAD_ARG_OR(max_window_layers, "max_window_layers", 28);
 
   LOAD_ARG_OR(markov_rank, "markov_rank", 0);

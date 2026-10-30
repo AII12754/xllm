@@ -70,8 +70,9 @@ python setup.py install
 已有产品构建时，也可单独执行 `python setup.py test` 来编译并运行单测。
 为兼容第三方构建定义，CMake 中仍保留测试目标注册。
 可传入 `--device npu` 等参数指定硬件后端。
-构建 wheel 时仍会编译和运行单测，设置 `SKIP_TEST=1` 可跳过；
-`SKIP_EXPORT=1` 则单独控制普通构建是否编译 Python 扩展。
+`bdist_wheel` 和 `install` 只编译产品并打包 wheel，不编译或运行单测；
+需要测试时，显式执行 `python setup.py test`。
+`SKIP_EXPORT=1` 控制普通构建是否编译 Python 扩展。
 使用 `MAX_JOBS` 控制原生代码和 xllm_ops 的编译并发数；如需单独调整
 xllm_ops，可设置 `OPS_CPU_NUMBER`。运行 NPU 单测时建议设置
 `CTEST_PARALLEL=1`，避免超过设备允许的进程数。

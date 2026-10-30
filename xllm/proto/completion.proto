@@ -53,8 +53,9 @@ message CompletionRequest {
   // whether to stream partial completions back as they are generated. default = false
   optional bool stream = 8;
 
-  // include the log probabilities of the chosen tokens. the maximum value is 5.
-  optional uint32 logprobs = 9;
+  // Include chosen-token log probabilities and up to 2000 alternatives.
+  // A value of -1 requests the full vocabulary.
+  optional int32 logprobs = 9;
 
   // whether to include the original prompt in the completion response. default = true
   optional bool echo = 10;

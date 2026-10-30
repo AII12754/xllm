@@ -72,6 +72,9 @@ TEST(SamplingParamsTest, MinimumConstraintsExpandForVerifyAndStayOffDrafts) {
   params.min_token_positions = torch::tensor({100, 200}, torch::kInt64);
   params.min_tokens_remaining = torch::tensor({3, 4}, torch::kInt64);
   params.min_token_ids = torch::tensor({{7, -1}, {8, 9}}, torch::kInt64);
+  params.bad_words = torch::ones({2, 1, 2}, torch::kInt64);
+  params.bad_word_suffix = torch::ones({2, 1}, torch::kInt64);
+  params.seeds = torch::ones({2}, torch::kInt64);
   EXPECT_TRUE(params.has_sampling_fields());
   for (const auto& field : kSamplingFields) {
     if (!field.per_request) {
@@ -94,6 +97,9 @@ TEST(SamplingParamsTest, MinimumConstraintsExpandForVerifyAndStayOffDrafts) {
     EXPECT_FALSE(draft.min_token_positions.defined());
     EXPECT_FALSE(draft.min_tokens_remaining.defined());
     EXPECT_FALSE(draft.min_token_ids.defined());
+    EXPECT_FALSE(draft.bad_words.defined());
+    EXPECT_FALSE(draft.bad_word_suffix.defined());
+    EXPECT_FALSE(draft.seeds.defined());
     EXPECT_FALSE(draft.has_sampling_fields());
   }
   EXPECT_TRUE(params.min_token_ids.defined());

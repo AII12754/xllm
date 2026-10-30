@@ -19,16 +19,26 @@ limitations under the License.
 #include <pybind11/eval.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <nlohmann/json.hpp>
+#include <optional>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "core/framework/config/kernel_config.h"
 #include "core/framework/model/llm_model_params.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_params_view.h"
 #include "core/framework/model_context/model_context.h"
+#include "core/framework/model_loader/hf_model_args.h"
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/quantization/quant_args.h"
 #include "core/kv_cache/storage/kv_cache.h"
+#include "core/util/scope_guard.h"
 #include "core/util/utils.h"
 
 namespace py = pybind11;
@@ -123,7 +133,8 @@ TEST(PyCausalLMMegaMoeCapacityTest,
 // dependency-free BridgeTestModel and returns a CPU ModelContext carrying the
 // given model_type (the Python side instantiates BridgeTestModel regardless —
 // real model classes such as deepseek_v4 require full vocab/layer configs).
-ModelContext make_bridge_model_context(const char* model_type) {
+ModelContext make_bridge_model_context(const char* model_type,
+                                       ModelArgs model_args = {}) {
   {
     py::gil_scoped_acquire gil;
     // Idempotent, but run the py::exec/registry writes only once across the
@@ -149,7 +160,6 @@ ModelContext make_bridge_model_context(const char* model_type) {
   parallel_args.python_rendezvous_host_ = "127.0.0.1";
   parallel_args.python_rendezvous_port_ = 1;
 
-  ModelArgs model_args;
   model_args.model_type(model_type);
   return ModelContext(
       parallel_args,
@@ -157,6 +167,110 @@ ModelContext make_bridge_model_context(const char* model_type) {
       QuantArgs(),
       torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32),
       /*context=*/nullptr);
+}
+
+TEST(PyCausalLMConfigBridgeTest, PreservesBlockDraftWindowEnablement) {
+  std::string pattern =
+      (std::filesystem::temp_directory_path() / "xllm_draft_window_XXXXXX")
+          .string();
+  const char* directory = ::mkdtemp(pattern.data());
+  ASSERT_NE(directory, nullptr);
+  const std::filesystem::path model_path(directory);
+  ScopeGuard remove_directory([&] { std::filesystem::remove_all(model_path); });
+  KernelConfig& kernel_config = KernelConfig::get_instance();
+  const std::string previous_backend = kernel_config.npu_kernel_backend();
+  ScopeGuard restore_backend(
+      [&] { kernel_config.npu_kernel_backend(previous_backend); });
+  kernel_config.npu_kernel_backend("TORCH");
+
+  struct WindowCase {
+    const char* draft_type;
+    std::optional<bool> enabled;
+    std::optional<int32_t> window;
+    bool nested;
+  };
+  const WindowCase cases[] = {
+      {"dflash2", std::nullopt, 8, false},
+      {"dflash2", true, 8, false},
+      {"dflash2", false, 8, false},
+      {"dflash2", std::nullopt, 8, true},
+      {"dflash2", false, 8, true},
+      {"dspark", std::nullopt, 8, true},
+      {"dspark", true, 8, true},
+      {"dspark", false, 8, true},
+      {"dspark", std::nullopt, std::nullopt, true},
+      {"dspark", std::nullopt, 0, true},
+      {"", std::nullopt, 8, false},
+  };
+  for (const WindowCase& test : cases) {
+    const std::string draft_type = test.draft_type;
+    nlohmann::json config = {
+        {"model_type", "qwen3"},
+        {"hidden_size", 4},
+        {"num_hidden_layers", 1},
+        {"num_attention_heads", 1},
+        {"num_key_value_heads", 1},
+        {"head_dim", 4},
+        {"intermediate_size", 8},
+        {"vocab_size", 8},
+    };
+    config["sliding_window"] = test.window.has_value()
+                                   ? nlohmann::json(*test.window)
+                                   : nlohmann::json(nullptr);
+    if (test.enabled.has_value()) {
+      config["use_sliding_window"] = *test.enabled;
+    }
+    if (draft_type == "dflash2") {
+      config["dflash_config"] = {{"block_size", 4},
+                                 {"conv_group_size", 2},
+                                 {"conv_kernel_size", 2},
+                                 {"selector_rank", 2},
+                                 {"selector_top_k", 2}};
+    } else if (draft_type == "dspark") {
+      config["markov_rank"] = 2;
+    }
+    if (test.nested) {
+      config = {{"speculators_model_type", draft_type},
+                {"transformer_layer_config", config}};
+    }
+    SCOPED_TRACE(config.dump());
+    {
+      std::ofstream output(model_path / "config.json");
+      output << config;
+      ASSERT_TRUE(output.good());
+    }
+    ModelArgs args;
+    ASSERT_TRUE(load_hf_model_args(model_path, /*backend=*/"llm", &args));
+    const bool expected_enabled = test.enabled.value_or(
+        !draft_type.empty() && test.window.value_or(0) > 0);
+    EXPECT_EQ(args.use_sliding_window(), expected_enabled);
+    if (draft_type.empty()) {
+      continue;
+    }
+    const bool is_dflash2 = draft_type == "dflash2";
+    const char* model_type =
+        is_dflash2 ? "DFlash2DraftModel" : "DSparkDraftModel";
+    ModelContext context =
+        make_bridge_model_context(model_type, std::move(args));
+    PyCausalLM model(context, kBridgeTestModelType);
+    py::gil_scoped_acquire gil;
+    const char* module = is_dflash2 ? "xllm.python.models.qwen3_dflash2"
+                                    : "xllm.python.models.qwen3_dspark";
+    const char* config_class =
+        is_dflash2 ? "DFlash2Qwen3Config" : "Qwen3DSparkConfig";
+    py::object python_config = py::module_::import(module)
+                                   .attr(config_class)
+                                   .attr("from_dict")(model.config_dict());
+    const int32_t expected_window =
+        expected_enabled ? test.window.value_or(0) : 0;
+    EXPECT_EQ(python_config.attr("sliding_window").cast<int32_t>(),
+              expected_window);
+    if (is_dflash2 && expected_window == 0) {
+      EXPECT_THROW(python_config.attr("validate")(), py::error_already_set);
+    } else {
+      python_config.attr("validate")();
+    }
+  }
 }
 
 TEST(PyCausalLMContextKVBridgeTest, PassesSwaCacheAsSixthPythonSlot) {

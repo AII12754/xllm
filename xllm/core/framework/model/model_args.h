@@ -244,6 +244,7 @@ class SlidingWindowArgs final {
 
   PROPERTY(bool, use_sliding_window) = false;
   PROPERTY(int32_t, sliding_window) = -1;
+  PROPERTY(bool, sliding_window_non_causal) = false;
   PROPERTY(int32_t, max_window_layers) = 0;
 };
 
@@ -1071,6 +1072,7 @@ struct ModelArgs {
 
   FORWARD_PROPERTY(bool, use_sliding_window, sliding_window_args);
   FORWARD_PROPERTY(int32_t, sliding_window, sliding_window_args);
+  FORWARD_PROPERTY(bool, sliding_window_non_causal, sliding_window_args);
   FORWARD_PROPERTY(int32_t, max_window_layers, sliding_window_args);
 
   FORWARD_PROPERTY(int64_t, num_speculative_tokens, speculative_args);

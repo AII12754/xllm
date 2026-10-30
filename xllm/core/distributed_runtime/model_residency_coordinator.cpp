@@ -133,7 +133,7 @@ bool ModelResidencyCoordinator::initialize_model(
     int32_t tp_size,
     MasterStatus master_status) {
   std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-  if (!options_.enabled) {
+  if (!options_.enabled || !LoadConfig::get_instance().enable_vmm_weights()) {
     return true;
   }
   if (distributed_worker_manager_ == nullptr ||
@@ -157,11 +157,19 @@ bool ModelResidencyCoordinator::initialize_model(
         dp_size,
         worker_count,
         KVCacheConfig::get_instance().phy_page_granularity_size(),
-        /*enable_prealloc=*/true);
+        /*enable_prealloc=*/KVCacheConfig::get_instance().enable_vmm_kvcache());
   }
 
   const std::string& model_id = options_.model_id;
   coordinator.set_model_parallel_strategy(model_id, dp_size, tp_size);
+
+  // Weight-only VMM still uses the residency transaction, with an empty KV
+  // mapping plan. Physical KV tensors remain owned by their normal allocator.
+  if (!KVCacheConfig::get_instance().enable_vmm_kvcache() &&
+      !coordinator.vmm_kv_page_allocator().register_model(model_id,
+                                                          num_layers)) {
+    return false;
+  }
 
   const int64_t total_weight_size =
       get_effective_weight_size(model_loader, num_layers);
@@ -202,7 +210,8 @@ bool ModelResidencyCoordinator::initialize_model(
 bool ModelResidencyCoordinator::finish_initialization(
     MasterStatus master_status) {
   std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-  if (!options_.enabled || master_status == MasterStatus::WAKEUP) {
+  if (!options_.enabled || !LoadConfig::get_instance().enable_vmm_weights() ||
+      master_status == MasterStatus::WAKEUP) {
     return true;
   }
 
@@ -237,8 +246,8 @@ void ModelResidencyCoordinator::get_virtual_memory_info(
 
 bool ModelResidencyCoordinator::sleep(MasterStatus master_status) {
   std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-  if (!options_.enabled) {
-    LOG(WARNING) << "sleep requires --enable_virtual_memory=true";
+  if (!options_.enabled || !LoadConfig::get_instance().enable_vmm_weights()) {
+    LOG(WARNING) << "sleep requires --enable_vmm_weights=true";
     return false;
   }
   if (!is_sleep_status(master_status)) {
@@ -284,8 +293,8 @@ bool ModelResidencyCoordinator::sleep(MasterStatus master_status) {
 
 bool ModelResidencyCoordinator::wakeup(const WakeupOptions& options) {
   std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-  if (!options_.enabled) {
-    LOG(WARNING) << "wakeup requires --enable_virtual_memory=true";
+  if (!options_.enabled || !LoadConfig::get_instance().enable_vmm_weights()) {
+    LOG(WARNING) << "wakeup requires --enable_vmm_weights=true";
     return false;
   }
   if (!is_sleep_status(options.master_status) ||
@@ -294,7 +303,7 @@ bool ModelResidencyCoordinator::wakeup(const WakeupOptions& options) {
                << options_.model_id;
     return false;
   }
-  if (KVCacheConfig::get_instance().enable_virtual_memory() &&
+  if (LoadConfig::get_instance().enable_vmm_weights() &&
       KVCacheConfig::get_instance().vmm_elastic() &&
       !options.remote_addrs.empty()) {
     // The current transport requires a dense, fully resident shared arena.
@@ -420,7 +429,7 @@ bool ModelResidencyCoordinator::wakeup(const WakeupOptions& options) {
 }
 
 bool ModelResidencyCoordinator::is_suspended() const {
-  if (!options_.enabled) {
+  if (!options_.enabled || !LoadConfig::get_instance().enable_vmm_weights()) {
     return false;
   }
   auto& coordinator = DistributedVirtualMemoryCoordinator::get_instance();

@@ -130,6 +130,13 @@ endif()
 xllm_export_native_host(xllm)
 xllm_export_native_host(xllm_export)
 
+if(USE_NPU)
+  include(npu_runtime)
+  foreach(_native_host xllm xllm_export)
+    xllm_configure_npu_runtime(${_native_host})
+  endforeach()
+endif()
+
 # link brpc
 target_link_libraries(xllm PRIVATE glog::glog brpc leveldb::leveldb protobuf::libprotobuf ${OpenCV_LIBS} ${FFMPEG_LIBRARIES})
 add_dependencies(xllm brpc-static)
@@ -138,7 +145,6 @@ if(USE_NPU)
   set(COMMON_LIBS
       torch_npu
       torch_python
-      tensorpipe
       npu_profiler
       Python::Python
       ascendcl
@@ -148,6 +154,16 @@ if(USE_NPU)
       c_sec
       nnopbase
       ms_tools_ext)
+  # Some Torch wheels embed TensorPipe in libtorch_cpu instead of shipping
+  # a standalone library. Link it explicitly only when this Torch provides it.
+  find_library(TENSORPIPE_LIBRARY NAMES tensorpipe
+    HINTS "${TORCH_INSTALL_PREFIX}/lib"
+          "$ENV{PYTORCH_INSTALL_PATH}/lib"
+          "$ENV{PYTORCH_NPU_INSTALL_PATH}/lib"
+    NO_DEFAULT_PATH)
+  if(TENSORPIPE_LIBRARY)
+    list(APPEND COMMON_LIBS "${TENSORPIPE_LIBRARY}")
+  endif()
 elseif(USE_MLU)
   set(COMMON_LIBS Python::Python)
 endif()

@@ -395,6 +395,24 @@ class WorkerImpl {
       const LlmForwardInput& input);
   virtual std::optional<ForwardOutput> step_for_schedule_overlap(
       const VlmForwardInput& input);
+  // Orders linear-state restoration after input preparation on the compute
+  // stream. Leaf workers use this before their no-sync forward; composite
+  // workers use it before their regular step dispatch.
+  void prepare_schedule_overlap(const LlmForwardInput& input);
+  void prepare_schedule_overlap(const VlmForwardInput& input);
+  // Keep no-sync inputs alive until their compute stream work is complete.
+  // Overlap callers request an event; composite callers retire the ownership
+  // through their own completion path.
+  template <typename Input>
+  void finalize_no_sync_output(ForwardOutput& output,
+                               const Input& input,
+                               ForwardCompletion completion) {
+    output.retained_inputs.emplace_back(std::make_shared<Input>(input.clone()));
+    if (completion == ForwardCompletion::RECORD_EVENT) {
+      output.ready_event = device_.current_stream()->record_event_or_sync();
+    }
+  }
+
   // Return true when the model rebuilds this input in place or manages its
   // continuation in step(). Return false without changing the input to use
   // the coordinator's ordinary token replacement.
@@ -494,6 +512,9 @@ class WorkerImpl {
                        MasterStatus master_status);
 
   WorkerResidencyState residency_state_;
+
+  template <typename Input>
+  void prepare_schedule_overlap_impl(const Input& input);
 
   template <typename Input>
   std::optional<ForwardOutput> step_for_schedule_overlap_impl(

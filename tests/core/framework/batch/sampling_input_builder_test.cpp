@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/stopping_checker.h"
+#include "core/framework/sampling/logits_processor.h"
 
 namespace xllm {
 namespace {
@@ -60,18 +61,24 @@ TEST(SamplingInputBuilderTest, MasksStopsUntilMinimumAndBadWordCompletions) {
   StoppingChecker stopping;
   Sequence sequence = make_sequence(params, stopping, 0, {1, 2});
   auto first = build_row(params, sequence);
-  EXPECT_EQ(first.logits_bias[0][3].item<float>(), 0.0F);
-  EXPECT_TRUE(std::isinf(first.logits_bias[0][4].item<float>()));
-  EXPECT_TRUE(std::isinf(first.logits_bias[0][7].item<float>()));
+  torch::Tensor first_logits = torch::zeros({1, 8});
+  apply_sampling_penalties(first_logits, first);
+  EXPECT_EQ(first_logits[0][3].item<float>(), 0.0F);
+  EXPECT_TRUE(std::isinf(first_logits[0][4].item<float>()));
+  EXPECT_TRUE(std::isinf(first_logits[0][7].item<float>()));
   sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
   sequence.append_token(Token(2));
   auto second = build_row(params, sequence);
-  EXPECT_TRUE(std::isinf(second.logits_bias[0][3].item<float>()));
-  EXPECT_TRUE(std::isinf(second.logits_bias[0][7].item<float>()));
+  torch::Tensor second_logits = torch::zeros({1, 8});
+  apply_sampling_penalties(second_logits, second);
+  EXPECT_TRUE(std::isinf(second_logits[0][3].item<float>()));
+  EXPECT_TRUE(std::isinf(second_logits[0][7].item<float>()));
   sequence.append_token(Token(5));
   auto third = build_row(params, sequence);
-  EXPECT_EQ(third.logits_bias[0][3].item<float>(), 0.0F);
-  EXPECT_EQ(third.logits_bias[0][7].item<float>(), 0.0F);
+  torch::Tensor third_logits = torch::zeros({1, 8});
+  apply_sampling_penalties(third_logits, third);
+  EXPECT_EQ(third_logits[0][3].item<float>(), 0.0F);
+  EXPECT_EQ(third_logits[0][7].item<float>(), 0.0F);
 }
 
 TEST(SamplingInputBuilderTest, MergesConstraintsAndIndependentSeedOffsets) {

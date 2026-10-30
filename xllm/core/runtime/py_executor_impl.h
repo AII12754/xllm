@@ -66,6 +66,11 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
                              std::vector<KVCache>& kv_caches,
                              const ModelParamsView& params) override;
 
+  std::vector<torch::Tensor> get_prepared_aux_hidden_states(
+      const torch::Tensor& tokens,
+      const torch::Tensor& positions,
+      const ModelParamsView& params);
+
   ModelOutput run(const torch::Tensor& tokens,
                   const torch::Tensor& positions,
                   std::vector<KVCache>& kv_caches,

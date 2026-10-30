@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include "common/macros.h"
+#include "core/framework/model/model_output.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/embedding_cache.h"
 #include "runtime/vlm_forward_params.h"
@@ -34,32 +35,26 @@ void clear_selected_embeddings(ForwardOutput& output) {
 
 void output_spec_hidden_states(
     SampleOutput& sample_output,
-    const torch::Tensor& hidden_states,
-    const torch::Tensor& aux_hidden_states,
+    const ModelOutput& model_output,
     const torch::Tensor& logits_indices,
     const torch::Tensor& gathered_sample_hidden_states,
     bool is_target_prefill,
     bool cp_enabled) {
-  const bool has_aux = aux_hidden_states.defined();
   const torch::Tensor& target_hidden_states =
-      has_aux ? aux_hidden_states : hidden_states;
+      get_hidden_states_for_drafter(model_output);
+  CHECK(target_hidden_states.defined())
+      << "speculative hidden states are undefined";
   torch::Tensor sample_hidden_states;
   if (logits_indices.defined()) {
-    // CP decode must reuse the pre-gathered rows: logits_indices live in
-    // all-gather space and cannot index the local hidden shard. Off that path
-    // we still reuse them when no aux hidden is requested, since gathered rows
-    // are produced from the main hidden only.
-    const bool must_use_gathered = cp_enabled && !is_target_prefill;
-    if (must_use_gathered) {
+    // The lm_head selection contains primary rows, not auxiliary rows.
+    const bool has_aux = model_output.aux_hidden_states.defined();
+    if (cp_enabled && !is_target_prefill && !has_aux) {
       CHECK(gathered_sample_hidden_states.defined())
           << "gathered selected hidden is required on the CP decode path";
     }
-    if (gathered_sample_hidden_states.defined() &&
-        (must_use_gathered || !has_aux)) {
+    if (gathered_sample_hidden_states.defined() && !has_aux) {
       sample_hidden_states = gathered_sample_hidden_states;
     } else {
-      CHECK(target_hidden_states.defined())
-          << "speculative hidden states are undefined";
       sample_hidden_states = target_hidden_states.index_select(
           /*dim=*/0,
           logits_indices.to(torch::dtype(torch::kLong)

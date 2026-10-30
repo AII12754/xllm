@@ -91,6 +91,13 @@ std::optional<ForwardOutput> VLMWorkerImpl::step(const VlmForwardInput& input) {
   return step_internal(input, ForwardSyncPolicy::LEGACY);
 }
 
+std::optional<ForwardOutput> VLMWorkerImpl::step_for_schedule_overlap(
+    const VlmForwardInput& input) {
+  prepare_schedule_overlap(input);
+  return execute_no_sync_on_stream(
+      input, *compute_stream_, ForwardCompletion::RECORD_EVENT);
+}
+
 std::optional<ForwardOutput> VLMWorkerImpl::execute_no_sync_on_stream(
     const VlmForwardInput& input,
     Stream& compute_stream,
@@ -190,8 +197,7 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
         !input.input_params.meta.batch_forward_type.is_decode() &&
         !is_spec_draft_;
     output_spec_hidden_states(output.sample_output,
-                              model_output.hidden_states,
-                              model_output.aux_hidden_states,
+                              model_output,
                               lm_head_selected_token_idxes,
                               selected_hidden_from_lm_head,
                               is_target_prefill,
@@ -199,29 +205,13 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   }
 
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
-    output.retained_inputs.emplace_back(
-        std::make_shared<VlmForwardInput>(input.clone()));
-    if (completion == ForwardCompletion::RECORD_EVENT) {
-      output.ready_event = device_.current_stream()->record_event_or_sync();
-    }
+    finalize_no_sync_output(output, input, completion);
     return output;
   }
 
   auto ret = device_.synchronize_default_stream();
   (void)ret;
   return output;
-}
-
-std::optional<ForwardOutput> VLMWorkerImpl::step_for_schedule_overlap(
-    const VlmForwardInput& input) {
-  // Linear-attention VLMs need the same compute-stream restore ordering as
-  // LLMs.
-  if (has_linear_attention_layers(context_.get_model_args())) {
-    c10::StreamGuard restore_guard = compute_stream_->set_stream_guard();
-    try_restore_linear_state_slots(ModelParamsView(input.input_params));
-  }
-  return execute_no_sync_on_stream(
-      input, *compute_stream_, ForwardCompletion::RECORD_EVENT);
 }
 
 }  // namespace xllm

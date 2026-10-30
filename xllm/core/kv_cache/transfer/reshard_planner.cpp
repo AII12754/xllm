@@ -304,6 +304,25 @@ Status validate_tensor_pair(const AtomicLogicalRegion& source,
         "matching logical tensors have incompatible dtype or resource "
         "semantics");
   }
+  if (source.role == static_cast<int32_t>(KVCacheTensorRole::KPOOL_TAIL)) {
+    constexpr size_t kKpoolRank = 4;
+    constexpr int64_t kKpoolPlanes = 2;
+    const CacheTensorManifest& source_tensor = *source.tensor;
+    const CacheTensorManifest& destination_tensor = *destination.tensor;
+    // Circular rows use position % tail capacity, so neither growth nor
+    // truncation preserves their meaning without remapping token positions.
+    if (source_tensor.shape.size() != kKpoolRank ||
+        destination_tensor.shape.size() != kKpoolRank ||
+        source_tensor.shape[1] != kKpoolPlanes ||
+        !std::equal(source_tensor.shape.begin() + 1,
+                    source_tensor.shape.end(),
+                    destination_tensor.shape.begin() + 1) ||
+        source_tensor.stride != destination_tensor.stride ||
+        source_tensor.physical_rows_per_resource != 1 ||
+        destination_tensor.physical_rows_per_resource != 1) {
+      return invalid("KPool circular-tail layouts differ");
+    }
+  }
   return Status();
 }
 
@@ -317,6 +336,11 @@ Status validate_coverage_for_sources(
       return invalid("destination logical bytes have no source writer");
     }
     const RegionGroup& sources = source_it->second;
+    const int32_t tensor_role = std::get<2>(key);
+    const bool is_conv =
+        tensor_role == static_cast<int32_t>(KVCacheTensorRole::CONV);
+    const bool is_linear_state_tensor =
+        is_conv || tensor_role == static_cast<int32_t>(KVCacheTensorRole::SSM);
     const Status tensor_status =
         visit_overlaps(sources,
                        destinations,
@@ -330,7 +354,19 @@ Status validate_coverage_for_sources(
 
     std::vector<std::pair<uint64_t, int32_t>> events;
     events.reserve(sources.size() * 2);
+    bool compact_linear_source = is_linear_state_tensor;
+    int64_t max_source_state_len = std::numeric_limits<int64_t>::min();
     for (const AtomicLogicalRegion* source : sources) {
+      if (compact_linear_source) {
+        compact_linear_source =
+            source->tensor->physical_rows_per_resource == 1 &&
+            (!is_conv || source->tensor->shape.size() > 1);
+        if (compact_linear_source && is_conv) {
+          // The NPU CONV layout is [blocks, state_len, dim].
+          max_source_state_len =
+              std::max(max_source_state_len, source->tensor->shape[1]);
+        }
+      }
       events.emplace_back(source->logical_offset, 1);
       events.emplace_back(logical_end(*source), -1);
     }
@@ -353,12 +389,19 @@ Status validate_coverage_for_sources(
       }
       coverage.emplace_back(CoveragePoint{position, writers});
     }
+    const uint64_t source_coverage_end = coverage.back().position;
 
     for (const AtomicLogicalRegion* destination : destinations) {
       const uint64_t destination_end = logical_end(*destination);
+      const bool expanded_shape =
+          compact_linear_source &&
+          (is_conv ? destination->tensor->shape.size() > 1 &&
+                         destination->tensor->shape[1] > max_source_state_len
+                   : destination->tensor->physical_rows_per_resource > 1);
+      const auto coverage_end = coverage.end();
       auto next_point =
           std::upper_bound(coverage.begin(),
-                           coverage.end(),
+                           coverage_end,
                            destination->logical_offset,
                            [](uint64_t position, const CoveragePoint& point) {
                              return position < point.position;
@@ -368,16 +411,21 @@ Status validate_coverage_for_sources(
       uint64_t cursor = destination->logical_offset;
       while (cursor < destination_end) {
         const uint64_t next_position =
-            next_point == coverage.end()
+            next_point == coverage_end
                 ? destination_end
                 : std::min(destination_end, next_point->position);
         if (next_position > cursor && writers != 1) {
-          return invalid(
-              writers == 0 ? "destination logical bytes have no source writer"
-                           : "destination logical bytes have multiple writers");
+          const bool expanded_linear_destination =
+              expanded_shape && writers == 0 && cursor >= source_coverage_end;
+          if (!expanded_linear_destination) {
+            return invalid(
+                writers == 0
+                    ? "destination logical bytes have no source writer"
+                    : "destination logical bytes have multiple writers");
+          }
         }
         cursor = next_position;
-        if (cursor < destination_end && next_point != coverage.end()) {
+        if (cursor < destination_end && next_point != coverage_end) {
           writers = next_point->writers;
           ++next_point;
         }

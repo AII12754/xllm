@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/kv_cache_store_config.h"
+#include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
@@ -876,7 +877,7 @@ TEST(KVCacheConfigValidationTest, RejectsNonpositiveStartupTimeout) {
 
 TEST(KVCacheConfigValidationTest, ElasticVmmAllowsUnsetUtilizationCeiling) {
   KVCacheConfig config;
-  config.enable_virtual_memory(true)
+  config.enable_vmm_kvcache(true)
       .vmm_elastic(true)
       .max_memory_utilization(0.0)
       .vmm_memory_reserve_bytes(0)
@@ -890,14 +891,14 @@ TEST(KVCacheConfigValidationTest, RejectsUnsetCeilingOutsideElasticVmm) {
   EXPECT_DEATH(
       {
         KVCacheConfig config;
-        config.enable_virtual_memory(false).max_memory_utilization(0.0);
+        config.enable_vmm_kvcache(false).max_memory_utilization(0.0);
         config.validate();
       },
       "Only elastic VMM");
   EXPECT_DEATH(
       {
         KVCacheConfig config;
-        config.enable_virtual_memory(true)
+        config.enable_vmm_kvcache(true)
             .vmm_elastic(false)
             .max_memory_utilization(0.0);
         config.validate();
@@ -916,7 +917,7 @@ TEST(KVCacheConfigValidationTest, RejectsInvalidUtilizationCeilings) {
     EXPECT_DEATH(
         {
           KVCacheConfig config;
-          config.enable_virtual_memory(true)
+          config.enable_vmm_kvcache(true)
               .vmm_elastic(true)
               .max_memory_utilization(ratio);
           config.validate();
@@ -1041,6 +1042,53 @@ TEST(ConfigJsonTest, RegistersExplicitFiaDecodeCommandLineOption) {
   EXPECT_FALSE(execution_config.enable_fia_decode());
 }
 
+TEST(ConfigJsonTest, BlockDraftKvWarmupDefaultsAndJsonRoundTrip) {
+  google::FlagSaver flag_saver;
+  google::CommandLineFlagInfo flag_info;
+  ASSERT_TRUE(google::GetCommandLineFlagInfo(
+      "block_draft_graph_warmup_max_kv_len", &flag_info));
+  EXPECT_EQ(flag_info.default_value, "0");
+  ExecutionConfig execution_config;
+  EXPECT_EQ(execution_config.block_draft_graph_warmup_max_kv_len(), 0);
+  const auto& names = ExecutionConfig::option_category().option_names;
+  EXPECT_NE(
+      std::find(
+          names.begin(), names.end(), "block_draft_graph_warmup_max_kv_len"),
+      names.end());
+  for (const int32_t limit : {-1, 32768}) {
+    nlohmann::ordered_json exported;
+    {
+      // Each value models a fresh startup; JSON loading writes back flags.
+      google::FlagSaver limit_flag_saver;
+      ExecutionConfig loaded_config;
+      loaded_config.from_flags();
+      loaded_config.from_json(config::parse_json_string(nlohmann::ordered_json{
+          {"block_draft_graph_warmup_max_kv_len", limit}}.dump()));
+      EXPECT_EQ(loaded_config.block_draft_graph_warmup_max_kv_len(), limit);
+      loaded_config.append_config_json(exported);
+    }
+    EXPECT_EQ(exported.at("block_draft_graph_warmup_max_kv_len").get<int32_t>(),
+              limit);
+    google::FlagSaver restored_flag_saver;
+    ExecutionConfig restored_config;
+    restored_config.from_flags();
+    restored_config.from_json(config::parse_json_string(exported.dump()));
+    EXPECT_EQ(restored_config.block_draft_graph_warmup_max_kv_len(), limit);
+  }
+}
+
+TEST(ConfigJsonTest, BlockDraftKvWarmupCommandLineOverridesJson) {
+  google::FlagSaver flag_saver;
+  ASSERT_FALSE(google::SetCommandLineOption(
+                   "block_draft_graph_warmup_max_kv_len", "32768")
+                   .empty());
+  ExecutionConfig execution_config;
+  execution_config.from_flags();
+  execution_config.from_json(config::parse_json_string(
+      R"json({"block_draft_graph_warmup_max_kv_len":-1})json"));
+  EXPECT_EQ(execution_config.block_draft_graph_warmup_max_kv_len(), 32768);
+}
+
 TEST(ConfigJsonTest, LoadJsonFileReadsConfigFixture) {
   // The fixture sets more keys than ConfigFlagGuard restores, and from_json
   // writes every resolved value back into its FLAGS_ global. FlagSaver reverts
@@ -1057,6 +1105,10 @@ TEST(ConfigJsonTest, LoadJsonFileReadsConfigFixture) {
   kv_cache_config.from_flags();
   kv_cache_config.from_json(json);
 
+  LoadConfig load_config;
+  load_config.from_flags();
+  load_config.from_json(json);
+
   SchedulerConfig scheduler_config;
   scheduler_config.from_flags();
   scheduler_config.from_json(json);
@@ -1068,7 +1120,8 @@ TEST(ConfigJsonTest, LoadJsonFileReadsConfigFixture) {
   EXPECT_EQ(kv_cache_config.indexer_cache_dtype(), "int8");
   EXPECT_FALSE(kv_cache_config.enable_prefix_cache());
   EXPECT_EQ(kv_cache_config.xxh3_128bits_seed(), 2048);
-  EXPECT_TRUE(kv_cache_config.enable_virtual_memory());
+  EXPECT_TRUE(kv_cache_config.enable_vmm_kvcache());
+  EXPECT_TRUE(load_config.enable_vmm_weights());
   EXPECT_EQ(kv_cache_config.phy_page_granularity_size(), 4096);
 
   EXPECT_EQ(scheduler_config.max_tokens_per_batch(), 2048);
@@ -1377,85 +1430,120 @@ TEST(ConfigPrecedenceTest, InitializeAppliesCliOverConfigOverDefault) {
   std::filesystem::remove(config_path);
 }
 
-TEST(VirtualMemoryConfigTest, JsonLoadsAndExportsMemoryOptions) {
-  google::FlagSaver flag_saver;
-  const JsonReader json = config::parse_json_string(R"json({
-    "enable_virtual_memory": true,
-    "worker_memory_master_node_addr": "192.0.2.1:19889"
-  })json");
-  KVCacheConfig kv_cache_config;
-  DistributedConfig distributed_config;
+TEST(VirtualMemoryConfigTest, JsonLoadsAndExportsIndependentMemoryModes) {
+  for (const bool enable_kvcache : {false, true}) {
+    for (const bool enable_weights : {false, true}) {
+      google::FlagSaver flag_saver;
+      SCOPED_TRACE(nlohmann::json({{"enable_vmm_kvcache", enable_kvcache},
+                                   {"enable_vmm_weights", enable_weights}})
+                       .dump());
+      const JsonReader json = config::parse_json_string(
+          nlohmann::json(
+              {{"enable_vmm_kvcache", enable_kvcache},
+               {"enable_vmm_weights", enable_weights},
+               {"worker_memory_master_node_addr", "192.0.2.1:19889"}})
+              .dump());
+      KVCacheConfig kv_cache_config;
+      LoadConfig load_config;
+      DistributedConfig distributed_config;
 
-  kv_cache_config.from_json(json);
-  distributed_config.from_json(json);
+      kv_cache_config.from_json(json);
+      load_config.from_json(json);
+      distributed_config.from_json(json);
 
-  EXPECT_TRUE(kv_cache_config.enable_virtual_memory());
-  EXPECT_EQ(distributed_config.worker_memory_master_node_addr(),
-            "192.0.2.1:19889");
-  EXPECT_TRUE(FLAGS_enable_virtual_memory);
-  EXPECT_EQ(FLAGS_worker_memory_master_node_addr, "192.0.2.1:19889");
+      EXPECT_EQ(kv_cache_config.enable_vmm_kvcache(), enable_kvcache);
+      EXPECT_EQ(load_config.enable_vmm_weights(), enable_weights);
+      EXPECT_FALSE(load_config.enable_manual_loader());
+      EXPECT_EQ(distributed_config.worker_memory_master_node_addr(),
+                "192.0.2.1:19889");
 
-  nlohmann::ordered_json exported = nlohmann::ordered_json::object();
-  kv_cache_config.append_config_json(exported);
-  distributed_config.append_config_json(exported);
-  EXPECT_TRUE(exported.at("enable_virtual_memory").get<bool>());
-  EXPECT_EQ(exported.at("worker_memory_master_node_addr").get<std::string>(),
-            "192.0.2.1:19889");
-  EXPECT_FALSE(exported.contains("enable_xtensor"));
-  EXPECT_FALSE(exported.contains("xtensor_master_node_addr"));
-  EXPECT_FALSE(exported.contains("virtual_memory_master_node_addr"));
+      nlohmann::ordered_json exported = nlohmann::ordered_json::object();
+      kv_cache_config.append_config_json(exported);
+      load_config.append_config_json(exported);
+      distributed_config.append_config_json(exported);
+      EXPECT_EQ(exported.value("enable_vmm_kvcache", false), enable_kvcache);
+      EXPECT_EQ(exported.value("enable_vmm_weights", false), enable_weights);
+      EXPECT_EQ(exported.contains("enable_vmm_kvcache"), enable_kvcache);
+      EXPECT_EQ(exported.contains("enable_vmm_weights"), enable_weights);
+      EXPECT_EQ(
+          exported.at("worker_memory_master_node_addr").get<std::string>(),
+          "192.0.2.1:19889");
+      EXPECT_FALSE(exported.contains("enable_virtual_memory"));
+      EXPECT_FALSE(exported.contains("enable_xtensor"));
+      EXPECT_FALSE(exported.contains("xtensor_master_node_addr"));
+      EXPECT_FALSE(exported.contains("virtual_memory_master_node_addr"));
+    }
+  }
 }
 
 TEST(VirtualMemoryConfigTest, JsonPreservesExplicitFalseAndEmptyValues) {
   google::FlagSaver flag_saver;
   const JsonReader json = config::parse_json_string(R"json({
-    "enable_virtual_memory": false,
+    "enable_vmm_kvcache": false,
+    "enable_vmm_weights": false,
     "worker_memory_master_node_addr": ""
   })json");
   KVCacheConfig kv_cache_config;
-  kv_cache_config.enable_virtual_memory(true);
+  kv_cache_config.enable_vmm_kvcache(true);
+  LoadConfig load_config;
+  load_config.enable_vmm_weights(true);
   DistributedConfig distributed_config;
 
   kv_cache_config.from_json(json);
+  load_config.from_json(json);
   distributed_config.from_json(json);
 
-  EXPECT_FALSE(kv_cache_config.enable_virtual_memory());
+  EXPECT_FALSE(kv_cache_config.enable_vmm_kvcache());
+  EXPECT_FALSE(load_config.enable_vmm_weights());
   EXPECT_TRUE(distributed_config.worker_memory_master_node_addr().empty());
-  EXPECT_FALSE(FLAGS_enable_virtual_memory);
-  EXPECT_TRUE(FLAGS_worker_memory_master_node_addr.empty());
 }
 
-TEST(VirtualMemoryConfigTest, CommandLineOptionsOverrideJson) {
-  google::FlagSaver flag_saver;
-  ASSERT_FALSE(
-      google::SetCommandLineOption("enable_virtual_memory", "false").empty());
-  ASSERT_FALSE(google::SetCommandLineOption("worker_memory_master_node_addr",
-                                            "192.0.2.2:19889")
-                   .empty());
-  const JsonReader json = config::parse_json_string(R"json({
-    "enable_virtual_memory": true,
-    "worker_memory_master_node_addr": "192.0.2.1:19889"
-  })json");
-  KVCacheConfig kv_cache_config;
-  DistributedConfig distributed_config;
+TEST(VirtualMemoryConfigTest, CommandLineOptionsOverrideJsonIndependently) {
+  for (const bool enable_kvcache : {false, true}) {
+    for (const bool enable_weights : {false, true}) {
+      google::FlagSaver flag_saver;
+      ASSERT_FALSE(google::SetCommandLineOption(
+                       "enable_vmm_kvcache", enable_kvcache ? "true" : "false")
+                       .empty());
+      ASSERT_FALSE(google::SetCommandLineOption(
+                       "enable_vmm_weights", enable_weights ? "true" : "false")
+                       .empty());
+      ASSERT_FALSE(google::SetCommandLineOption(
+                       "worker_memory_master_node_addr", "192.0.2.2:19889")
+                       .empty());
+      const JsonReader json = config::parse_json_string(
+          nlohmann::json(
+              {{"enable_vmm_kvcache", !enable_kvcache},
+               {"enable_vmm_weights", !enable_weights},
+               {"worker_memory_master_node_addr", "192.0.2.1:19889"}})
+              .dump());
+      KVCacheConfig kv_cache_config;
+      LoadConfig load_config;
+      DistributedConfig distributed_config;
 
-  kv_cache_config.from_flags();
-  distributed_config.from_flags();
-  kv_cache_config.from_json(json);
-  distributed_config.from_json(json);
+      kv_cache_config.from_flags();
+      load_config.from_flags();
+      distributed_config.from_flags();
+      kv_cache_config.from_json(json);
+      load_config.from_json(json);
+      distributed_config.from_json(json);
 
-  EXPECT_FALSE(kv_cache_config.enable_virtual_memory());
-  EXPECT_EQ(distributed_config.worker_memory_master_node_addr(),
-            "192.0.2.2:19889");
-  EXPECT_FALSE(FLAGS_enable_virtual_memory);
-  EXPECT_EQ(FLAGS_worker_memory_master_node_addr, "192.0.2.2:19889");
+      EXPECT_EQ(kv_cache_config.enable_vmm_kvcache(), enable_kvcache);
+      EXPECT_EQ(load_config.enable_vmm_weights(), enable_weights);
+      EXPECT_EQ(distributed_config.worker_memory_master_node_addr(),
+                "192.0.2.2:19889");
+    }
+  }
 }
 
 TEST(VirtualMemoryConfigTest, RegistersMemoryOptionsWithoutLegacyAliases) {
   google::CommandLineFlagInfo flag_info;
-  ASSERT_TRUE(
+  for (const std::string& name : {"enable_vmm_kvcache", "enable_vmm_weights"}) {
+    ASSERT_TRUE(google::GetCommandLineFlagInfo(name.c_str(), &flag_info));
+    EXPECT_EQ(flag_info.default_value, "false");
+  }
+  EXPECT_FALSE(
       google::GetCommandLineFlagInfo("enable_virtual_memory", &flag_info));
-  EXPECT_EQ(flag_info.default_value, "false");
   ASSERT_TRUE(google::GetCommandLineFlagInfo("worker_memory_master_node_addr",
                                              &flag_info));
   EXPECT_EQ(flag_info.default_value, "127.0.0.1:19889");
@@ -1464,13 +1552,35 @@ TEST(VirtualMemoryConfigTest, RegistersMemoryOptionsWithoutLegacyAliases) {
       google::GetCommandLineFlagInfo("xtensor_master_node_addr", &flag_info));
   EXPECT_FALSE(google::GetCommandLineFlagInfo("virtual_memory_master_node_addr",
                                               &flag_info));
+  const KVCacheConfig kv_cache_config;
+  const LoadConfig load_config;
+  EXPECT_FALSE(kv_cache_config.enable_vmm_kvcache());
+  EXPECT_FALSE(load_config.enable_vmm_weights());
   const std::vector<std::string>& kv_options =
       KVCacheConfig::option_category().option_names;
   EXPECT_NE(
+      std::find(kv_options.begin(), kv_options.end(), "enable_vmm_kvcache"),
+      kv_options.end());
+  EXPECT_EQ(
+      std::find(kv_options.begin(), kv_options.end(), "enable_vmm_weights"),
+      kv_options.end());
+  EXPECT_EQ(
       std::find(kv_options.begin(), kv_options.end(), "enable_virtual_memory"),
       kv_options.end());
   EXPECT_EQ(std::find(kv_options.begin(), kv_options.end(), "enable_xtensor"),
             kv_options.end());
+  const std::vector<std::string>& load_options =
+      LoadConfig::option_category().option_names;
+  EXPECT_NE(
+      std::find(load_options.begin(), load_options.end(), "enable_vmm_weights"),
+      load_options.end());
+  EXPECT_EQ(
+      std::find(load_options.begin(), load_options.end(), "enable_vmm_kvcache"),
+      load_options.end());
+  EXPECT_EQ(
+      std::find(
+          load_options.begin(), load_options.end(), "enable_virtual_memory"),
+      load_options.end());
   const std::vector<std::string>& distributed_options =
       DistributedConfig::option_category().option_names;
   EXPECT_NE(std::find(distributed_options.begin(),

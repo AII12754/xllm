@@ -150,7 +150,7 @@ ContinuousSchedulerBase::ContinuousSchedulerBase(
         [this](xllm_service::proto::HeartbeatRequest& request) {
           populate_heartbeat_request(request, !options_.enable_disagg_pd());
         });
-    if (::xllm::KVCacheConfig::get_instance().enable_virtual_memory() &&
+    if (::xllm::KVCacheConfig::get_instance().enable_vmm_kvcache() &&
         !options_.enable_disagg_pd()) {
       CHECK(distributed_worker_manager_ != nullptr);
       distributed_worker_manager_->get_cache_info(instance_info_.cluster_ids,
@@ -193,7 +193,7 @@ void ContinuousSchedulerBase::populate_heartbeat_request(
   }
 
   if (include_virtual_memory_info && model_residency_coordinator_ != nullptr &&
-      ::xllm::KVCacheConfig::get_instance().enable_virtual_memory()) {
+      ::xllm::KVCacheConfig::get_instance().enable_vmm_kvcache()) {
     std::vector<size_t> worker_free_phy_pages;
     std::unordered_map<std::string, std::vector<WeightSegment>>
         model_weight_segments;

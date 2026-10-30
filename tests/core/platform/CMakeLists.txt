@@ -1,5 +1,15 @@
 include(cc_test)
 
+cc_test(
+  NAME
+    npu_vendor_paths_test
+  NO_NPU_RUNTIME
+  SRCS
+    npu_vendor_paths_test.cpp
+  DEPS
+    GTest::gtest_main
+)
+
 if(USE_NPU)
   cc_test(
     NAME

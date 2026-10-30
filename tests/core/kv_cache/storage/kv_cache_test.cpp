@@ -18,9 +18,12 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <functional>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/framework/config/kv_cache_config.h"
@@ -33,11 +36,14 @@ limitations under the License.
 #include "core/kv_cache/storage/kv_cache_utils.h"
 #include "platform/device.h"
 #include "platform/platform.h"
+#include "tests/core/kv_cache/dcp_indexer_test_fixture.h"
 #include "worker.pb.h"
 
 namespace xllm {
 
 namespace {
+
+class DcpIndexerShapeTest : public test::DcpIndexerConfigTest {};
 
 std::vector<int64_t> shape_vec(const torch::Tensor& tensor) {
   return tensor.sizes().vec();
@@ -285,7 +291,7 @@ class GenericIndexerAllocationTest : public ::testing::Test {
 };
 
 TEST_F(GenericIndexerAllocationTest, VirtualIndexerUsesAllocatorWithoutWrites) {
-  options_.enable_virtual_memory(true);
+  options_.enable_vmm_kvcache(true);
   std::vector<KVCache> caches;
   allocate_kv_caches(caches, shape_, options_);
 
@@ -388,7 +394,7 @@ TEST_F(NpuKVCacheTest, VirtualMemoryPreservesSharedIndexerOwnership) {
       .num_layers(4)
       .model_id("virtual-shared-indexer")
       .model_type("glm_moe_dsa")
-      .enable_virtual_memory(true)
+      .enable_vmm_kvcache(true)
       .enable_lighting_indexer(true)
       .indexer_cache_enabled_layers({true, false, true, false})
       .tensor_allocator(allocator);
@@ -461,7 +467,7 @@ TEST_F(NpuKVCacheTest, VirtualMemoryRejectsNpuNzLayout) {
       .dtype(torch::kBFloat16)
       .num_layers(1)
       .model_type("deepseek_v3")
-      .enable_virtual_memory(true)
+      .enable_vmm_kvcache(true)
       .tensor_allocator(std::make_shared<RecordingKVCacheTensorAllocator>());
 
   EXPECT_DEATH(create_kv_cache_tensors(shape, options),
@@ -538,7 +544,7 @@ TEST(KVCacheTest, VirtualMemoryRejectsQuantizedIndexerCache) {
       .num_layers(1)
       .model_id("virtual-quantized-indexer")
       .model_type("glm_moe_dsa")
-      .enable_virtual_memory(true)
+      .enable_vmm_kvcache(true)
       .enable_lighting_indexer(true)
       .enable_indexer_cache_quant(true)
       .tensor_allocator(std::make_shared<RecordingKVCacheTensorAllocator>());
@@ -1450,81 +1456,147 @@ TEST(KVCacheTest, SharedKPoolBudgetCoversBothModelsWithoutDoubleCounting) {
   options.cache_size_in_bytes = 64 * 1024;
   options.block_size = 32;
   options.n_local_kv_heads = 1;
-  options.max_seqs_per_batch = 3;
+  options.max_seqs_per_batch = 2;
   options.num_speculative_tokens = 5;
   KVCacheEstimateOptions draft_options = options;
   draft_options.is_draft_engine = true;
-  draft_options.max_seqs_per_batch = 1;
   draft_options.num_speculative_tokens = 0;
 
   for (const int32_t nextn_layers : {0, 1}) {
     for (const int32_t draft_kpool : {4, 32}) {
-      SCOPED_TRACE(::testing::Message() << "nextn_layers=" << nextn_layers
-                                        << ", draft_kpool=" << draft_kpool);
+      draft_options.max_seqs_per_batch = draft_kpool == 4 ? 3 : 1;
+      SCOPED_TRACE(::testing::Message()
+                   << "nextn_layers=" << nextn_layers
+                   << ", draft_kpool=" << draft_kpool
+                   << ", draft_max_seqs=" << draft_options.max_seqs_per_batch);
       target_args.num_nextn_predict_layers(nextn_layers);
       ModelArgs draft_args = target_args;
-      draft_args.n_layers(1).index_kpool(draft_kpool);
-      KVCacheCapacity target_cap =
+      draft_args.n_layers(1).index_head_dim(64).index_kpool(draft_kpool);
+      const KVCacheCapacity target_cap =
           estimate_kv_cache_capacity(target_args, options);
-      KVCacheCapacity draft_cap =
+      const KVCacheCapacity draft_cap =
           estimate_kv_cache_capacity(draft_args, draft_options);
       ASSERT_NE(target_cap.num_linear_state_blocks(),
                 draft_cap.num_linear_state_blocks());
-      const int64_t n_blocks =
-          estimate_shared_kpool_blocks(target_cap, draft_cap, draft_args);
-      target_cap.n_blocks(n_blocks);
-      draft_cap.n_blocks(n_blocks);
-      // Match the final draft shape's inherited request slots and window.
-      draft_cap.num_linear_state_blocks(target_cap.num_linear_state_blocks())
-          .kpool_tail_len(target_cap.kpool_tail_len());
-      const auto allocated_bytes = [&]() -> int64_t {
+      const SharedKPoolPlan plan =
+          plan_shared_kpool(target_cap, draft_cap, draft_args);
+      const int64_t n_blocks = plan.target.n_blocks();
+      const int64_t budget = std::min(target_cap.cache_size_in_bytes(),
+                                      draft_cap.cache_size_in_bytes());
+      EXPECT_GT(n_blocks, 0);
+      EXPECT_EQ(plan.draft.n_blocks(), n_blocks);
+      EXPECT_EQ(plan.target.cache_size_in_bytes(), budget);
+      EXPECT_EQ(plan.draft.cache_size_in_bytes(), budget);
+      EXPECT_EQ(plan.draft.num_linear_state_blocks(),
+                plan.target.num_linear_state_blocks());
+      EXPECT_GE(plan.draft.kpool_tail_len(), target_cap.kpool_tail_len());
+      const KVCacheShape plan_draft_shape(
+          plan.draft, draft_args, /*world_size=*/1);
+      EXPECT_EQ(plan_draft_shape.kpool_tail_shape()[0],
+                plan.target.num_linear_state_blocks());
+      EXPECT_EQ(plan_draft_shape.kpool_tail_shape()[2],
+                plan.draft.kpool_tail_len());
+      struct Allocation {
+        int64_t total_bytes = 0;
+        int64_t draft_tail_bytes = 0;
+      };
+      const auto measure = [&](const KVCacheCapacity& target_cap,
+                               const KVCacheCapacity& draft_cap) {
         const KVCacheShape target_shape(
             target_cap, target_args, /*world_size=*/1);
         const KVCacheShape draft_shape(draft_cap, draft_args, /*world_size=*/1);
         KVCacheCreateOptions create_options;
         create_options.enable_lighting_indexer(true).dtype(torch::kBFloat16);
-        int64_t bytes = 0;
+        Allocation allocation;
         for (int32_t layer_id = 0; layer_id < target_args.n_layers();
              ++layer_id) {
           KVCache cache(target_shape, create_options, layer_id);
           for (const KVCacheTensor& tensor : cache.get_cache_tensors()) {
-            bytes += tensor.tensor.numel() * tensor.tensor.element_size();
+            allocation.total_bytes +=
+                tensor.tensor.numel() * tensor.tensor.element_size();
           }
         }
         KVCache draft_cache(draft_shape, create_options, /*layer_id=*/0);
         for (const KVCacheTensor& tensor : draft_cache.get_cache_tensors()) {
-          bytes += tensor.tensor.numel() * tensor.tensor.element_size();
+          allocation.total_bytes +=
+              tensor.tensor.numel() * tensor.tensor.element_size();
         }
-        return bytes;
+        allocation.draft_tail_bytes =
+            draft_cache.get_kpool_tail().numel() *
+            draft_cache.get_kpool_tail().element_size();
+        return allocation;
       };
-      EXPECT_LE(allocated_bytes(), options.cache_size_in_bytes);
-      target_cap.n_blocks(n_blocks + 1);
-      draft_cap.n_blocks(n_blocks + 1);
-      EXPECT_GT(allocated_bytes(), options.cache_size_in_bytes);
+      const Allocation planned = measure(plan.target, plan.draft);
+      EXPECT_LE(planned.total_bytes, budget);
+      EXPECT_EQ(plan.draft.linear_cache_size_in_bytes(),
+                planned.draft_tail_bytes);
+      KVCacheCapacity over_target = plan.target;
+      KVCacheCapacity over_draft = plan.draft;
+      over_target.n_blocks(n_blocks + 1);
+      over_draft.n_blocks(n_blocks + 1);
+      EXPECT_GT(measure(over_target, over_draft).total_bytes, budget);
     }
   }
 }
 
-TEST(KVCacheTest, SharedKPoolBudgetRejectsInsufficientMemory) {
-  ModelArgs draft_args;
-  draft_args.index_kpool(4).index_head_dim(16);
-  KVCacheCapacity capacity;
-  capacity.block_size(16)
-      .slot_size(64)
-      .index_slot_size(8)
-      .num_full_attention_layers(1)
-      .num_indexer_layers(1)
-      .num_linear_state_blocks(5)
-      .kpool_tail_len(16)
-      .kpool_tail_slot_size(1024)
-      .linear_cache_size_in_bytes(5120)
-      .cache_size_in_bytes(10240);
-  EXPECT_DEATH(estimate_shared_kpool_blocks(capacity, capacity, draft_args),
-               "target and draft KPool request state");
-  capacity.cache_size_in_bytes(10241);
-  EXPECT_DEATH(estimate_shared_kpool_blocks(capacity, capacity, draft_args),
-               "no memory for a shared KPool block");
-}
 #endif
+
+TEST_P(DcpIndexerShapeTest, MatchesCapacityBudget) {
+  ModelArgs model_args;
+  model_args.n_layers(4)
+      .n_heads(2)
+      .n_kv_heads(2)
+      .head_dim(16)
+      .index_n_heads(1)
+      .index_head_dim(16);
+  KVCacheEstimateOptions options;
+  options.dtype = torch::kFloat16;
+  options.kv_cache_dtype = "auto";
+  options.cache_size_in_bytes = 1024 * 1024;
+  options.block_size = 16;
+  options.world_size = 1;
+  options.n_local_kv_heads = 2;
+
+  const auto element_count = [](const std::vector<int64_t>& dims) {
+    return std::accumulate(
+        dims.begin(), dims.end(), int64_t{1}, std::multiplies<int64_t>());
+  };
+  for (const bool quantized : {false, true}) {
+    SCOPED_TRACE(quantized);
+    options.indexer_cache_dtype = quantized ? "int8" : "auto";
+    const KVCacheCapacity capacity =
+        estimate_kv_cache_capacity(model_args, options);
+    const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
+    ASSERT_TRUE(shape.has_index_cache_shape());
+    EXPECT_EQ(shape.key_cache_shape()[0], capacity.n_blocks());
+    EXPECT_EQ(shape.value_cache_shape()[0], capacity.n_blocks());
+    EXPECT_EQ(shape.index_cache_shape()[0],
+              capacity.n_blocks() * expected_factor());
+    EXPECT_EQ(shape.has_index_cache_scale_shape(), quantized);
+    int64_t index_bytes =
+        element_count(shape.index_cache_shape()) * (quantized ? 1 : 2);
+    if (quantized) {
+      ASSERT_TRUE(shape.has_index_cache_scale_shape());
+      EXPECT_EQ(shape.index_cache_scale_shape()[0],
+                shape.index_cache_shape()[0]);
+      index_bytes +=
+          element_count(shape.index_cache_scale_shape()) * sizeof(float);
+    }
+    EXPECT_EQ(index_bytes,
+              capacity.n_blocks() * capacity.block_size() *
+                  capacity.index_slot_size());
+  }
+
+  model_args.index_n_heads(0);
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+  const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
+  EXPECT_FALSE(shape.has_index_cache_shape());
+  EXPECT_FALSE(shape.has_index_cache_scale_shape());
+}
+
+INSTANTIATE_TEST_SUITE_P(KvSplits,
+                         DcpIndexerShapeTest,
+                         ::testing::Values(1, 2, 4, 0));
 
 }  // namespace xllm

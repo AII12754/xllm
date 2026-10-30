@@ -334,7 +334,7 @@ void allocate_kv_caches(std::vector<KVCache>& kv_caches,
     return;
   }
 
-  if (create_options.enable_virtual_memory()) {
+  if (create_options.enable_vmm_kvcache()) {
     CHECK(layer_cache_owned.empty())
         << "VirtualMemory does not support layerwise split.";
     CHECK(kv_cache_shape.has_key_cache_shape())

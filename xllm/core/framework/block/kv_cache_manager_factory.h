@@ -48,7 +48,8 @@ class KVCacheManagerFactory final {
       torch::ScalarType dtype,
       int64_t world_size,
       const std::vector<std::shared_ptr<WorkerClient>>& worker_clients,
-      bool is_multimodal = false);
+      bool is_multimodal = false,
+      int64_t reserved_memory_bytes = 0);
 
   static KVCacheManagerFactoryResult create(
       const KVCacheCapacity& kv_cache_capacity,

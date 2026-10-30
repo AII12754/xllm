@@ -18,6 +18,8 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <algorithm>
+
 #include "core/framework/constrained/json_object_constraint_batch.h"
 #include "core/platform/stream.h"
 #include "core/runtime/forward_params.h"
@@ -45,20 +47,16 @@ void JsonObjectDecodeContinuation::advance_constraints(
 
   const bool has_prior_output =
       prior_output.sample_output.next_tokens.defined();
-  torch::Tensor next_tokens;
   if (has_prior_output) {
     c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
     if (prior_output.ready_event != nullptr) {
       CHECK(compute_stream.wait_event(prior_output.ready_event))
           << "failed to wait for last-step output before JSON grammar update";
     }
-    next_tokens =
-        safe_to(prior_output.sample_output.next_tokens,
-                torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU),
-                /*non_blocking=*/false);
-    CHECK(next_tokens.dim() == 1 || next_tokens.dim() == 2)
+    CHECK(prior_output.sample_output.next_tokens.dim() == 1 ||
+          prior_output.sample_output.next_tokens.dim() == 2)
         << "overlap JSON token output must be 1-D or 2-D, got "
-        << next_tokens.sizes();
+        << prior_output.sample_output.next_tokens.sizes();
   }
 
   bool expects_prior_output = false;
@@ -72,8 +70,9 @@ void JsonObjectDecodeContinuation::advance_constraints(
   }
   if (has_prior_output &&
       (!prior_sample_sequence_ids.empty() || expects_prior_output)) {
-    CHECK_EQ(prior_sample_sequence_ids.size(),
-             static_cast<size_t>(next_tokens.size(0)))
+    CHECK_EQ(
+        prior_sample_sequence_ids.size(),
+        static_cast<size_t>(prior_output.sample_output.next_tokens.size(0)))
         << "last-step sampled request ids must align with output rows";
   }
 
@@ -104,6 +103,19 @@ void JsonObjectDecodeContinuation::advance_constraints(
       input.json_object_states[state_idx] = JsonObjectGrammarState();
       output_rows[state_idx] = detail::kNoPriorJsonObjectOutputRow;
     }
+  }
+
+  torch::Tensor next_tokens;
+  const bool needs_prior_tokens =
+      std::any_of(output_rows.begin(), output_rows.end(), [](int32_t row) {
+        return row >= 0;
+      });
+  if (needs_prior_tokens) {
+    c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
+    next_tokens =
+        safe_to(prior_output.sample_output.next_tokens,
+                torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU),
+                /*non_blocking=*/false);
   }
 
   JsonObjectConstraintBatch constraints(input.json_object_states);

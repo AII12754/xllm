@@ -211,7 +211,7 @@ KVCacheTensors create_kv_cache_tensors(
                                              create_options);
   }
 #elif defined(USE_NPU)
-  CHECK(!create_options.enable_virtual_memory() ||
+  CHECK(!create_options.enable_vmm_kvcache() ||
         !use_npu_nz_kv_cache_layout(create_options.model_type()))
       << "Virtual memory does not support the NPU NZ KV cache layout.";
   const bool mla_packed_c8 = create_options.mla_packed_c8();
@@ -342,7 +342,7 @@ IndexedKVCacheTensors create_indexed_kv_cache_tensors(
                                            kv_cache_shape.index_cache_shape(),
                                            create_options.dtype(),
                                            create_options);
-  if (!create_options.enable_virtual_memory() &&
+  if (!create_options.enable_vmm_kvcache() &&
       create_options.tensor_allocator() != nullptr) {
     tensors.index_cache.zero_();
   }

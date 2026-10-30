@@ -42,6 +42,7 @@ from scripts.build_support.env import (
     set_musa_envs,
     set_npu_envs,
 )
+from scripts.build_support.npu_ops import stage_npu_ops_vendor as _stage_npu_ops_vendor
 from scripts.build_support.utils import (
     check_and_install_pre_commit,
     configure_ccache,
@@ -195,13 +196,12 @@ def _stage_mlu_triton_kernels(base_dir: str, extdir: str, device: str) -> None:
     os.makedirs(dest_dir, exist_ok=True)
 
     copied_count = 0
-    for item in sorted(os.listdir(source_dir)):
-        if not item.endswith(".py"):
-            continue
-        source_path = os.path.join(source_dir, item)
+    for source_path in sorted(glob.glob(os.path.join(source_dir, "**", "*.py"), recursive=True)):
         if not os.path.isfile(source_path):
             continue
-        shutil.copy2(source_path, os.path.join(dest_dir, item))
+        dest_path = os.path.join(dest_dir, os.path.relpath(source_path, source_dir))
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        shutil.copy2(source_path, dest_path)
         copied_count += 1
 
     if copied_count == 0:
@@ -613,6 +613,8 @@ class ExtBuild(build_ext):
 
         _stage_triton_npu_runtime_binaries(self.base_dir, extdir, self.device)
 
+        _stage_npu_ops_vendor(self.base_dir, extdir, self.device, env)
+
         _stage_mooncake_runtime_binaries(cmake_dir, extdir)
 
         _stage_mlu_triton_kernels(self.base_dir, extdir, self.device)
@@ -746,14 +748,6 @@ class BuildDistWheel(bdist_wheel):
         logger.info("🔨 build project...")
         self.run_command("build")
 
-        if "SKIP_TEST" in os.environ:
-            logger.info("⏭️ skipping UT because SKIP_TEST is set")
-        elif self.device == "musa":
-            logger.info("Skipping UT because the musa backend does not provide test targets")
-        else:
-            logger.info("🧪 testing UT...")
-            self.run_command("test")
-
         if self.arch == "arm":
             ext_path = get_base_dir() + f"/build/lib.linux-aarch64-cpython-{get_python_version()}/"
         else:
@@ -763,6 +757,8 @@ class BuildDistWheel(bdist_wheel):
             exit(1)
         tmp_path = os.path.join(ext_path, "xllm")
         for root, dirs, files in os.walk(tmp_path):
+            if root == tmp_path and "opp" in dirs:
+                dirs.remove("opp")
             for item in files:
                 path = os.path.join(root, item)
                 if "_test" in item and os.path.isfile(path):
@@ -852,6 +848,7 @@ class TestUT(ExtBuild):
         "BroadcastMultiDeviceTest",
         "DeepEPMultiDeviceTest",
         "AttentionMultiDeviceTest",
+        "Glm5AttentionDcpTest",
         "FusedMoEAll2AllMultiDeviceTest",
     ]
 
@@ -1161,6 +1158,7 @@ if __name__ == "__main__":
         zip_safe=False,
         py_modules=[
             "xllm/launch_server",
+            "xllm/_npu_runtime",
             "xllm/__init__",
             "xllm/pybind/llm",
             "xllm/pybind/vlm",

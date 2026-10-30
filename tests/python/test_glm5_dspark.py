@@ -215,7 +215,11 @@ def test_checkpoint_loads_original_mla_and_context_weight_names(model: Glm5DSpar
 
 
 @torch.inference_mode()
-def test_real_mla_dspark_graph_and_context_replay_match_eager() -> None:
+@pytest.mark.parametrize("warmup_limit", [-1, 0], ids=["lazy", "prewarmed"])
+@pytest.mark.parametrize("cache_pages", [1, 64])
+def test_real_mla_dspark_graph_and_context_replay_match_eager(
+    warmup_limit: int, cache_pages: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     if not torch.npu.is_available():
         pytest.skip("requires an NPU")
     from xllm.python.attention.backend import LayerCache
@@ -223,6 +227,9 @@ def test_real_mla_dspark_graph_and_context_replay_match_eager() -> None:
     from xllm.python.model_executor.executor import ModelExecutor
     from xllm.python.model_executor.runners.acl_graph import StaticGraphAttentionMetadata
 
+    # Independent test runners must not reuse an allocator pool after its
+    # final graph owner has been destroyed.
+    monkeypatch.setattr("xllm.python.model_executor.runners.acl_graph._GRAPH_POOL", None)
     config = _config(
         model_type="glm5_dspark",
         hidden_size=64,
@@ -240,6 +247,8 @@ def test_real_mla_dspark_graph_and_context_replay_match_eager() -> None:
         num_speculative_tokens=8,
         python_graph_backend="aclgraph",
         enable_task_pipeline=True,
+        max_position_embeddings=cache_pages * 128,
+        block_draft_graph_warmup_max_kv_len=warmup_limit,
     )
     torch.manual_seed(89)
     model = Glm5DSparkForCausalLM(config)
@@ -249,8 +258,8 @@ def test_real_mla_dspark_graph_and_context_replay_match_eager() -> None:
         parameter.normal_(std=0.1)
     caches = [
         (
-            torch.randn(1, 128, 1, 512, dtype=model.dtype, device=model.device),
-            torch.randn(1, 128, 1, 64, dtype=model.dtype, device=model.device),
+            torch.randn(cache_pages, 128, 1, 512, dtype=model.dtype, device=model.device),
+            torch.randn(cache_pages, 128, 1, 64, dtype=model.dtype, device=model.device),
         )
         for _ in range(model.cfg.n_layers)
     ]
@@ -263,7 +272,7 @@ def test_real_mla_dspark_graph_and_context_replay_match_eager() -> None:
         paged_kv_indptr=None,
         paged_kv_indices=None,
         paged_kv_last_page_len=None,
-        block_table=torch.zeros(1, 1, dtype=torch.int32, device=model.device),
+        block_table=torch.arange(cache_pages, dtype=torch.int32, device=model.device).view(1, cache_pages),
         q_seq_lens=torch.tensor([8], dtype=torch.int32),
         q_cu_seq_lens=torch.tensor([8], dtype=torch.int32, device=model.device),
         q_cu_seq_lens_host_values=[8],
@@ -276,16 +285,24 @@ def test_real_mla_dspark_graph_and_context_replay_match_eager() -> None:
     with torch.npu.stream(stream):
         executor.prepare_metadata(metadata)
         executor.warmup_prepared_graph(tokens, positions, metadata)
-        for length in (12, 24, 8, 32):
+        prepared = executor.prepared_graph_runner
+        initial_graphs = len(prepared._prepared_graphs)
+        assert initial_graphs == (2 if cache_pages == 64 and warmup_limit == 0 else 1)
+        lengths = (12, 24, 8, 32) if cache_pages == 1 else (12, 4090, 4097, 6112, 32)
+        for length in lengths:
             positions.copy_(torch.arange(length - 8, length, dtype=torch.int32, device=model.device))
             metadata.slot_mapping.copy_(positions)
             metadata.kv_seq_lens.fill_(length)
+            metadata.kv_seq_lens_host_values[:] = [length]
             executor.prepare_metadata(metadata)
             reference = executor.execute(tokens, positions, metadata).clone()
             actual = executor.execute(tokens, positions, metadata, enable_graph=True)
             torch.npu.synchronize()
             torch.testing.assert_close(actual, reference)
-        assert executor.prepared_graph_runner.prepared_replays == 4
+        assert prepared.prepared_replays == len(lengths)
+        assert len(prepared._prepared_graphs) == (2 if cache_pages == 64 else 1)
+        if warmup_limit == 0:
+            assert len(prepared._prepared_graphs) == initial_graphs
 
         context = torch.randn(8, 128, dtype=model.dtype, device=model.device)
         context_positions = torch.arange(8, dtype=torch.int32, device=model.device)

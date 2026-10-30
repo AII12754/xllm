@@ -20,6 +20,7 @@ limitations under the License.
 #include <optional>
 #include <utility>
 
+#include "core/framework/sampling/logits_processor.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/framework/speculative/rejection_sampler.h"
 #include "core/framework/speculative/spec_verify.h"
@@ -270,6 +271,114 @@ TEST(SamplerControlsTest, SeededSamplingDoesNotChangeGlobalGenerator) {
   const auto second = sample(logits, params);
   EXPECT_TRUE(torch::equal(first.next_tokens, second.next_tokens));
   EXPECT_TRUE(torch::equal(before, generator.get_state()));
+}
+
+TEST(SamplerControlsTest, OverlapAdvancesBadWordSuffixAndSeedByAcceptedTokens) {
+  auto params = make_sampling_params(2, false);
+  params.bad_words = torch::tensor({{{1, 2, 3}}, {{1, 2, 3}}}, torch::kLong);
+  params.bad_word_suffix = torch::tensor({{-1, 1}, {-1, -1}}, torch::kLong);
+  params.seeds = torch::tensor({42, -1}, torch::kLong);
+  params.seed_offsets = torch::tensor({7, 10}, torch::kLong);
+  advance_sampling_history(
+      params, torch::tensor({{1, 2, -1}, {2, -1, -1}}, torch::kLong), {1, 0});
+  torch::Tensor logits =
+      torch::tensor({{0.F, 0.F, 0.F, 100.F}, {0.F, 0.F, 0.F, 100.F}});
+  const auto result = sample(logits, params);
+  EXPECT_NE(result.next_tokens[0].item<int64_t>(), 3);
+  EXPECT_NE(result.next_tokens[1].item<int64_t>(), 3);
+  EXPECT_EQ(params.seed_offsets[0].item<int64_t>(), 8);
+  EXPECT_EQ(params.seed_offsets[1].item<int64_t>(), 12);
+}
+
+TEST(SamplerControlsTest, OverlapLeavesNewRequestsUnchanged) {
+  auto params = make_sampling_params(2, false);
+  params.bad_words = torch::tensor({{{2, 3}}, {{2, 3}}}, torch::kLong);
+  params.bad_word_suffix = torch::full({2, 1}, -1, torch::kLong);
+  advance_sampling_history(params, torch::tensor({2}, torch::kLong), {-1, 0});
+  torch::Tensor logits =
+      torch::tensor({{0.F, 0.F, 0.F, 100.F}, {0.F, 0.F, 0.F, 100.F}});
+  const auto result = sample(logits, params);
+  EXPECT_EQ(result.next_tokens[0].item<int64_t>(), 3);
+  EXPECT_NE(result.next_tokens[1].item<int64_t>(), 3);
+}
+
+TEST(RejectionSamplerControlsTest, BadWordsAdvanceAcrossDraftAndBonusTokens) {
+  auto params = make_sampling_params(1, false);
+  params.bad_words = torch::tensor({{{1, 2, 3}, {-1, -1, 4}}}, torch::kLong);
+  params.bad_word_suffix = torch::tensor({{-1, 1}}, torch::kLong);
+  torch::Tensor logits = torch::tensor({{0.F, 0.F, 10.F, 0.F, 100.F},
+                                        {0.F, 0.F, 0.F, 10.F, 100.F},
+                                        {0.F, 0.F, 0.F, 10.F, 100.F}});
+  auto result = rejection_sample(
+      params, DraftProposal(torch::tensor({{2, 3}}, torch::kLong)), logits);
+  EXPECT_EQ(result.next_tokens[0][0].item<int64_t>(), 2);
+  EXPECT_NE(result.next_tokens[0][1].item<int64_t>(), 3);
+  EXPECT_EQ(result.next_tokens[0][2].item<int64_t>(), -1);
+  params.bad_words = torch::tensor({{{1, 2, 3}}}, torch::kLong);
+  params.bad_word_suffix = torch::full({1, 2}, -1, torch::kLong);
+  logits = torch::tensor(
+      {{0.F, 10.F, 0.F, 0.F}, {0.F, 0.F, 10.F, 0.F}, {0.F, 0.F, 0.F, 10.F}});
+  result = rejection_sample(
+      params, DraftProposal(torch::tensor({{1, 2}}, torch::kLong)), logits);
+  EXPECT_EQ(result.next_tokens[0][0].item<int64_t>(), 1);
+  EXPECT_EQ(result.next_tokens[0][1].item<int64_t>(), 2);
+  EXPECT_NE(result.next_tokens[0][2].item<int64_t>(), 3);
+}
+
+TEST(RejectionSamplerControlsTest, SeededVerifyMatchesOrdinaryTokenOffsets) {
+  for (const int64_t seed : {-2, 0, 42}) {
+    auto params = make_sampling_params(1, true);
+    params.seeds = torch::tensor({seed}, torch::kLong);
+    params.seed_offsets = torch::tensor({7}, torch::kLong);
+    torch::Tensor logits = torch::zeros({3, 16});
+    std::vector<int64_t> expected;
+    expected.reserve(3);
+    for (int64_t column = 0; column < 3; ++column) {
+      auto ordinary = params;
+      ordinary.seed_offsets = params.seed_offsets + column;
+      torch::Tensor row = logits[column].unsqueeze(0).clone();
+      expected.emplace_back(
+          sample(row, ordinary).next_tokens[0].item<int64_t>());
+    }
+    const auto proposal =
+        torch::tensor({{expected[0], expected[1]}}, torch::kLong);
+    const auto result =
+        rejection_sample(params, DraftProposal(proposal), logits);
+    EXPECT_TRUE(
+        torch::equal(result.next_tokens,
+                     torch::tensor(expected, torch::kLong).unsqueeze(0)));
+  }
+}
+
+TEST(RejectionSamplerControlsTest, CandidatePenaltiesCountDraftPrefix) {
+  auto params = make_sampling_params(1, false);
+  params.unique_token_ids = torch::tensor({{0}}, torch::kLong);
+  params.unique_token_counts = torch::tensor({{0}}, torch::kInt);
+  params.unique_token_ids_lens = torch::tensor({1}, torch::kInt);
+  params.frequency_penalties = torch::tensor({2.F});
+  params.presence_penalties = torch::tensor({1.F});
+  params.repetition_penalties = torch::tensor({2.F});
+  torch::Tensor logits =
+      torch::tensor({{0.F, 6.F, 2.F}, {0.F, 6.F, 2.F}, {0.F, 6.F, 2.F}});
+  const auto result = rejection_sample(
+      params, DraftProposal(torch::tensor({{1, 1}}, torch::kLong)), logits);
+  EXPECT_EQ(result.next_tokens[0][0].item<int64_t>(), 1);
+  EXPECT_EQ(result.next_tokens[0][1].item<int64_t>(), 2);
+  EXPECT_EQ(result.next_tokens[0][2].item<int64_t>(), -1);
+}
+
+TEST(RejectionSamplerControlsTest, ReportsRawLogprobsBeforeTokenConstraints) {
+  auto params = make_sampling_params(1, false);
+  params.logprobs = true;
+  params.max_top_logprobs = 2;
+  params.logits_bias = torch::tensor({{-INFINITY, 0.F, 100.F}});
+  torch::Tensor logits = torch::tensor({{4.F, 2.F, 1.F}, {4.F, 2.F, 1.F}});
+  const torch::Tensor expected = torch::log_softmax(logits[0], -1);
+  const auto result = rejection_sample(
+      params, DraftProposal(torch::tensor({{2}}, torch::kLong)), logits);
+  EXPECT_NEAR(
+      result.logprobs[0][0].item<float>(), expected[2].item<float>(), 1e-6);
+  EXPECT_EQ(result.top_tokens[0][0][0].item<int64_t>(), 0);
 }
 
 TEST(SamplerControlsTest, MinPRemovesLowProbabilityCandidates) {

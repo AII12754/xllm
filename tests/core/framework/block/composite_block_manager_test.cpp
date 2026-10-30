@@ -1199,7 +1199,7 @@ TEST(CompositeBlockManagerTest,
   BlockManagerPool::Options options;
   options.num_blocks(8)
       .block_size(4)
-      .enable_virtual_memory(true)
+      .enable_vmm_kvcache(true)
       .num_layers(2)
       .slot_size(36)  // Unequal K/V widths must not be averaged.
       .virtual_block_bytes(16)
@@ -1233,7 +1233,7 @@ TEST(CompositeBlockManagerTest, PagedShortageReturnsPagesToInjectedAllocator) {
   BlockManager::Options options;
   options.num_blocks(8)
       .block_size(4)
-      .enable_virtual_memory(true)
+      .enable_vmm_kvcache(true)
       .num_layers(2)
       .slot_size(36)  // Unequal K/V widths must not be averaged.
       .virtual_block_bytes(16)
@@ -1287,7 +1287,7 @@ TEST(CompositeBlockManagerTest,
   BlockManagerPool::Options options;
   options.num_blocks(8)
       .block_size(4)
-      .enable_virtual_memory(true)
+      .enable_vmm_kvcache(true)
       .num_layers(2)
       .slot_size(36)
       .virtual_block_bytes(16)
@@ -1307,7 +1307,7 @@ TEST(CompositeBlockManagerTest,
   BlockManagerPool::Options options;
   options.num_blocks(8)
       .block_size(4)
-      .enable_virtual_memory(true)
+      .enable_vmm_kvcache(true)
       .num_layers(2)
       .slot_size(36)
       .virtual_block_bytes(16)

@@ -23,10 +23,109 @@ limitations under the License.
 
 #include "core/framework/sampling/logits_processor.h"
 #include "core/framework/sampling/sampler.h"
+#include "core/framework/speculative/rejection_sampler.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 
 namespace xllm {
 namespace {
+
+TEST(SeededSamplerTest, NpuVerificationMatchesOrdinaryDrawsAtTokenOffsets) {
+  constexpr int64_t kRows = 8;
+  constexpr int64_t kSteps = 3;
+  constexpr int64_t kVocab = 33;
+  const auto options = torch::TensorOptions().device(torch::kPrivateUse1, 0);
+  const torch::Tensor original =
+      torch::arange(kRows * (kSteps + 1) * kVocab, options)
+          .sin()
+          .view({kRows, kSteps + 1, kVocab});
+  for (const SamplingMode mode : {SamplingMode::RANDOM, SamplingMode::MIXED}) {
+    SamplingParameters params;
+    params.sampling_mode = mode;
+    params.seeds = torch::arange(kRows, options.dtype(torch::kInt64)).add(42);
+    params.seed_offsets = torch::arange(kRows, params.seeds.options());
+    if (mode == SamplingMode::MIXED) {
+      params.do_sample = params.seeds.remainder(2).eq(0);
+    }
+    torch::Tensor expected =
+        torch::empty({kRows, kSteps + 1}, params.seeds.options());
+    for (int64_t column = 0; column <= kSteps; ++column) {
+      SamplingParameters step_params = params;
+      step_params.seed_offsets = params.seed_offsets + column;
+      torch::Tensor logits = original.select(1, column).clone();
+      expected.select(1, column).copy_(sample(logits, step_params).next_tokens);
+    }
+    const torch::Tensor tokens = expected.narrow(1, 0, kSteps).clone();
+    const DraftProposal proposal(tokens);
+    const SampleOutput accepted =
+        rejection_sample(params, proposal, original.clone().view({-1, kVocab}));
+    EXPECT_TRUE(torch::equal(accepted.next_tokens, expected));
+    EXPECT_TRUE(torch::equal(
+        accepted.num_accepted_tokens,
+        torch::full({kRows, 1}, kSteps, options.dtype(torch::kInt32))));
+
+    const SampleOutput bonus = rejection_sample(
+        params,
+        DraftProposal(torch::empty({kRows, 0}, params.seeds.options())),
+        original.select(1, 0).clone());
+    EXPECT_TRUE(torch::equal(bonus.next_tokens, expected.narrow(1, 0, 1)));
+    EXPECT_TRUE(
+        torch::equal(bonus.num_accepted_tokens,
+                     torch::zeros({kRows, 1}, options.dtype(torch::kInt32))));
+
+    const torch::Tensor invalid =
+        torch::zeros({kRows, kSteps}, options.dtype(torch::kBool));
+    invalid.select(1, 1).fill_(true);
+    const SampleOutput rejected = rejection_sample(
+        params, proposal, original.clone().view({-1, kVocab}), invalid);
+    expected.narrow(1, 2, kSteps - 1).fill_(-1);
+    EXPECT_TRUE(torch::equal(rejected.next_tokens, expected));
+    EXPECT_TRUE(
+        torch::equal(rejected.num_accepted_tokens,
+                     torch::ones({kRows, 1}, options.dtype(torch::kInt32))));
+  }
+}
+
+TEST(SeededSamplerTest, NpuVerificationLogprobsUseRawLogitsWithBiasAndTopK) {
+  constexpr int64_t kRows = 64;
+  constexpr int64_t kVocab = 65536;
+  const auto options = torch::TensorOptions()
+                           .device(torch::kPrivateUse1, 0)
+                           .dtype(torch::kBFloat16);
+  const torch::Tensor original =
+      torch::arange(kVocab, options.dtype(torch::kFloat32))
+          .remainder(17)
+          .to(torch::kBFloat16)
+          .repeat({kRows * 3, 1});
+  SamplingParameters params;
+  params.sampling_mode = SamplingMode::RANDOM;
+  params.logprobs = true;
+  params.logits_bias = torch::zeros({kRows, kVocab}, options);
+  params.logits_bias.select(1, 0).fill_(100.0F);
+  params.top_k = torch::ones({kRows}, options.dtype(torch::kInt64));
+  const DraftProposal proposal(
+      torch::zeros({kRows, 2}, options.dtype(torch::kInt64)));
+  const torch::Tensor expected =
+      torch::log_softmax(original, -1, torch::kFloat32)
+          .select(1, 0)
+          .view({kRows, 3});
+  for (const int64_t top_logprobs : {int64_t{0}, int64_t{5}}) {
+    params.max_top_logprobs = top_logprobs;
+    const SampleOutput result =
+        rejection_sample(params, proposal, original.clone());
+    EXPECT_TRUE(
+        torch::equal(result.next_tokens,
+                     torch::zeros({kRows, 3}, options.dtype(torch::kInt64))));
+    EXPECT_TRUE(torch::allclose(result.logprobs, expected, 1e-5, 5e-6));
+    if (top_logprobs > 0) {
+      const auto [values, ids] =
+          torch::log_softmax(
+              original.view({kRows, 3, kVocab}), -1, torch::kFloat32)
+              .topk(top_logprobs, -1);
+      EXPECT_TRUE(torch::equal(result.top_tokens, ids));
+      EXPECT_TRUE(torch::equal(result.top_logprobs, values));
+    }
+  }
+}
 
 SamplingParameters make_seeded_params(const torch::Tensor& seeds,
                                       const torch::Tensor& offsets) {

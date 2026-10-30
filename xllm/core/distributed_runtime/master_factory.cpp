@@ -26,7 +26,7 @@ limitations under the License.
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/rec_master.h"
 #include "core/distributed_runtime/vlm_master.h"
-#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
 
 namespace xllm {
 
@@ -53,9 +53,9 @@ std::unique_ptr<Master> create_master(const std::string& backend,
 
 std::unique_ptr<LLMMaster> fork_llm_master(LLMMaster* master,
                                            const Options& options) {
-  // sleep/wakeup/fork_master requires --enable_virtual_memory=true
-  if (!KVCacheConfig::get_instance().enable_virtual_memory()) {
-    LOG(WARNING) << "fork_master requires virtual memory to be enabled";
+  // Forked models share virtual weight storage.
+  if (!LoadConfig::get_instance().enable_vmm_weights()) {
+    LOG(WARNING) << "fork_master requires --enable_vmm_weights=true";
     return nullptr;
   }
 

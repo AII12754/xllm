@@ -63,12 +63,41 @@ torch::Generator make_sampling_generator(const torch::Device& device) {
 torch::Tensor gumbel_noise(const SamplingParameters& params,
                            torch::IntArrayRef sizes,
                            const torch::Device& device) {
-  torch::Tensor noise =
-      torch::empty(sizes,
-                   torch::TensorOptions().dtype(torch::kFloat32).device(device))
-          .exponential_(/*lambd=*/1.0)
-          .clamp_min_(std::numeric_limits<float>::min())
-          .log_();
+  torch::Tensor noise = torch::empty(
+      sizes, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  if (params.seeds.defined()) {
+    CHECK(sizes.size() == 2 || sizes.size() == 3);
+    const torch::Tensor seeds = params.seeds.to(torch::kCPU);
+    const torch::Tensor offsets = params.seed_offsets.to(torch::kCPU);
+    const torch::Tensor seeded = seeds.ne(-1);
+    const torch::Tensor random_rows =
+        params.sampling_mode == SamplingMode::MIXED
+            ? params.require_do_sample().to(torch::kCPU)
+            : torch::ones({sizes[0]}, torch::kBool);
+    torch::Generator generator = make_sampling_generator(device);
+    for (int64_t row = 0; row < sizes[0]; ++row) {
+      if (!random_rows[row].item<bool>()) {
+        noise[row].fill_(1.0);
+        continue;
+      }
+      const int64_t columns = sizes.size() == 3 ? sizes[1] : 1;
+      for (int64_t column = 0; column < columns; ++column) {
+        std::optional<torch::Generator> row_generator;
+        if (seeded[row].item<bool>()) {
+          generator.set_current_seed(
+              sampling_seed(seeds[row].item<int64_t>(),
+                            offsets[row].item<int64_t>() + column));
+          row_generator = generator;
+        }
+        torch::Tensor values =
+            sizes.size() == 3 ? noise[row][column] : noise[row];
+        values.exponential_(/*lambd=*/1.0, row_generator);
+      }
+    }
+  } else {
+    noise.exponential_(/*lambd=*/1.0);
+  }
+  noise.clamp_min_(std::numeric_limits<float>::min()).log_();
   // Fill after the log_: masking first would turn the sentinel into
   // log(0) = -inf.
   if (params.sampling_mode == SamplingMode::MIXED) {
@@ -161,8 +190,6 @@ SampleOutput sample(torch::Tensor& logits,
     CHECK_EQ(logits.size(0), do_sample.size(0));
   }
 
-  const bool seed_sampling =
-      params.seeds.defined() && params.sampling_mode != SamplingMode::GREEDY;
   torch::Tensor samples;
 #if defined(USE_NPU)
   const bool batched_seed_sampling =
@@ -197,41 +224,10 @@ SampleOutput sample(torch::Tensor& logits,
     }
   } else
 #endif
-      if (seed_sampling) {
-    const torch::Tensor seeds = params.seeds.to(torch::kCPU);
-    const torch::Tensor offsets = params.seed_offsets.to(torch::kCPU);
-    const torch::Tensor do_sample =
-        params.sampling_mode == SamplingMode::RANDOM
-            ? torch::Tensor()
-            : params.require_do_sample().to(torch::kCPU);
-    // Seed -1 rows keep the global RNG.
-    torch::Generator generator = make_sampling_generator(logits.device());
-    // Skipped greedy rows hold garbage; clamp_min_/log_ maps any finite
-    // garbage to a finite value and the greedy-row masked_fill_ below
-    // overwrites them with the 0.0 sentinel, so no zero init is needed.
-    torch::Tensor noise =
-        torch::empty(logits.sizes(), logits.options().dtype(torch::kFloat32));
-    for (int64_t row = 0; row < logits.size(0); ++row) {
-      if (do_sample.defined() && !do_sample[row].item<bool>()) {
-        continue;
-      }
-      const int64_t seed = seeds[row].item<int64_t>();
-      std::optional<torch::Generator> row_generator;
-      if (seed != -1) {
-        generator.set_current_seed(
-            sampling_seed(seed, offsets[row].item<int64_t>()));
-        row_generator = generator;
-      }
-      noise.select(0, row).exponential_(/*lambd=*/1.0, row_generator);
-    }
-    noise.clamp_min_(std::numeric_limits<float>::min()).log_();
-    if (params.sampling_mode == SamplingMode::MIXED) {
-      noise.masked_fill_(
-          greedy_mask(params, logits.device())
-              .view(batch_broadcast_shape(noise.size(0), noise.dim())),
-          0.0);
-    }
-    samples = gumbel_argmax(logits, noise);
+      if (params.seeds.defined() &&
+          params.sampling_mode != SamplingMode::GREEDY) {
+    samples = gumbel_argmax(
+        logits, gumbel_noise(params, logits.sizes(), logits.device()));
   } else if (params.sampling_mode == SamplingMode::RANDOM) {
     samples = gumbel_sample(logits);
   } else if (params.sampling_mode == SamplingMode::GREEDY) {

@@ -76,10 +76,10 @@ class BlockManager {
     // executor thread, so leaves are wrapped in ConcurrentBlockManagerImpl when
     // this is set to make those mutations thread-safe against the scheduler.
     PROPERTY(bool, enable_host_offload) = false;
-    // Virtual memory (VMM) KV leaf parameters. When enable_virtual_memory is
+    // Virtual memory (VMM) KV leaf parameters. When enable_vmm_kvcache is
     // set, the KV leaf is a VmmKVBlockManager; these carry the
     // construction args the spec builder needs.
-    PROPERTY(bool, enable_virtual_memory) = false;
+    PROPERTY(bool, enable_vmm_kvcache) = false;
     PROPERTY(int64_t, num_layers) = 0;
     PROPERTY(int64_t, slot_size) = 0;
     PROPERTY(size_t, virtual_block_bytes) = 0;

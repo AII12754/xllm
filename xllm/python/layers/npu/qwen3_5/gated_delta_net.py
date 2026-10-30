@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -98,9 +99,8 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
             device=device,
             use_checkpoint_layout=True,
         )
-        # Keep one rank-local storage for each pair of projections. Prefill
-        # consumes contiguous row views, while Decode runs two packed
-        # projections and splits their outputs for the existing Mega operator.
+        # Prefill and Decode share rank-local QKVZ and BA projections. Weight
+        # loading and Verify consume row views of the same storage.
         self.in_proj_qkvz = ColumnParallelLinear(
             cfg.hidden_size,
             self.conv_dim + self.value_dim,
@@ -123,6 +123,19 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
                 device=device,
             )
         )
+        self._prefill_projection_sources: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._prefill_projection_weights: list[torch.Tensor] = []
+
+    def _apply(
+        self,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        recurse: bool = True,
+    ) -> NpuQwen3_5GatedDeltaNet:
+        # Module.to() can replace parameter storage without changing the
+        # Parameter object. Rebuild our non-owning views after any conversion.
+        self._prefill_projection_sources = None
+        self._prefill_projection_weights = []
+        return super()._apply(fn, recurse)
 
     def _input_projection_weight_views(
         self,
@@ -147,6 +160,21 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _project_prefill_inputs(
+        self,
+        hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Inspect registered parameters directly: dynamic Module attribute
+        # lookups otherwise dominate cache validation for small prefills.
+        qkvz_weight = self._modules["in_proj_qkvz"]._parameters["weight"]
+        ba_weight = self._modules["in_proj_ba"]._parameters["weight"]
+        sources = self._prefill_projection_sources
+        if sources is None or sources[0] is not qkvz_weight or sources[1] is not ba_weight:
+            self._prefill_projection_weights = [weight.t() for weight in self._input_projection_weight_views()]
+            self._prefill_projection_sources = (qkvz_weight, ba_weight)
+        mixed_qkv, z, b, a = kernels.grouped_linear(hidden, self._prefill_projection_weights)
+        return mixed_qkv, a, b, z.view(-1, self.num_v_heads, self.value_head_dim)
+
+    def _project_verify_inputs(
         self,
         hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -238,7 +266,7 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
 
         # Match native project_split_inputs: project packed rows first, then
         # pad each request independently to the checkpoint stride.
-        mixed_qkv, a, b, z = (_pad(tensor) for tensor in self._project_prefill_inputs(hidden))
+        mixed_qkv, a, b, z = (_pad(tensor) for tensor in self._project_verify_inputs(hidden))
         chunk_outputs = []
         for start in range(0, batch_size, _MEGA_GDN_MAX_DECODE_BATCH_SIZE):
             end = min(start + _MEGA_GDN_MAX_DECODE_BATCH_SIZE, batch_size)
@@ -284,10 +312,10 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
         elif isinstance(metadata, GdnPrefillMetadata):
             mixed_qkv, a, b, z = self._project_prefill_inputs(hidden)
             output = kernels.mega_gdn_prefill(
-                mixed_qkv.contiguous(),
-                b.contiguous(),
-                a.contiguous(),
-                z.contiguous(),
+                mixed_qkv,
+                b,
+                a,
+                z,
                 self.conv1d_weight,
                 state_cache.conv,
                 self.A_log,

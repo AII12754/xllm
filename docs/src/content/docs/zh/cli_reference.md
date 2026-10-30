@@ -53,7 +53,8 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 
 | 参数名称 | 类型 | 默认值 | 参数含义 |
 |:---------|:-----|:-------|:---------|
-| `enable_manual_loader` | `bool` | `false` | 将 decoder layer 权重固定在 host 内存并使用异步 H2D 传输；`enable_rolling_load` 依赖该参数，`enable_virtual_memory` 也会隐式启用该能力。 |
+| `enable_manual_loader` | `bool` | `false` | 将 decoder layer 权重固定在 host 内存并使用异步 H2D 传输；`enable_rolling_load` 依赖该参数，`enable_vmm_weights` 也会隐式启用该能力。 |
+| `enable_vmm_weights` | `bool` | `false` | 为模型权重启用 VMM，并隐式启用 manual loader。与 `enable_vmm_kvcache` 独立，仅 NPU 支持。 |
 | `enable_rolling_load` | `bool` | `false` | 启用 rolling weight load：HBM 中仅保留 N 个 decoder layer 权重槽位，并按层即时加载；需要 `enable_manual_loader=true`，仅 NPU 支持。 |
 | `rolling_load_num_cached_layers` | `int32` | `2` | `enable_rolling_load=true` 时 HBM 中保留的 decoder layer 权重槽位数量。 |
 | `rolling_load_num_rolling_slots` | `int32` | `-1` | decoder rolling load 使用的 rolling 槽位数量；固定槽位数为 `rolling_load_num_cached_layers - rolling_load_num_rolling_slots`。`-1` 表示自动设置为 `min(2, preload_count)`，取值需在 `[-1, rolling_load_num_cached_layers]` 范围内。 |
@@ -73,27 +74,13 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `enable_in_batch_prefix_cache` | `bool` | `false` | 是否将已准入的 prefill 完整 block 缓存进 prefix cache，使同一 batch 内的后续请求可以共享。 |
 | `max_linear_state_cache_slots` | `int64` | `0` | linear-attention state cache 的最大活跃槽位数；`0` 表示根据可用 KV Cache 预算自动推导容量。 |
 | `xxh3_128bits_seed` | `uint32` | `1024` | XXH3 128-bit 哈希的默认 seed。 |
-| `enable_virtual_memory` | `bool` | `false` | 是否为模型权重和 KV Cache 启用共享虚拟内存池；`false` 使用原有物理 KV Cache 实现。 |
-| `vmm_elastic` | `bool` | `true` | 启用虚拟内存后，按需扩张活动逻辑槽位及物理页，并释放空闲页的物理内存；`false` 在启动时整体分配固定池。 |
+| `enable_vmm_kvcache` | `bool` | `false` | 为 KV Cache 启用 VMM，与 `enable_vmm_weights` 独立；`false` 使用原有物理 KV Cache 实现，仅 NPU 支持。 |
+| `vmm_elastic` | `bool` | `true` | 任一 VMM 开关启用后，按需扩张活动逻辑槽位及物理页，并释放空闲页的物理内存；`false` 使用固定驻留池。 |
 | `vmm_memory_reserve_bytes` | `int64` | `0` | 弹性虚拟内存增长时额外保留的设备空闲显存，单位 byte，须非负；在运行时执行预留空间之外叠加生效。 |
 | `vmm_startup_timeout_ms` | `int32` | `120000` | VMM 启动时，master 等待节点注册、各非 master 等待物理池就绪分别使用的超时，单位毫秒，须为正数。独立于单次 RPC 超时，每个等待阶段单独计时。 |
 | `phy_page_granularity_size` | `int64` | `2097152` | 单个物理页的粒度大小，单位 byte，默认 2 MiB；用于连续 KV Cache。 |
 
-### 虚拟 KV Cache
-
-同时设置 `enable_virtual_memory=true` 和 `vmm_elastic=true` 时，物理内存随页映射按需增长，KV 页的最后一个 block 归还后释放该页的物理内存。KV 与权重共享池在启动时预留稳定虚拟地址，需求超过初始容量时自动激活更多逻辑槽位。显式配置正数 `max_memory_utilization` 时，arena 不超过设备总显存的该比例，物理增长也会在每个 worker 上保留剩余比例的空闲显存。不配置 ratio 或设为 `0` 时，arena 可覆盖设备总显存；`max_cache_size` 仍是可选的字节上限。实际增长和请求准入始终受实时可用显存及执行余量约束，原生 allocator 统计可区分执行缓存回收与池外显存释放，后者可提供新增 KV 容量，无需重启。不支持可靠 allocator 统计的后端保留保守执行水位。未被预热覆盖的执行形状和直接分配的 SDK buffer 需通过 `vmm_memory_reserve_bytes` 预留空间。
-
-可在原有启动命令中加入以下参数，取消两个显式容量上限，并为执行额外预留 1 GiB 空闲显存。弹性模式下，不配置 `max_memory_utilization` 与设为 `0` 效果相同：
-
-```bash
---enable_virtual_memory=true \
---vmm_elastic=true \
---max_memory_utilization=0 \
---max_cache_size=0 \
---vmm_memory_reserve_bytes=1073741824
-```
-
-额外预留量应根据设备实测调整。`vmm_memory_reserve_bytes=0` 仍会保留运行时执行所需的空间。弹性虚拟内存使用 graph 时必须执行启动预热（`disable_graph_warmup=false`）。使用 Mooncake 的 PD KV 传输及远端权重传输要求池完全驻留，应设置 `vmm_elastic=false` 并使用正数 `max_memory_utilization`。详见[弹性虚拟 KV](/zh/dev_guide/code_arch/#弹性虚拟-kv)。
+VMM 的使用方式和容量配置说明见[KV Cache 与模型权重的虚拟内存](/zh/features/virtual_memory/)。
 
 ### kv_events_config
 
@@ -363,6 +350,7 @@ engine 从正常回收的结果统计逐位置前缀接受概率
 | `enable_graph_vmm_pool` | `bool` | `true` | 是否启用 VMM-backed CUDA graph memory pool，用于多 shape graph 的显存复用。 |
 | `max_tokens_for_graph_mode` | `int32` | `2048` | 图执行最大 token 数；`0` 表示不限制。 |
 | `acl_graph_decode_batch_size_limit` | `int32` | `16` | NPU 上 ACL graph 的 decode batch size 阈值；实际 decode batch size 超过该值时，ACL graph decode 会回退到 eager 模式以避免 OOM。 |
+| `block_draft_graph_warmup_max_kv_len` | `int32` | `0` | 仅为 Python block draft 的独立 ACL graph（DSpark/DFlash2，包括 GLM MLA draft）预捕获按 2 的幂增长的 KV 容量桶。`0` 覆盖完整模型上下文；正数预捕获到覆盖该长度的容量桶；`-1` 保留按需捕获。已有 warmup 必需的形状始终保留，即使超过正数上限。超过预捕获上界的请求仍可在线扩桶。更多容量桶会增加启动时间和 draft 图显存占用；不改变 target、MTP、context-write 或可选整轮 unified graph 的预热策略。 |
 | `enable_shm` | `bool` | `false` | 是否为模型执行启用共享内存。 |
 | `use_contiguous_input_buffer` | `bool` | `true` | 是否使用连续的 device input buffer 执行模型。 |
 | `input_shm_size` | `uint64` | `1024` | 输入共享内存大小，默认 1GB。 |

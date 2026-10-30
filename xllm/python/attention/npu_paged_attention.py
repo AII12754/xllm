@@ -37,6 +37,11 @@ from xllm.python.attention.backend import (
     has_rope_dim,
     resolve_linear_state_io_indices,
 )
+from xllm.python.attention.block_draft_window import (
+    WindowedBlockTable,
+    block_draft_window_context,
+    prepare_windowed_block_table,
+)
 from xllm.python.attention.expanded_decode_metadata import (
     resolve_expanded_decode_metadata,
 )
@@ -242,7 +247,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         is_mla: bool,
         device: torch.device,
         dtype: torch.dtype,
-        num_decoding_tokens: int = 1,
         mla_block_draft: bool = False,
     ) -> None:
         self._mla_block_draft = mla_block_draft
@@ -256,7 +260,9 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._use_fia_v2 = _HAS_FIA_V2
         self._is_mla = is_mla
         self._uses_sparse_mla = False
-        self._kda_verify_width = num_decoding_tokens
+        self._kda_checkpoint_stride: int | None = None
+        self._kda_query_start_locs: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+        self._kda_checkpoint_offsets: dict[tuple[int, torch.device], torch.Tensor] = {}
 
         self._kv_caches: list[LayerCache] = []
         self._kpool_cache_triton_compatible: tuple[bool, ...] = ()
@@ -267,7 +273,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._graph_metadata_updated_in_place = False
         self._use_expanded_decode = False
         self._block_table_i32: torch.Tensor | None = None
-        self._block_attention_masks: dict[tuple[int, int] | tuple[str, int, int] | None, torch.Tensor] = {}
+        self._block_attention_masks: dict[tuple[object, ...], torch.Tensor] = {}
+        self._windowed_block_tables: dict[int, WindowedBlockTable] = {}
         self._actual_seq_lens: list[int] | None = None
         self._actual_seq_q: list[int] = []
         self._actual_seq_kv: list[int] = []
@@ -373,6 +380,16 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._kpool_cache_triton_compatible = tuple(_is_compact_kpool_cache_compatible(cache) for cache in kv_caches)
         self._page_size = page_sizes.pop()
         self._num_kv_blocks = num_kv_blocks.pop()
+        checkpoint_strides: set[int] = set()
+        for cache in kv_caches:
+            if cache.conv is None or cache.ssm is None:
+                continue
+            if cache.conv.shape[0] <= 0 or cache.ssm.shape[0] % cache.conv.shape[0] != 0:
+                raise RuntimeError("linear SSM cache does not align with state slots")
+            checkpoint_strides.add(cache.ssm.shape[0] // cache.conv.shape[0])
+        if len(checkpoint_strides) > 1:
+            raise RuntimeError("linear-attention layers use inconsistent checkpoint capacities")
+        self._kda_checkpoint_stride = checkpoint_strides.pop() if checkpoint_strides else None
         has_sparse_index = any(cache.index is not None for cache in kv_caches)
         # glm5_next DSA layers are NoPE: the latent lives in the key slot and
         # the value/rope slot is a 0-dim tensor normalized to None, while the
@@ -567,6 +584,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         # Device KV lengths can change between forwards while the prepared
         # Slot binding stays the same. Masks are shared only within a forward.
         self._block_attention_masks.clear()
+        self._windowed_block_tables.clear()
         self._kda_validated_query_shape = None
         self._graph_metadata_updated_in_place = False
         prepared = getattr(metadata, "prepared_attention_state", None)
@@ -979,6 +997,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 )
             return self._prefill_cp(q_3d, k_3d, v_3d, metadata, cp_context, k_cache, v_cache)
 
+        if self._uses_block_draft_window(layer) and metadata.block_table is None:
+            raise ValueError("windowed block drafts require a paged KV block table")
         kernels.reshape_paged_cache(metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache)
 
         prepared = getattr(metadata, "prepared_attention_state", None)
@@ -989,7 +1009,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         ):
             return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
         device_lengths = isinstance(prepared, _PreparedPagedAttention) and prepared.device_kv_lengths is not None
-        if metadata.is_prefill or metadata.is_chunked_prefill or device_lengths:
+        if metadata.is_prefill or metadata.is_chunked_prefill or device_lengths or self._uses_block_draft_window(layer):
             if self._use_expanded_decode:
                 return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
             return self._prefill(
@@ -1897,21 +1917,65 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     # Prefill: packed TND with causal mask
     # ------------------------------------------------------------------
 
-    def _block_attention_mask(self, prepared: _PreparedPagedAttention, layer: Attention) -> torch.Tensor:
-        policy = (layer.fia_pre_tokens, layer.fia_next_tokens) if layer.fia_sparse_mode == 4 else None
-        mask = self._block_attention_masks.get(policy)
+    @staticmethod
+    def _uses_block_draft_window(layer: Attention) -> bool:
+        # Explicit standard FIA mode is set by the block-draft model. An
+        # ordinary causal decoder with a sliding_window must not acquire the
+        # synthetic block's shared-anchor geometry.
+        return getattr(layer, "sliding_window", 0) > 0 and layer.fia_sparse_mode == _SPARSE_MODE_NONE
+
+    @staticmethod
+    def _build_block_draft_mask(
+        lengths: torch.Tensor, keys: torch.Tensor, width: int, layer: Attention
+    ) -> torch.Tensor:
+        anchors = lengths - width
+        mask = keys < anchors - layer.sliding_window
+        if layer.causal:
+            rows = torch.arange(width, device=lengths.device).view(1, 1, -1, 1)
+            mask = mask | (keys > anchors + rows)
+        return mask
+
+    def _block_attention_mask(
+        self, prepared: _PreparedPagedAttention, layer: Attention, keys: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        block_window = self._uses_block_draft_window(layer)
+        if block_window:
+            policy = ("block", layer.sliding_window, layer.causal)
+        elif layer.fia_sparse_mode == 4:
+            policy = ("band", layer.fia_pre_tokens, layer.fia_next_tokens)
+        else:
+            policy = None
+        cache_key = (policy, prepared.kv_capacity if keys is None else keys.shape[-1], keys is not None)
+        mask = self._block_attention_masks.get(cache_key)
         if mask is None:
             width = prepared.query_lengths[0]
             lengths = prepared.device_kv_lengths.view(-1, 1, 1, 1)
-            keys = torch.arange(prepared.kv_capacity, device=lengths.device).view(1, 1, 1, -1)
+            if keys is None:
+                keys = torch.arange(prepared.kv_capacity, device=lengths.device).view(1, 1, 1, -1)
             mask = keys >= lengths
-            if policy is not None:
+            if block_window:
+                mask = mask | self._build_block_draft_mask(lengths, keys, width, layer)
+            elif layer.fia_sparse_mode == 4:
                 query_positions = lengths - width
                 query_positions = query_positions + torch.arange(width, device=lengths.device).view(1, 1, -1, 1)
-                mask = mask | (keys < query_positions - policy[0]) | (keys > query_positions + policy[1])
+                mask = mask | (keys < query_positions - layer.fia_pre_tokens)
+                mask = mask | (keys > query_positions + layer.fia_next_tokens)
             mask = mask.expand(-1, 1, width, -1).contiguous()
-            self._block_attention_masks[policy] = mask
+            self._block_attention_masks[cache_key] = mask
         return mask
+
+    def _windowed_block_table(self, prepared: _PreparedPagedAttention, left_context: int) -> WindowedBlockTable:
+        table = self._windowed_block_tables.get(left_context)
+        if table is None:
+            table = prepare_windowed_block_table(
+                prepared.block_table,
+                prepared.device_kv_lengths,
+                prepared.query_lengths[0],
+                self.page_size,
+                left_context,
+            )
+            self._windowed_block_tables[left_context] = table
+        return table
 
     def _bounded_paged_graph_attention(
         self,
@@ -2018,7 +2082,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         layer: Attention,
     ) -> torch.Tensor:
         actual_seq = self._cumulative_seq_lens(metadata, num_tokens)
-        atten_mask = self._get_causal_mask() if (layer.causal or layer.fia_use_attention_mask) else None
+        block_window = self._uses_block_draft_window(layer)
+        atten_mask = (
+            self._get_causal_mask() if (layer.causal or layer.fia_use_attention_mask) and not block_window else None
+        )
         sparse_mode = layer.fia_sparse_mode
         if sparse_mode is None:
             sparse_mode = _SPARSE_MODE_RIGHT_DOWN_CAUSAL if layer.causal else _SPARSE_MODE_NONE
@@ -2034,14 +2101,27 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             k_flat = k_cache.view(k_cache.size(0), block_size, -1)
             v_flat = v_cache.view(v_cache.size(0), block_size, -1)
             prepared = getattr(metadata, "prepared_attention_state", None)
+            if block_window and (
+                not isinstance(prepared, _PreparedPagedAttention) or prepared.device_kv_lengths is None
+            ):
+                prepared = self.prepare_metadata(metadata, device_kv_lengths=True)
             if isinstance(prepared, _PreparedPagedAttention) and prepared.device_kv_lengths is not None:
-                if layer.causal and prepared.query_lengths[0] != 1:
+                if layer.causal and not block_window and prepared.query_lengths[0] != 1:
                     raise ValueError("causal device-length attention requires singleton packed queries")
                 # Host lengths are safe upper bounds prepared before the prior
                 # Slot accepts its prefix. Mask that bounded tail using the
                 # exact device lengths; never read acceptance back to Host.
                 widths = prepared.query_lengths
-                atten_mask = self._block_attention_mask(prepared, layer)
+                left_context = block_draft_window_context(layer)
+                if left_context is None:
+                    atten_mask = self._block_attention_mask(prepared, layer)
+                    block_table = self._block_table_i32
+                    kv_lengths = prepared.actual_seq_kv
+                else:
+                    window = self._windowed_block_table(prepared, left_context)
+                    atten_mask = self._block_attention_mask(prepared, layer, window.key_positions)
+                    block_table = window.block_table
+                    kv_lengths = [window.capacity] * len(widths)
                 # CANN's TND split-fuse interface only accepts compressed
                 # causal masks. BNSD supports the explicit non-causal tail
                 # mask and the same paged KV without a Host length readback.
@@ -2049,6 +2129,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 query = query.transpose(1, 2).contiguous()
                 if (
                     getattr(metadata, "linear_verify_graph", None) is not None
+                    and left_context is None
                     and in_acl_graph()
                     and get_forward_context().acl_graph is not None
                 ):
@@ -2061,9 +2142,9 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                     k_flat,
                     v_flat,
                     atten_mask=atten_mask,
-                    block_table=self._block_table_i32,
+                    block_table=block_table,
                     actual_seq_lengths=widths,
-                    actual_seq_lengths_kv=prepared.actual_seq_kv,
+                    actual_seq_lengths_kv=kv_lengths,
                     num_heads=self.num_heads,
                     num_key_value_heads=self.num_kv_heads,
                     scale=self.scale,

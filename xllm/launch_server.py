@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import NoReturn, TextIO
 
 from scripts.logger import logger
+from xllm._npu_runtime import configure_npu_runtime
 
 
 @dataclass
@@ -368,6 +369,7 @@ def _open_log_file(log_dir: str | None, rank: int) -> TextIO | None:
 
 
 def _start_process(command: Sequence[str], rank: int, log_dir: str | None) -> ServerProcess:
+    configure_npu_runtime(command[0])
     log_file = _open_log_file(log_dir, rank)
     try:
         process = subprocess.Popen(
@@ -482,8 +484,9 @@ def _print_binary_help(parser: argparse.ArgumentParser, binary_path: str) -> Non
     # print the binary help before the launcher help.
     sys.stdout.flush()
     try:
+        configure_npu_runtime(binary_path)
         subprocess.run([binary_path, "--help"], check=False)
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         parser.error(f"failed to run xllm binary help {binary_path}: {error}")
 
 
@@ -567,7 +570,8 @@ def _exec_binary(argv: Sequence[str]) -> NoReturn:
     # start the server through the binary directly.
     try:
         binary_path = _resolve_binary_path(None)
-    except (FileNotFoundError, PermissionError) as error:
+        configure_npu_runtime(binary_path)
+    except (FileNotFoundError, PermissionError, RuntimeError) as error:
         logger.error("%s", error)
         raise SystemExit(1)
 

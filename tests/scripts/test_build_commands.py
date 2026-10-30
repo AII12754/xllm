@@ -69,6 +69,7 @@ class BuildCommandsTest(unittest.TestCase):
                 stack.enter_context(mock.patch.object(self.setup, "BUILD_EXPORT", export))
                 for stage in (
                     "_stage_triton_npu_runtime_binaries",
+                    "_stage_npu_ops_vendor",
                     "_stage_mooncake_runtime_binaries",
                     "_stage_mlu_triton_kernels",
                     "_stage_triton_compiler_package",
@@ -78,6 +79,10 @@ class BuildCommandsTest(unittest.TestCase):
                 call = stack.enter_context(mock.patch.object(self.setup.subprocess, "check_call"))
 
                 self._build_targets(command)
+
+                self.setup._stage_npu_ops_vendor.assert_called_once_with(
+                    str(self.root), str(self.extdir), "npu", self.env
+                )
 
                 configure, build = call.call_args_list
                 self.assertEqual(configure.args[0][-1], "-DBUILD_TESTING=ON")
@@ -243,11 +248,11 @@ class BuildCommandsTest(unittest.TestCase):
             distribution.run_commands()
         self.assertEqual(commands, [self.setup.ExtBuild, self.setup.TestUT])
 
-    def test_wheel_preserves_testing_and_explicit_skip(self) -> None:
-        for device, skip, commands in (
-            ("npu", False, [mock.call("build"), mock.call("test")]),
-            ("npu", True, [mock.call("build")]),
-            ("musa", False, [mock.call("build")]),
+    def test_wheel_builds_product_without_invoking_tests(self) -> None:
+        for device, skip in (
+            ("npu", False),
+            ("npu", True),
+            ("musa", False),
         ):
             with self.subTest(device=device, skip=skip):
                 command = self._command(self.setup.BuildDistWheel, device)
@@ -259,7 +264,7 @@ class BuildCommandsTest(unittest.TestCase):
                     mock.patch.object(self.setup.bdist_wheel, "run"),
                 ):
                     command.run()
-                self.assertEqual(run.call_args_list, commands)
+                self.assertEqual(run.call_args_list, [mock.call("build")])
                 self.assertTrue(command.skip_build)
                 self.assertFalse(self.setup.InstallWheel._building_wheel)
 

@@ -22,7 +22,12 @@ DEFINE_bool(enable_manual_loader,
             false,
             "Pin decoder layer weights to host memory and use async H2D "
             "transfer. Required by enable_rolling_load; also implied by "
-            "enable_virtual_memory.");
+            "enable_vmm_weights.");
+
+DEFINE_bool(enable_vmm_weights,
+            false,
+            "Whether to enable virtual memory for model weights "
+            "with the physical page pool. NPU only.");
 
 DEFINE_bool(enable_rolling_load,
             false,
@@ -54,6 +59,7 @@ namespace xllm {
 
 void LoadConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_manual_loader);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_vmm_weights);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_rolling_load);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(rolling_load_num_cached_layers);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(rolling_load_num_rolling_slots);
@@ -62,6 +68,7 @@ void LoadConfig::from_flags() {
 
 void LoadConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_manual_loader);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_vmm_weights);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_rolling_load);
   XLLM_CONFIG_ASSIGN_FROM_JSON(rolling_load_num_cached_layers);
   XLLM_CONFIG_ASSIGN_FROM_JSON(rolling_load_num_rolling_slots);
@@ -72,6 +79,8 @@ void LoadConfig::append_config_json(nlohmann::ordered_json& config_json) const {
   const LoadConfig default_config;
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_manual_loader);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_vmm_weights);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_rolling_load);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

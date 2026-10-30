@@ -53,7 +53,8 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 
 | Parameter | Type | Default | Description |
 |:----------|:-----|:--------|:------------|
-| `enable_manual_loader` | `bool` | `false` | Pin decoder layer weights to host memory and use async H2D transfer. Required by `enable_rolling_load`; also implied by `enable_virtual_memory`. |
+| `enable_manual_loader` | `bool` | `false` | Pin decoder layer weights to host memory and use async H2D transfer. Required by `enable_rolling_load`; also implied by `enable_vmm_weights`. |
+| `enable_vmm_weights` | `bool` | `false` | Enable VMM for model weights and implicitly enable the manual loader. Independent of `enable_vmm_kvcache`. NPU only. |
 | `enable_rolling_load` | `bool` | `false` | Enable rolling weight load: keep only N decoder layer weight slots in HBM and stream-load each layer just in time. Requires `enable_manual_loader=true`. NPU only. |
 | `rolling_load_num_cached_layers` | `int32` | `2` | Number of decoder layer weight slots to keep in HBM when `enable_rolling_load=true`. |
 | `rolling_load_num_rolling_slots` | `int32` | `-1` | Number of rolling slots used by decoder rolling load. Fixed slots are `rolling_load_num_cached_layers - rolling_load_num_rolling_slots`. `-1` means auto, `min(2, preload_count)`. Must be in `[-1, rolling_load_num_cached_layers]`. |
@@ -73,27 +74,13 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | `enable_in_batch_prefix_cache` | `bool` | `false` | Whether to cache admitted prefill full blocks into the prefix cache so that later requests in the same batch can share them. |
 | `max_linear_state_cache_slots` | `int64` | `0` | Maximum number of active linear-attention state cache slots. `0` derives an automatic capacity from the available KV Cache budget. |
 | `xxh3_128bits_seed` | `uint32` | `1024` | Default XXH3 128-bit hash seed. |
-| `enable_virtual_memory` | `bool` | `false` | Enable a shared virtual memory pool for model weights and KV Cache. `false` uses the original physical KV Cache implementation. |
-| `vmm_elastic` | `bool` | `true` | When virtual memory is enabled, grow active logical slots and physical backing on demand, and release idle backing. `false` allocates the fixed pool at startup. |
+| `enable_vmm_kvcache` | `bool` | `false` | Enable VMM for KV Cache. Independent of `enable_vmm_weights`; `false` uses the original physical KV Cache implementation. NPU only. |
+| `vmm_elastic` | `bool` | `true` | When either VMM flag is enabled, grow active logical slots and physical backing on demand, and release idle backing. `false` uses a fixed resident pool. |
 | `vmm_memory_reserve_bytes` | `int64` | `0` | Additional device memory to keep free when elastic virtual memory grows, in bytes. Supplements runtime execution headroom; must be nonnegative. |
 | `vmm_startup_timeout_ms` | `int32` | `120000` | Positive timeout in milliseconds applied separately to the master's node-registration wait and each non-master's physical-pool readiness wait during VMM startup. Independent of per-request RPC timeouts; each wait has its own timer. |
 | `phy_page_granularity_size` | `int64` | `2097152` | Granularity size of one physical page in bytes, default 2 MiB, for continuous KV Cache. |
 
-### Virtual KV Cache
-
-With `enable_virtual_memory=true` and `vmm_elastic=true`, physical backing grows as pages are mapped. Idle KV backing is released after the last block on a page is returned. The shared KV/weight pool reserves a stable virtual address arena at startup, then activates logical slots automatically as demand exceeds the initial capacity. With an explicitly configured positive `max_memory_utilization`, the arena is bounded by that fraction of total device memory, and physical growth also keeps the remaining fraction free on each worker. Omitting the ratio or setting it to `0` lets the arena cover total device memory. `max_cache_size` remains an optional byte limit. Actual growth and request admission always use live available memory and preserve execution headroom, so native allocator statistics allow memory released outside the pool to provide additional KV capacity without restarting. Backends without reliable allocator statistics retain conservative execution watermarks. Use `vmm_memory_reserve_bytes` for direct SDK buffers and execution shapes not covered by warmup.
-
-Append the following flags to an existing launch command to disable both explicit capacity ceilings and keep an additional 1 GiB free for execution. In elastic mode, omitting `max_memory_utilization` has the same effect as setting it to `0`:
-
-```bash
---enable_virtual_memory=true \
---vmm_elastic=true \
---max_memory_utilization=0 \
---max_cache_size=0 \
---vmm_memory_reserve_bytes=1073741824
-```
-
-Tune the additional reserve from device measurements. `vmm_memory_reserve_bytes=0` still preserves runtime execution headroom. When using graphs with elastic virtual memory, startup warmup is required (`disable_graph_warmup=false`). PD KV transfer and remote weight transfer using Mooncake require a fully resident pool: use `vmm_elastic=false` and a positive `max_memory_utilization`. See [Elastic virtual KV](/en/dev_guide/code_arch/#elastic-virtual-kv) for details.
+For VMM usage and capacity guidance, see [Virtual Memory for KV Cache and Model Weights](/en/features/virtual_memory/).
 
 ### kv_events_config
 
@@ -376,6 +363,7 @@ flag defaults to false and leaves fixed-width MTP unchanged when disabled.
 | `enable_graph_vmm_pool` | `bool` | `true` | Whether to enable a VMM-backed CUDA graph memory pool for multi-shape graph memory reuse. |
 | `max_tokens_for_graph_mode` | `int32` | `2048` | Maximum number of tokens for graph execution. `0` means no limit. |
 | `acl_graph_decode_batch_size_limit` | `int32` | `16` | Decode batch size threshold for ACL graph on NPU. When the actual decode batch size exceeds this value, ACL graph decode falls back to eager mode to avoid OOM. |
+| `block_draft_graph_warmup_max_kv_len` | `int32` | `0` | Pre-capture power-of-two KV capacity buckets for independent Python block-draft ACL graphs (DSpark/DFlash2, including GLM MLA drafts). `0` covers the full model context; a positive value selects the bucket covering that length; `-1` retains lazy capacity capture. Required existing warmup shapes are always retained, even above a positive limit. Requests beyond the warmup limit can still grow graphs lazily. More buckets increase startup time and draft graph memory. Does not change target, MTP, context-write or optional whole-round unified graph warmup. |
 | `enable_shm` | `bool` | `false` | Whether to enable shared memory for model execution. |
 | `use_contiguous_input_buffer` | `bool` | `true` | Whether to use a contiguous device input buffer for model execution. |
 | `input_shm_size` | `uint64` | `1024` | Input shared-memory size. Default is 1GB. |

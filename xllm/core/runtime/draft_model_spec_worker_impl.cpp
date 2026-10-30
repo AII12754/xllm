@@ -142,7 +142,7 @@ KVCacheEstimateOptions make_kv_cache_estimate_options(
   const KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
   estimate_options.enable_prefix_cache =
       kv_cache_config.enable_prefix_cache() &&
-      !kv_cache_config.enable_virtual_memory();
+      !kv_cache_config.enable_vmm_kvcache();
   estimate_options.enable_disagg_pd = options.enable_disagg_pd();
   estimate_options.instance_role = options.instance_role();
   estimate_options.dp_size = options.dp_size();

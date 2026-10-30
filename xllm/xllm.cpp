@@ -340,6 +340,12 @@ void validate_config(const std::string& model_type) {
 #endif
 
 #if defined(USE_NPU)
+  CHECK(!load_config.enable_vmm_weights() || model_config.backend() == "llm")
+      << "Weight VMM currently requires --backend=llm.";
+  CHECK(!load_config.enable_vmm_weights() ||
+        kv_cache_config.enable_vmm_kvcache() || kv_cache_config.vmm_elastic())
+      << "Weight-only VMM requires --vmm_elastic=true so ordinary KV cache "
+         "can allocate device memory outside the weight pool.";
   if (speculative_config.num_speculative_tokens() > 0 &&
       execution_config.enable_graph_double_buffer()) {
     LOG(WARNING) << "enable_graph_double_buffer is not compatible with "
@@ -347,11 +353,10 @@ void validate_config(const std::string& model_type) {
                  << "Disabling enable_graph_double_buffer.";
     execution_config.enable_graph_double_buffer(false);
   }
-  // enable_virtual_memory / enable_rolling_load imply enable_manual_loader
-  if ((kv_cache_config.enable_virtual_memory() ||
-       load_config.enable_rolling_load()) &&
+  // Weight VMM and rolling load require the manual weight loader.
+  if ((load_config.enable_vmm_weights() || load_config.enable_rolling_load()) &&
       !load_config.enable_manual_loader()) {
-    LOG(WARNING) << "enable_virtual_memory or enable_rolling_load requires "
+    LOG(WARNING) << "enable_vmm_weights or enable_rolling_load requires "
                     "enable_manual_loader; forcing enable_manual_loader=true.";
     load_config.enable_manual_loader(true);
   }
@@ -371,8 +376,11 @@ void validate_config(const std::string& model_type) {
                << "rolling_load_num_cached_layers.";
   }
 #else
-  if (kv_cache_config.enable_virtual_memory()) {
-    LOG(FATAL) << "enable_virtual_memory is only supported on NPU.";
+  if (kv_cache_config.enable_vmm_kvcache()) {
+    LOG(FATAL) << "enable_vmm_kvcache is only supported on NPU.";
+  }
+  if (load_config.enable_vmm_weights()) {
+    LOG(FATAL) << "enable_vmm_weights is only supported on NPU.";
   }
   if (load_config.enable_manual_loader()) {
     LOG(FATAL) << "enable_manual_loader is only supported on NPU.";
@@ -387,6 +395,7 @@ void validate_config(const std::string& model_type) {
 
 int run() {
   ModelConfig& model_config = ModelConfig::get_instance();
+  LoadConfig& load_config = LoadConfig::get_instance();
   KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
   BeamSearchConfig& beam_search_config = BeamSearchConfig::get_instance();
   SchedulerConfig& scheduler_config = SchedulerConfig::get_instance();
@@ -470,8 +479,9 @@ int run() {
   InstanceName::name()->set_name(options.instance_name().value_or(""));
 
   // master node
-  // init VirtualMemory allocator and PhysicalPagePool for virtual memory mode
-  if (kv_cache_config.enable_virtual_memory()) {
+  // Initialize the shared pool for either VMM consumer.
+  if (kv_cache_config.enable_vmm_kvcache() ||
+      load_config.enable_vmm_weights()) {
     // Parse devices
     const auto devices = DeviceNameUtils::parse_devices("auto");
 
@@ -491,16 +501,17 @@ int run() {
           parallel_config.dp_size());
     }
 
-    // Initialize PhysicalPagePool on all workers
-    int64_t num_pages = memory_coordinator.init_physical_page_pools(
-        kv_cache_config.max_memory_utilization(),
-        kv_cache_config.max_cache_size(),
-        kv_cache_config.max_memory_utilization_configured());
-    if (num_pages <= 0) {
-      LOG(FATAL) << "Failed to initialize PhysicalPagePool";
+    // Weight loading needs the pool immediately. KV-only pools are created
+    // after ordinary model weights have consumed their device memory.
+    if (load_config.enable_vmm_weights()) {
+      const int64_t num_pages = memory_coordinator.init_physical_page_pools(
+          kv_cache_config.max_memory_utilization(),
+          kv_cache_config.max_cache_size(),
+          kv_cache_config.max_memory_utilization_configured());
+      CHECK_GT(num_pages, 0) << "Failed to initialize PhysicalPagePool";
+      LOG(INFO) << "VirtualMemory initialized with " << num_pages
+                << " physical pages";
     }
-    LOG(INFO) << "VirtualMemory initialized with " << num_pages
-              << " physical pages";
   }
 
   std::unique_ptr<Master> master =
@@ -513,8 +524,7 @@ int run() {
   std::string model_version = default_model_name;
   std::vector<std::string> model_versions = {model_version};
 
-  if (distributed_config.node_rank() == 0 ||
-      kv_cache_config.enable_virtual_memory()) {
+  if (distributed_config.node_rank() == 0 || load_config.enable_vmm_weights()) {
     auto api_service = std::make_unique<APIService>(
         master.get(), model_names, model_repository_names, model_versions);
     auto xllm_server =

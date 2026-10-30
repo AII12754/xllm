@@ -66,6 +66,7 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
     def __init__(self, config: dict) -> None:
         cfg = Qwen3DSparkConfig.from_dict(config)
         cfg.validate()
+        causal = cfg.sliding_window > 0 and not config.get("sliding_window_non_causal", False)
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "npu"))
         super().__init__(
@@ -81,7 +82,7 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
         self.cfg = cfg
         self.dtype = dtype
         self.device = device
-        self.model = Qwen3DSparkModel(cfg, dtype, device)  # pyright: ignore[reportIncompatibleVariableOverride]
+        self.model = Qwen3DSparkModel(cfg, dtype, device, causal=causal)  # pyright: ignore[reportIncompatibleVariableOverride]
         self.lm_head: nn.Module | None = None  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:

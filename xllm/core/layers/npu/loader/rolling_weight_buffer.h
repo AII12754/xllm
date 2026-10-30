@@ -29,16 +29,16 @@ namespace layer {
 // Slot index = layer_index % num_slots.
 //
 // Memory allocation strategy:
-//   - enable_virtual_memory=true:  memory is allocated via
+//   - enable_vmm_weights=true:  memory is allocated via
 //   WorkerMemoryResources
 //                           (counted in weight pages budget)
-//   - enable_virtual_memory=false: memory is allocated via aclrtMalloc
+//   - enable_vmm_weights=false: memory is allocated via aclrtMalloc
 class RollingWeightBuffer {
  public:
   // num_slots: number of cached decoder layer slots(N =
   // rolling_load_num_cached_layers) storage_size: byte size of one decoder
   // layer's weights (aligned) model_id: VirtualMemory model id
-  //           (used when enable_virtual_memory=true; ignored otherwise)
+  //           (used when enable_vmm_weights=true; ignored otherwise)
   RollingWeightBuffer(int32_t num_slots,
                       size_t storage_size,
                       const std::string& model_id = "");

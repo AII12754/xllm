@@ -56,9 +56,9 @@ class BlockManagerPool : public KVCacheManager {
     // leaves in ConcurrentBlockManagerImpl so the async D2H offload callback
     // can free blocks off-thread safely.
     PROPERTY(bool, enable_host_offload) = false;
-    PROPERTY(bool, enable_virtual_memory) = false;
+    PROPERTY(bool, enable_vmm_kvcache) = false;
     PROPERTY(int64_t,
-             num_layers) = 0;  // Required when enable_virtual_memory is true
+             num_layers) = 0;  // Required when enable_vmm_kvcache is true
     PROPERTY(int64_t,
              slot_size) = 0;  // Memory size per slot (for virtual memory)
     PROPERTY(size_t, virtual_block_bytes) = 0;

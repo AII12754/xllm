@@ -202,7 +202,7 @@ std::vector<XXH3Key> ExpectedChain(const std::vector<int32_t>& tokens,
 TEST(KVCacheManagerFactoryTest,
      RejectsVirtualMemoryHostOffloadBeforeAllocation) {
   BlockManagerPool::Options options;
-  options.enable_virtual_memory(true).enable_host_offload(true);
+  options.enable_vmm_kvcache(true).enable_host_offload(true);
 
   EXPECT_DEATH(KVCacheManagerFactory::create(KVCacheCapacity{},
                                              ModelArgs{},
@@ -216,7 +216,7 @@ TEST(KVCacheManagerFactoryTest,
 TEST(KVCacheManagerFactoryTest,
      RejectsVirtualMemoryHostOffloadConfigurationBeforeAllocation) {
   BlockManagerPool::Options options;
-  options.enable_virtual_memory(true);
+  options.enable_vmm_kvcache(true);
   HostCacheValidationOptions host_options;
   host_options.host_blocks_factor = 2.0;
 

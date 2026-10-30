@@ -59,25 +59,13 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-bool uses_prepared_dflash2_graphs(const runtime::Options& options) {
-  if (!options.enable_task_pipeline() || !Platform::is_npu() ||
-      !SpeculativeConfig::is_dflash2_algorithm(
-          options.speculative_algorithm()) ||
-      (options.num_speculative_tokens() != 5 &&
-       options.num_speculative_tokens() != 7)) {
-    return false;
-  }
-  const std::string model_type =
-      get_model_type(options.model_path(), options.backend());
-  return model_type == "qwen3_5" || model_type == "qwen3_5_text";
-}
-
-// Unsupported prepared block geometries retain the worker-owned hybrid path.
+// Ordinary DFlash retains its worker-owned recurrent target path. DSpark and
+// DFlash2 use the shared block task pipeline and its capability validation.
 bool uses_hybrid_worker_pipeline(const runtime::Options& options) {
   if (!options.enable_task_pipeline() || !Platform::is_npu() ||
       options.enable_adaptive_target_verify() ||
-      SpeculativeConfig::is_dspark_algorithm(options.speculative_algorithm()) ||
-      uses_prepared_dflash2_graphs(options)) {
+      !SpeculativeConfig::is_dflash_algorithm(
+          options.speculative_algorithm())) {
     return false;
   }
   const std::string model_type =
@@ -106,23 +94,20 @@ runtime::Options draft_options(const runtime::Options& options) {
   const bool is_dflash2 =
       SpeculativeConfig::is_dflash2_algorithm(options.speculative_algorithm());
   const bool hybrid_pipeline = uses_hybrid_worker_pipeline(options);
-  const bool prepared_dflash2 = uses_prepared_dflash2_graphs(options);
   const int32_t draft_num_speculative_tokens =
       is_dspark ? options.num_speculative_tokens() : 0;
   runtime::Options opts = options;
   opts.enable_schedule_overlap(false)
       .is_draft_engine(true)
-      .num_decoding_tokens((hybrid_pipeline || prepared_dflash2) && is_dflash2
-                               ? options.num_speculative_tokens() + 1
-                               : 1)
+      .num_decoding_tokens(is_dflash2 ? options.num_speculative_tokens() + 1
+                                      : 1)
       .num_speculative_tokens(draft_num_speculative_tokens)
       .enable_graph_aux_hidden_states(false);
   if (hybrid_pipeline) {
     // The outer worker owns the task queue. Its leaf executors retain their
     // recurrent-aware ACL runners instead of borrowing full-attention slots.
     opts.enable_task_pipeline(false);
-  } else if (options.enable_task_pipeline() && !is_dspark &&
-             !prepared_dflash2) {
+  } else if (options.enable_task_pipeline() && !is_dspark && !is_dflash2) {
     opts.enable_graph(false);
   }
   return opts;
@@ -387,8 +372,7 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
 ::xllm::Status DFlashWorkerImpl::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
   if (target_is_hybrid_recurrent_ && uses_hybrid_worker_pipeline(options_)) {
-    if (!uses_hybrid_worker_pipeline(options_) || !options_.enable_graph() ||
-        options_.enable_adaptive_target_verify() ||
+    if (!options_.enable_graph() || options_.enable_adaptive_target_verify() ||
         parallel_args_.dp_size() != 1) {
       return ::xllm::Status(
           StatusCode::INVALID_ARGUMENT,

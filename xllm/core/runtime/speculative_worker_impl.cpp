@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "core/runtime/speculative_worker_impl.h"
 
+#include <type_traits>
+
 #include "common/global_flags.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_utils.h"
@@ -168,6 +170,21 @@ bool SpeculativeWorkerImpl<TargetInput>::allocate_kv_cache_with_transfer(
 template <typename TargetInput>
 std::optional<ForwardOutput> SpeculativeWorkerImpl<TargetInput>::step(
     const TargetInput& input) {
+  if constexpr (std::is_same_v<TargetInput, VlmForwardInput>) {
+    if (input.runtime.input_host_buffer_has_layout) {
+      // Rebuild host views before speculative code derives text draft inputs.
+      // Each leaf worker still owns device preparation on its ordered stream.
+      TargetInput unpacked_input;
+      if (input.runtime.device_tensors_ready) {
+        unpacked_input = input.clone();
+        unpacked_input.runtime.input_host_buffer_has_layout = false;
+      } else {
+        CHECK(detail::unpack_from_input_host_buffer(
+            input, torch::Device(torch::kCPU), unpacked_input));
+      }
+      return step(unpacked_input);
+    }
+  }
   auto& mutable_params = input.input_params;
   set_hierarchy_layer_synchronizer(mutable_params);
   const bool run_speculative_decode =
@@ -257,8 +274,14 @@ ForwardOutput finalize_verify_output(
     ForwardOutput target_output,
     SampleOutput val_output,
     const std::vector<JsonObjectGrammarState>& json_object_states) {
-  target_output.spec_verify_layouts = make_verify_layouts(
-      val_output.next_tokens, nullptr, constrained_mask(json_object_states));
+  // Verify kernels have completed by every entry to this tail.
+  const std::vector<int32_t> num_accepted_tokens =
+      tensor_to_vector<int32_t>(val_output.num_accepted_tokens);
+  target_output.spec_verify_stats =
+      make_verify_stats(val_output.next_tokens,
+                        /*per_seq_draft_counts=*/nullptr,
+                        num_accepted_tokens,
+                        constrained_mask(json_object_states));
   // The verify output replaces sample_output wholesale, so only its own
   // embeddings need clearing.
   val_output.embeddings = torch::Tensor();

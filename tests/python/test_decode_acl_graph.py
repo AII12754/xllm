@@ -14,7 +14,8 @@
 
 """Tests for the NPU ACL decode-graph runner."""
 
-from contextlib import nullcontext
+import os
+from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -26,7 +27,7 @@ from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa_attention import DsaAttentionBackend
 from xllm.python.attention.dsa_metadata import DsaMetadataBuilder, build_cache_specs
 from xllm.python.attention.paged_kv_metadata import build_row_aligned_paged_kv_metadata
-from xllm.python.model_executor.runners.acl_graph import AclGraphEntry, AclGraphRunner
+from xllm.python.model_executor.runners.acl_graph import AclGraphEntry, AclGraphRunner, StaticGraphAttentionMetadata
 from xllm.python.model_executor.runners.block_draft_acl_graph import (
     BlockDraftAclGraphRunner,
 )
@@ -35,15 +36,28 @@ from xllm.python.model_executor.runners.decode_acl_graph import (
 )
 
 
-def _runner(**kwargs) -> DecodeAclGraphRunner:
+def _runner(
+    *,
+    max_batch: int = 8,
+    max_model_len: int = 8,
+    dp_size: int = 1,
+    num_decoding_tokens: int = 1,
+    spec_verify_width: int = 1,
+    enable_graph_mode_decode_no_padding: bool = False,
+    enable_mega_moe_token_mask: bool = False,
+) -> DecodeAclGraphRunner:
     attention_backend = SimpleNamespace(page_size=4, is_mla=False, create_graph_block_tables=lambda *_: ())
     return DecodeAclGraphRunner(
         nn.Identity(),
         attention_backend,
         torch.device("cpu"),
-        max_batch=8,
-        max_model_len=8,
-        **kwargs,
+        max_batch=max_batch,
+        max_model_len=max_model_len,
+        dp_size=dp_size,
+        num_decoding_tokens=num_decoding_tokens,
+        spec_verify_width=spec_verify_width,
+        enable_graph_mode_decode_no_padding=enable_graph_mode_decode_no_padding,
+        enable_mega_moe_token_mask=enable_mega_moe_token_mask,
     )
 
 
@@ -260,6 +274,88 @@ def test_dspark_dp_warmup_recaptures_when_any_rank_is_missing() -> None:
     capture.assert_called_once()
 
 
+@pytest.mark.parametrize("dp_rank", [0, 1])
+def test_block_draft_dp_prewarm_keeps_collectives_aligned_for_unequal_capacities(dp_rank: int) -> None:
+    runner = _block_draft_runner(dp_size=2, dp_rank=dp_rank, block_draft_graph_warmup_max_kv_len=4096)
+    runner.max_model_len = 16384
+    runner.attention_backend.logical_page_size = 128
+    metadata = _block_draft_metadata(torch.zeros(1, 128, dtype=torch.int32))
+    length = 8193 if dp_rank == 0 else 2
+    metadata.kv_seq_lens.fill_(length)
+    metadata.kv_seq_lens_host_values = [length]
+    metadata.dp_execution_token_counts = (2, 2)
+    metadata.dp_is_decode = (1, 1)
+    tokens = torch.arange(2, dtype=torch.int32)
+    captured = []
+
+    def presence(count: torch.Tensor, *, group_name: str) -> None:
+        assert group_name == "dp"
+        count.mul_(2)
+
+    def prepare(*args: object, graph_key: tuple[object, ...], eplb: object = None) -> None:
+        captured.append(graph_key)
+        runner._graphs[graph_key] = object()
+
+    with (
+        patch("xllm.python.model_executor.runners.decode_acl_graph.dist.is_initialized", return_value=True),
+        patch(
+            "xllm.python.distributed.all_gather",
+            side_effect=[torch.tensor([1, 1]), torch.tensor([2, 1])],
+        ) as gather,
+        patch("xllm.python.distributed.all_reduce_", side_effect=presence) as reduce,
+        patch.object(runner, "_prepare_graph_entry", side_effect=prepare),
+    ):
+        key = runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+
+    # Both ranks visit the bounded tier, then their current local capacity.
+    assert gather.call_count == reduce.call_count == 2
+    assert [key[2] for key in captured] == ([32, 128] if dp_rank == 0 else [32, 32])
+    assert [key[-1] for key in captured] == [(1, 1), (2, 1)]
+    assert key == captured[-1]
+
+
+def test_block_draft_dp_prewarmed_capacity_keys_are_reused_at_runtime() -> None:
+    runner = _block_draft_runner(dp_size=2)
+    runner.max_model_len = 16384
+    runner.attention_backend.logical_page_size = 128
+    metadata = _block_draft_metadata(torch.zeros(1, 128, dtype=torch.int32))
+    metadata.kv_seq_lens.fill_(2)
+    metadata.kv_seq_lens_host_values = [2]
+    metadata.dp_execution_token_counts = (2, 2)
+    metadata.dp_is_decode = (1, 1)
+    tokens = torch.arange(2, dtype=torch.int32)
+    captured = []
+
+    def gather(variant: torch.Tensor, *, dim: int, world_size: int, group_name: str) -> torch.Tensor:
+        assert dim == 0 and world_size == 2 and group_name == "dp"
+        return variant.repeat(world_size)
+
+    def presence(count: torch.Tensor, *, group_name: str) -> None:
+        assert group_name == "dp"
+        count.mul_(2)
+
+    def prepare(*args: object, graph_key: tuple[object, ...], eplb: object = None) -> None:
+        captured.append(graph_key)
+        runner._graphs[graph_key] = object()
+
+    with (
+        patch("xllm.python.model_executor.runners.decode_acl_graph.dist.is_initialized", return_value=True),
+        patch("xllm.python.distributed.all_gather", side_effect=gather),
+        patch("xllm.python.distributed.all_reduce_", side_effect=presence),
+        patch.object(runner, "_prepare_graph_entry", side_effect=prepare),
+    ):
+        current_key = runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+        assert current_key == captured[-1]
+        assert [(key[2], key[-1]) for key in captured] == [(128, (1, 1)), (64, (2, 2)), (32, (3, 3))]
+        for length in (2048, 4097, 8193, 2048):
+            metadata.kv_seq_lens.fill_(length)
+            metadata.kv_seq_lens_host_values = [length]
+            assert runner.warmup(tokens, tokens, metadata) in captured
+        runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+
+    assert len(captured) == 3
+
+
 def test_dspark_graph_key_buckets_live_page_table_width() -> None:
     runner = _block_draft_runner()
     input_ids = torch.zeros(2, dtype=torch.int32)
@@ -309,6 +405,32 @@ def test_dspark_graph_capacity_does_not_use_model_maximum() -> None:
     assert entry.static_metadata.block_table.shape == (1, 32)
     assert entry.static_metadata.paged_kv_indices.numel() == 32
     assert entry.static_metadata.kv_seq_lens_host_values == [4096]
+
+
+@pytest.mark.parametrize("sparse_mode", [0, 4], ids=["dspark", "dflash2"])
+def test_windowed_block_draft_reuses_one_source_capacity_across_contexts(sparse_mode: int) -> None:
+    from xllm.python.layers.attention import Attention
+
+    model = nn.ModuleList([Attention(4, 1, 64, 0.125, 2048, 0, fia_sparse_mode=sparse_mode, fia_pre_tokens=2047)])
+    backend = _FakeBlockDraftAttentionBackend()
+    backend.logical_page_size = 128
+    runner = BlockDraftAclGraphRunner(model, backend, torch.device("cpu"), max_batch=1, max_model_len=65537)
+    tokens = torch.arange(2, dtype=torch.int32)
+
+    def prepare_entry(*args: object, graph_key: tuple[object, ...], eplb: object = None) -> None:
+        runner._graphs[graph_key] = object()
+
+    with patch.object(runner, "_prepare_graph_entry", side_effect=prepare_entry) as prepare:
+        for length in (16, 4097, 16385, 32769, 65537, 16):
+            columns = (length + 127) // 128
+            metadata = _block_draft_metadata(torch.zeros(1, columns, dtype=torch.int32))
+            metadata.kv_seq_lens_host_values[:] = [length]
+            metadata.kv_seq_lens.fill_(length)
+            key = runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+            assert key[2] == 513
+    assert prepare.call_count == 1
+    entry = runner._allocate_entry(tokens, tokens, metadata)
+    assert entry.static_metadata.block_table.shape == (1, 513)
 
 
 @pytest.mark.parametrize(("sequence_count", "padded_count"), [(1, 1), (2, 4)])
@@ -370,6 +492,37 @@ def test_dspark_warmup_captures_once_per_page_capacity_bucket() -> None:
     assert prepare.call_count == 2
     assert keys[0] == keys[1] == keys[3]
     assert keys[0] != keys[2]
+
+
+@pytest.mark.parametrize(
+    ("max_model_len", "expected"),
+    [(128, [2]), (2048, [32]), (8320, [128, 64, 32]), (16384, [128, 64, 32])],
+)
+def test_block_draft_startup_prewarms_large_buckets_with_short_metadata(
+    max_model_len: int, expected: list[int]
+) -> None:
+    runner = _block_draft_runner(block_draft_graph_warmup_max_kv_len=0)
+    runner.max_model_len = max_model_len
+    runner.attention_backend.logical_page_size = 128
+    metadata = _block_draft_metadata(torch.zeros(1, 1, dtype=torch.int32))
+    metadata.kv_seq_lens_host_values = [2]
+    tokens = torch.arange(2, dtype=torch.int32)
+    captured = []
+
+    def prepare_entry(*args: object, graph_key: tuple[object, ...], eplb: object = None) -> None:
+        captured.append(graph_key[2])
+        runner._graphs[graph_key] = object()
+
+    with patch.object(runner, "_prepare_graph_entry", side_effect=prepare_entry):
+        key = runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+        runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+    assert captured == expected
+    assert key[2] == expected[-1]
+    metadata.block_table = torch.zeros(1, (max_model_len + 127) // 128, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values[:] = [max_model_len]
+    metadata.kv_seq_lens.fill_(max_model_len)
+    runtime_key = runner._graph_key(tokens, metadata, 1, 2)
+    assert runtime_key in runner._graphs
 
 
 def test_dspark_request_reuses_startup_page_bucket() -> None:
@@ -780,32 +933,25 @@ def test_accepted_counts_refresh_in_stable_graph_buffer() -> None:
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("state_ids", [(1,), (0,) * 64, (2, 0, 2, 1, 0), tuple(range(64))])
 @pytest.mark.parametrize("capture_fails", [False, True])
-def test_capture_restores_all_gdn_checkpoints(
+def test_capture_preserves_gdn_live_checkpoints(
     index_dtype: torch.dtype, state_ids: tuple[int, ...], capture_fails: bool
 ) -> None:
-    runner = _runner()
+    runner = _runner(max_batch=max(8, len(state_ids)), max_model_len=64)
     indices = torch.tensor(state_ids, dtype=index_dtype)
-    touched = torch.tensor(sorted(set(state_ids)), dtype=torch.int64)
-    checkpoints = (touched[:, None] * 8 + torch.arange(8)).reshape(-1)
     slots = max(3, max(state_ids) + 1)
     conv = torch.arange(slots * 20, dtype=torch.float32).reshape(slots, 10, 2)
     ssm = torch.arange(slots * 32, dtype=torch.float32).reshape(slots * 8, 1, 2, 2)
     original_conv, original_ssm = conv.clone(), ssm.clone()
-    runner.layer_caches = [LayerCache(key=None, value=None, conv=conv, ssm=ssm)]
-    runner.attention_backend.snapshot_linear_state = Mock(return_value=None)
-    entry = AclGraphEntry()
-    entry.static_metadata = SimpleNamespace(
-        linear_state_indices=indices,
-    )
-    snapshot_rows: list[int] = []
-    index_select = torch.Tensor.index_select
+    runner.bind_layer_caches([LayerCache(key=None, value=None, conv=conv, ssm=ssm)])
+    runner.attention_backend.prepare = Mock()
+    runner.attention_backend.prepare_graph_replay = Mock()
+    metadata = _metadata(indices)
+    input_ids = torch.arange(indices.numel(), dtype=torch.int32)
 
-    def record_snapshot(tensor: torch.Tensor, dim: int, selected: torch.Tensor) -> torch.Tensor:
-        snapshot_rows.append(selected.numel())
-        return index_select(tensor, dim, selected)
-
-    def capture(*_: object) -> None:
-        conv.index_fill_(0, touched, -1)
+    def capture(entry: AclGraphEntry, stream: object) -> None:
+        selected = entry.static_metadata.linear_state_indices.long()
+        checkpoints = (selected[:, None] * 8 + torch.arange(8)).reshape(-1)
+        conv.index_fill_(0, selected, -1)
         ssm.index_fill_(0, checkpoints, -1)
         if capture_fails:
             raise RuntimeError("capture failed")
@@ -813,17 +959,153 @@ def test_capture_restores_all_gdn_checkpoints(
     with (
         patch.object(AclGraphRunner, "_capture", side_effect=capture),
         patch.object(torch.npu, "current_stream", return_value=Mock()),
-        patch.object(torch.Tensor, "index_select", new=record_snapshot),
+        patch.object(torch.npu, "Stream", return_value=Mock()),
+        patch(
+            "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
+            create=True,
+        ),
     ):
         failure = pytest.raises(RuntimeError, match="capture failed") if capture_fails else nullcontext()
         with failure:
-            runner._capture(entry, Mock())
+            runner._prepare_graph_entry(input_ids, input_ids, metadata, None)
 
-    torch.testing.assert_close(conv, original_conv)
-    torch.testing.assert_close(ssm, original_ssm)
-    assert snapshot_rows == [touched.numel(), checkpoints.numel()]
-    saved_indices = runner.attention_backend.snapshot_linear_state.call_args.args[0]
-    torch.testing.assert_close(saved_indices, touched)
+    torch.testing.assert_close(conv[1:], original_conv[1:])
+    torch.testing.assert_close(ssm[8:], original_ssm[8:])
+    torch.testing.assert_close(metadata.linear_state_indices, torch.tensor(state_ids, dtype=index_dtype))
+
+
+@pytest.mark.parametrize(
+    ("width", "is_mla"),
+    [(width, False) for width in (1, 2, 3, 4, 9, 17)] + [(3, True)],
+)
+@pytest.mark.parametrize("no_padding", [False, True])
+@pytest.mark.parametrize("device_kind", ["cpu", "npu"])
+def test_capture_preserves_live_state_until_first_replay(
+    width: int,
+    is_mla: bool,
+    no_padding: bool,
+    device_kind: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    if device_kind == "npu":
+        device_name = os.getenv("XLLM_KDA_TEST_NPU_DEVICE")
+        if not device_name:
+            pytest.skip("NPU device not configured")
+        pytest.importorskip("torch_npu")
+        device = torch.device(device_name)
+        previous_device = torch.npu.current_device()
+        request.addfinalizer(lambda: torch.npu.set_device(previous_device))
+        torch.npu.set_device(device)
+    else:
+        device = torch.device("cpu")
+    runner = _runner(
+        max_batch=max(8, 2 * width),
+        max_model_len=max(8, 2 * width),
+        num_decoding_tokens=width,
+        spec_verify_width=1 if is_mla else width,
+        enable_graph_mode_decode_no_padding=no_padding,
+    )
+    runner.attention_backend.is_mla = is_mla
+    slots = torch.tensor([1, 3], dtype=torch.int32)
+    rows = slots.numel() * width
+
+    class NativeMetadata(SimpleNamespace):
+        def __copy__(self) -> None:
+            raise TypeError("native metadata views cannot be copied")
+
+    metadata = NativeMetadata(**vars(_metadata(slots, rows=rows)))
+    page_size = runner.attention_backend.page_size
+    block_cols = (rows + page_size - 1) // page_size
+    metadata.block_table = torch.arange(1, rows * block_cols + 1, dtype=torch.int32).reshape(rows, block_cols)
+    metadata.paged_kv_indptr, metadata.paged_kv_indices, metadata.paged_kv_last_page_len = (
+        build_row_aligned_paged_kv_metadata(metadata.block_table, metadata.kv_seq_lens_host_values, page_size)
+    )
+    metadata.has_initial_state = torch.ones_like(slots, dtype=torch.bool)
+    metadata.num_accepted_tokens = torch.tensor([width, 1], dtype=torch.int32) if width > 1 else None
+    metadata.num_accepted_tokens_host_values = (width, 1) if width > 1 else ()
+    if width > 1:
+        metadata.is_spec_verify = True
+        metadata.q_seq_lens_host = torch.full((slots.numel(),), width, dtype=torch.int32)
+        metadata.q_cu_seq_lens = torch.arange(slots.numel() + 1, dtype=torch.int32) * width
+        metadata.expanded_decode_metadata = SimpleNamespace(
+            enabled=True,
+            kv_seq_lens=metadata.kv_seq_lens,
+            block_table=metadata.block_table,
+            paged_kv_indptr=metadata.paged_kv_indptr,
+            paged_kv_indices=metadata.paged_kv_indices,
+            paged_kv_last_page_len=metadata.paged_kv_last_page_len,
+            paged_attention_tiling_data=None,
+            kv_seq_lens_host=None,
+            kv_seq_lens_host_values=metadata.kv_seq_lens_host_values,
+        )
+    for name, value in vars(metadata).items():
+        if isinstance(value, torch.Tensor) and not name.endswith("_host"):
+            setattr(metadata, name, value.to(device))
+    conv = torch.arange(8, dtype=torch.float32, device=device).reshape(8, 1)
+    ssm = torch.arange(8 * width, dtype=torch.float32, device=device).reshape(8 * width, 1)
+    original_conv, original_ssm = conv.clone(), ssm.clone()
+    runner.bind_layer_caches([LayerCache(key=None, value=None, conv=conv, ssm=ssm)])
+    output = torch.empty(rows, 1, device=device)
+    prepared: list[StaticGraphAttentionMetadata] = []
+    pointers: list[int] = []
+
+    def prepare(static: StaticGraphAttentionMetadata, **_: object) -> None:
+        prepared.append(static)
+        pointers.append(static.linear_state_indices.data_ptr())
+
+    def advance() -> torch.Tensor:
+        static = prepared[-1]
+        indices = static.linear_state_indices.long()
+        checkpoints = indices[:, None] * width + torch.arange(width, device=device)
+        accepted = static.num_accepted_tokens
+        columns = accepted.long() - 1 if accepted is not None else torch.zeros_like(indices)
+        values = ssm[checkpoints[torch.arange(indices.numel(), device=device), columns]].flatten() + 1
+        conv.index_copy_(0, indices, conv[indices] + 1)
+        ssm.index_copy_(0, checkpoints.flatten().long(), values.repeat_interleave(width).view(-1, 1))
+        output.copy_(values[: slots.numel()].repeat_interleave(width).view(-1, 1))
+        return output
+
+    def capture(entry: AclGraphEntry, stream: object) -> None:
+        assert not entry.static_metadata.linear_state_indices.any()
+        for _ in range(3):
+            advance()
+        torch.testing.assert_close(conv[1:], original_conv[1:])
+        torch.testing.assert_close(ssm[width:], original_ssm[width:])
+        entry.static_output = output
+        entry.graph_tasks = []
+        entry.graph = Mock()
+        entry.graph.replay.side_effect = advance
+
+    runner.attention_backend.prepare = prepare
+    runner.attention_backend.prepare_graph_replay = prepare
+    input_ids = torch.arange(rows, dtype=torch.int32, device=device)
+    with ExitStack() as stack:
+        if device_kind == "cpu":
+            stack.enter_context(patch.object(AclGraphRunner, "_capture", side_effect=capture))
+            stack.enter_context(patch.object(torch.npu, "current_stream", return_value=Mock()))
+            stack.enter_context(patch.object(torch.npu, "stream", side_effect=lambda _: nullcontext()))
+            stack.enter_context(patch.object(torch.npu, "Stream", return_value=Mock()))
+            stack.enter_context(
+                patch(
+                    "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
+                    create=True,
+                )
+            )
+        else:
+            stack.enter_context(patch.object(runner, "_forward_static", side_effect=lambda _: advance()))
+        result = runner.execute(input_ids, input_ids, metadata)
+    slots = slots.to(device)
+    columns = torch.tensor([width - 1, 0], device=device)
+    expected = original_ssm[slots.long() * width + columns].flatten() + 1
+    torch.testing.assert_close(result.flatten(), expected.repeat_interleave(width))
+    torch.testing.assert_close(conv[slots.long()], original_conv[slots.long()] + 1)
+    checkpoints = slots.long()[:, None] * width + torch.arange(width, device=device)
+    torch.testing.assert_close(ssm[checkpoints].squeeze(-1), expected[:, None].expand_as(checkpoints))
+    assert len(set(pointers)) == 1
+    torch.testing.assert_close(metadata.linear_state_indices, slots)
+    assert metadata.has_initial_state.all()
+    if width > 1:
+        assert metadata.num_accepted_tokens.tolist() == [width, 1]
 
 
 def test_untyped_verify_reuses_row_aligned_paging_metadata() -> None:

@@ -28,7 +28,6 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/config/dit_config.h"
-#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/model_context/dit_model_context.h"
 #include "core/framework/model_loader/dit_model_loader.h"
@@ -843,7 +842,7 @@ class MiniMaxH3Transformer3DModelImpl final
 #if defined(USE_NPU)
     return LoadConfig::get_instance().enable_rolling_load() &&
            parallel_args.tp_size() == 1 &&
-           !KVCacheConfig::get_instance().enable_virtual_memory();
+           !LoadConfig::get_instance().enable_vmm_weights();
 #else
     (void)parallel_args;
     return false;

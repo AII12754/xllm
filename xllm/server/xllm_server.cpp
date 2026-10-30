@@ -25,7 +25,7 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/distributed_config.h"
-#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
 #include "core/framework/config/service_config.h"
 #include "health_reporter.h"
 
@@ -70,15 +70,15 @@ bool is_master_node() {
   return ::xllm::DistributedConfig::get_instance().node_rank() == 0;
 }
 
-bool is_virtual_memory_node() {
+bool is_weight_vmm_node() {
   return ::xllm::DistributedConfig::get_instance().node_rank() != 0 &&
-         ::xllm::KVCacheConfig::get_instance().enable_virtual_memory();
+         ::xllm::LoadConfig::get_instance().enable_vmm_weights();
 }
 
 const char* get_api_service_routes_for_current_mode() {
   static constexpr std::array<ApiRouteBinding, 2> kBindings = {{
       {"master_node", &is_master_node, kApiServiceRoutes},
-      {"virtual_memory_node", &is_virtual_memory_node, kForkOnlyRoute},
+      {"weight_vmm_node", &is_weight_vmm_node, kForkOnlyRoute},
   }};
   for (const auto& binding : kBindings) {
     if (binding.enabled()) {

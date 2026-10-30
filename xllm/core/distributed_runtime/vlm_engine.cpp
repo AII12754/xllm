@@ -308,6 +308,10 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .enable_linear_state(enable_state_cache)
       .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
+      .enable_vmm_kvcache(KVCacheConfig::get_instance().enable_vmm_kvcache())
+      .num_layers(args_.n_layers())
+      .slot_size(kv_cache_cap.slot_size())
+      .model_id(options_.model_id())
       .hasher_type(mtp_hasher_type(BlockHasherType::MM,
                                    options_.num_speculative_tokens(),
                                    options_.speculative_algorithm()))

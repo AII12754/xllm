@@ -57,7 +57,7 @@ class KVCacheConfig final {
          "enable_in_batch_prefix_cache",
          "max_linear_state_cache_slots",
          "xxh3_128bits_seed",
-         "enable_virtual_memory",
+         "enable_vmm_kvcache",
          "vmm_elastic",
          "vmm_memory_reserve_bytes",
          "vmm_startup_timeout_ms",
@@ -92,7 +92,7 @@ class KVCacheConfig final {
 
   PROPERTY(uint32_t, xxh3_128bits_seed) = 1024;
 
-  PROPERTY(bool, enable_virtual_memory) = false;
+  PROPERTY(bool, enable_vmm_kvcache) = false;
 
   // Fixed arenas remain explicit for transports requiring dense registration.
   PROPERTY(bool, vmm_elastic) = true;

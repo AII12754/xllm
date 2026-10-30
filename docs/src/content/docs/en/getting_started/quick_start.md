@@ -71,8 +71,9 @@ in the same build directory. You can also run `python setup.py test` separately
 to build and run tests after an existing product build. Test targets remain
 registered in CMake for compatibility with third-party build definitions.
 Pass `--device npu` (or another
-supported backend) to select the target device. Wheel builds still build and
-run unit tests unless `SKIP_TEST=1` is set; `SKIP_EXPORT=1` separately disables
+supported backend) to select the target device. `bdist_wheel` and `install`
+build the product and package the wheel without compiling or running unit tests;
+run `python setup.py test` explicitly when needed. `SKIP_EXPORT=1` disables
 the Python extension in the normal build. Set `MAX_JOBS` to control native
 compilation parallelism, including xllm_ops (override it separately with
 `OPS_CPU_NUMBER` if needed). NPU test runs should use `CTEST_PARALLEL=1` to avoid

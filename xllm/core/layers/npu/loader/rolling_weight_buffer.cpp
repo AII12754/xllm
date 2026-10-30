@@ -19,7 +19,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include "core/common/global_flags.h"
-#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
 #include "core/runtime/worker_memory_resources.h"
 
 namespace xllm {
@@ -32,7 +32,7 @@ RollingWeightBuffer::RollingWeightBuffer(int32_t num_slots,
       storage_size_(storage_size),
       model_id_(model_id),
       use_virtual_memory_(
-          ::xllm::KVCacheConfig::get_instance().enable_virtual_memory()) {
+          ::xllm::LoadConfig::get_instance().enable_vmm_weights()) {
   CHECK_GT(num_slots_, 0) << "num_slots must be > 0";
   CHECK_GT(storage_size_, 0u) << "storage_size must be > 0";
 

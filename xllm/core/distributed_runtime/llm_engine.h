@@ -95,6 +95,7 @@ class LLMEngine : public Engine {
   void observe_draft_step_acceptance(const RawForwardOutput& output);
   std::mutex profile_mutex_;
   std::unique_ptr<DSparkDpCoordinator> dspark_dp_coordinator_;
+  int64_t initial_weight_reservation_bytes_ = 0;
 
   template <typename TargetEngine>
   friend class SpeculativeEngineBase;

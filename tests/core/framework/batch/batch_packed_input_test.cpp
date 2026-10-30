@@ -948,6 +948,9 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackRestoresDoSample) {
   input.sampling_params.logits_bias = torch::tensor({{0.0F, -INFINITY, 2.0F}});
   input.sampling_params.seeds = torch::tensor({42}, torch::kLong);
   input.sampling_params.seed_offsets = torch::tensor({7}, torch::kLong);
+  input.sampling_params.bad_words = torch::tensor({{{1, 2}}}, torch::kLong);
+  input.sampling_params.bad_word_suffix = torch::tensor({{1}}, torch::kLong);
+
   input.sampling_params.filter_bitmask =
       torch::tensor({{static_cast<int32_t>(0x5)}},
                     torch::TensorOptions().dtype(torch::kInt32));
@@ -977,6 +980,10 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackRestoresDoSample) {
                            input.sampling_params.seeds));
   EXPECT_TRUE(torch::equal(unpacked_input.sampling_params.seed_offsets,
                            input.sampling_params.seed_offsets));
+  EXPECT_TRUE(torch::equal(unpacked_input.sampling_params.bad_words,
+                           input.sampling_params.bad_words));
+  EXPECT_TRUE(torch::equal(unpacked_input.sampling_params.bad_word_suffix,
+                           input.sampling_params.bad_word_suffix));
   ASSERT_TRUE(unpacked_input.sampling_params.filter_bitmask.defined());
   EXPECT_TRUE(torch::equal(unpacked_input.sampling_params.filter_bitmask,
                            input.sampling_params.filter_bitmask));

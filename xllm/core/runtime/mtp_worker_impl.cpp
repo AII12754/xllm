@@ -1145,9 +1145,22 @@ void MTPWorkerImpl<TargetInput>::ensure_spec_verify_control_block_table(
 
 template <typename TargetInput>
 bool MTPWorkerImpl<TargetInput>::use_chunked_prefill_spec_verify_path() const {
-  return target_spec_verify_mode_ ==
-             mtp_async::TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL ||
-         supports_explicit_spec_verify_replay_update();
+  if (target_spec_verify_mode_ ==
+          mtp_async::TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL ||
+      supports_explicit_spec_verify_replay_update()) {
+    return true;
+  }
+#if defined(USE_NPU) || defined(USE_MLU)
+  if (impl_ == nullptr ||
+      impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
+    return false;
+  }
+  const std::string& model_type = impl_->context_.get_model_args().model_type();
+  return is_qwen3_5_target_model_type(model_type) ||
+         is_glm5_next_target_model_type(model_type);
+#else
+  return false;
+#endif
 }
 
 template <typename TargetInput>
@@ -1941,6 +1954,17 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
     // the verify transforms in rejection_sample), because its
     // per-sequence grammar state advances with each speculative token.
     SamplingParameters verify_params = input.sampling_params;
+    if (verify_params.min_token_positions.defined()) {
+      // Overlap can leave the scheduler's generated count behind accepted
+      // tokens. Use the corrected target positions; rejection sampling applies
+      // the candidate and bonus offsets within each verify row.
+      const auto first_positions =
+          validate_input.positions
+              .view({batch_size, num_speculative_tokens + 1})
+              .select(/*dim=*/1, /*index=*/0);
+      verify_params.min_tokens_remaining =
+          verify_params.min_token_positions - first_positions;
+    }
     if (validate_input.sampling_params.filter_bitmask.defined()) {
       verify_params.filter_bitmask =
           validate_input.sampling_params.filter_bitmask;

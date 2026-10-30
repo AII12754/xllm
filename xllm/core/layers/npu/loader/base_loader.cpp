@@ -17,7 +17,7 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/distributed_config.h"
-#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
 #include "core/runtime/worker_memory_resources.h"
 #include "rolling_weight_buffer.h"
 
@@ -420,14 +420,14 @@ void BaseLoader::allocate_device_storage() {
   if (rolling_buffer_ != nullptr) {
     // Rolling load path: use the pre-allocated slot instead of
     // WorkerMemoryResources. Decoder layer weights bypass VirtualMemory
-    // regardless of enable_virtual_memory flag.
+    // regardless of enable_vmm_weights.
     CHECK_GE(layer_index_, 0) << "layer_index_ not set for rolling buffer";
     device_storage_ = rolling_buffer_->get_slot_ptr(layer_index_);
     CHECK(device_storage_ != nullptr)
         << "RollingWeightBuffer slot is null for layer " << layer_index_;
     return;
   }
-  if (::xllm::KVCacheConfig::get_instance().enable_virtual_memory()) {
+  if (::xllm::LoadConfig::get_instance().enable_vmm_weights()) {
     auto& memory_resources = WorkerMemoryResources::get_instance();
     bool ok = memory_resources.allocate_weight(
         model_id_, device_storage_, storage_size_);
@@ -585,7 +585,7 @@ void BaseLoader::release_device_storage() {
   }
   // Memory owned by virtual memory / rolling buffer is released by those
   // owners, not by aclrtFree here.
-  if (!::xllm::KVCacheConfig::get_instance().enable_virtual_memory() &&
+  if (!::xllm::LoadConfig::get_instance().enable_vmm_weights() &&
       !rolling_buffer_) {
     auto ret = aclrtFree(device_storage_);
     if (ret != ACL_SUCCESS) {

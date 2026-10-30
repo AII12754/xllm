@@ -93,6 +93,16 @@ distributed.moe_tp_all_reduce = MagicMock()
 distributed.moe_ep_all_reduce = MagicMock()
 
 
+@pytest.fixture
+def grouped_linear_reference(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    def _project(hidden: torch.Tensor, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [hidden @ weight for weight in weights]
+
+    grouped = MagicMock(side_effect=_project)
+    monkeypatch.setattr(kernels, "grouped_linear", grouped)
+    return grouped
+
+
 def _mega_moe_config(*, tp_rank: int = 0, dp_rank: int = 0, max_tokens_per_rank: int = 4096) -> Qwen3_5Config:
     return _config(
         tp_size=2,
@@ -423,14 +433,15 @@ def test_npu_gdn_loads_native_conv_weight_layout() -> None:
     torch.testing.assert_close(layer.conv1d_weight, checkpoint_conv.squeeze(1).transpose(0, 1))
 
 
-def test_npu_gdn_packs_rank_local_projection_weights() -> None:
+@pytest.mark.parametrize("tp_size,tp_rank", [(size, rank) for size in (1, 2, 4) for rank in range(size)])
+def test_npu_gdn_packs_rank_local_projection_weights(tp_size: int, tp_rank: int) -> None:
     cfg = _linear_config(
         linear_num_key_heads=4,
-        linear_num_value_heads=4,
-        tp_size=2,
-        tp_rank=1,
-        world_size=2,
-        moe_tp_size=2,
+        linear_num_value_heads=12,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        world_size=tp_size,
+        moe_tp_size=tp_size,
     )
     layer = NpuQwen3_5GatedDeltaNet(
         cfg,
@@ -439,7 +450,7 @@ def test_npu_gdn_packs_rank_local_projection_weights() -> None:
         torch.device("cpu"),
     )
     global_key_dim = 16
-    global_value_dim = 16
+    global_value_dim = 48
     global_conv_dim = 2 * global_key_dim + global_value_dim
     qkv = torch.arange(global_conv_dim * 8, dtype=torch.float32).view(
         global_conv_dim,
@@ -449,7 +460,7 @@ def test_npu_gdn_packs_rank_local_projection_weights() -> None:
         global_value_dim,
         8,
     )
-    b = torch.arange(4 * 8, dtype=torch.float32).view(4, 8)
+    b = torch.arange(12 * 8, dtype=torch.float32).view(12, 8)
     a = b + 1000
     tensors = {
         "linear_attn.in_proj_qkv.weight": qkv,
@@ -457,58 +468,128 @@ def test_npu_gdn_packs_rank_local_projection_weights() -> None:
         "linear_attn.in_proj_b.weight": b,
         "linear_attn.in_proj_a.weight": a,
         "linear_attn.conv1d.weight": torch.zeros(global_conv_dim, 1, 4),
-        "linear_attn.A_log": torch.zeros(4),
-        "linear_attn.dt_bias": torch.zeros(4),
+        "linear_attn.A_log": torch.zeros(12),
+        "linear_attn.dt_bias": torch.zeros(12),
         "linear_attn.norm.weight": torch.zeros(4),
         "linear_attn.out_proj.weight": torch.zeros(8, global_value_dim),
     }
 
     layer.load_weights(
         ScopedWeightLoader([_StateDict(tensors)], "linear_attn."),
-        ParallelLoadContext(tp_rank=1, tp_size=2),
+        ParallelLoadContext(tp_rank=tp_rank, tp_size=tp_size),
     )
 
     q, k, v = qkv.split((global_key_dim, global_key_dim, global_value_dim))
-    expected_qkv = torch.cat((q.chunk(2)[1], k.chunk(2)[1], v.chunk(2)[1]))
+    expected_qkv = torch.cat(tuple(weight.chunk(tp_size)[tp_rank] for weight in (q, k, v)))
     qkv_weight, z_weight, b_weight, a_weight = layer._input_projection_weight_views()
     torch.testing.assert_close(qkv_weight, expected_qkv)
-    torch.testing.assert_close(z_weight, z.chunk(2)[1])
-    torch.testing.assert_close(b_weight, b.chunk(2)[1])
-    torch.testing.assert_close(a_weight, a.chunk(2)[1])
+    torch.testing.assert_close(z_weight, z.chunk(tp_size)[tp_rank])
+    torch.testing.assert_close(b_weight, b.chunk(tp_size)[tp_rank])
+    torch.testing.assert_close(a_weight, a.chunk(tp_size)[tp_rank])
     assert qkv_weight.is_contiguous()
     assert z_weight.is_contiguous()
     assert qkv_weight.untyped_storage().data_ptr() == z_weight.untyped_storage().data_ptr()
     assert b_weight.untyped_storage().data_ptr() == a_weight.untyped_storage().data_ptr()
 
 
-def test_npu_gdn_prefill_uses_packed_weight_views(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("num_tokens", [1, 17])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_npu_gdn_grouped_prefill_matches_separate_projections(
+    grouped_linear_reference: MagicMock,
+    tp_size: int,
+    num_tokens: int,
+    dtype: torch.dtype,
+) -> None:
     layer = NpuQwen3_5GatedDeltaNet(
-        _linear_config(),
+        _linear_config(
+            linear_num_key_heads=4,
+            linear_num_value_heads=12,
+            tp_size=tp_size,
+            world_size=tp_size,
+            moe_tp_size=tp_size,
+        ),
         0,
-        torch.float32,
+        dtype,
         torch.device("cpu"),
     )
+    generator = torch.Generator().manual_seed(42)
     with torch.no_grad():
-        layer.in_proj_qkvz.weight.copy_(
-            torch.arange(layer.in_proj_qkvz.weight.numel(), dtype=torch.float32).view_as(layer.in_proj_qkvz.weight)
-        )
-        layer.in_proj_ba.weight.copy_(
-            torch.arange(layer.in_proj_ba.weight.numel(), dtype=torch.float32).view_as(layer.in_proj_ba.weight)
-        )
-    qkvz_forward = MagicMock(wraps=layer.in_proj_qkvz.forward)
-    ba_forward = MagicMock(wraps=layer.in_proj_ba.forward)
-    monkeypatch.setattr(layer.in_proj_qkvz, "forward", qkvz_forward)
-    monkeypatch.setattr(layer.in_proj_ba, "forward", ba_forward)
+        for weight in (layer.in_proj_qkvz.weight, layer.in_proj_ba.weight):
+            weight.copy_(torch.randn(weight.shape, generator=generator, dtype=dtype))
+    hidden = torch.randn(num_tokens, 8, generator=generator, dtype=dtype)
+    qkv_weight, z_weight, b_weight, a_weight = layer._input_projection_weight_views()
+    expected = (
+        torch.nn.functional.linear(hidden, qkv_weight),
+        torch.nn.functional.linear(hidden, a_weight),
+        torch.nn.functional.linear(hidden, b_weight),
+        torch.nn.functional.linear(hidden, z_weight).view(num_tokens, layer.num_v_heads, layer.value_head_dim),
+    )
+    prefill_outputs = layer._project_prefill_inputs(hidden)
+    grouped_linear_reference.assert_called_once()
+    weights = grouped_linear_reference.call_args.args[1]
+    assert len(weights) == 4
+    for weight, source in zip(weights, (qkv_weight, z_weight, b_weight, a_weight)):
+        assert weight.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+    for actual, reference in zip(prefill_outputs, expected):
+        torch.testing.assert_close(actual, reference)
+        assert actual.is_contiguous()
 
-    prefill_outputs = layer._project_prefill_inputs(torch.ones(2, 8))
-    qkvz_forward.assert_not_called()
-    ba_forward.assert_not_called()
-    assert [tuple(output.shape) for output in prefill_outputs] == [
-        (2, 24),
-        (2, 2),
-        (2, 2),
-        (2, 2, 4),
-    ]
+
+@pytest.mark.parametrize("update", ["in_place", "replace", "replace_module", "convert", "assign_state_dict"])
+def test_npu_gdn_grouped_prefill_tracks_weight_updates(
+    grouped_linear_reference: MagicMock,
+    update: str,
+) -> None:
+    layer = NpuQwen3_5GatedDeltaNet(_linear_config(), 0, torch.float32, torch.device("cpu"))
+    with torch.no_grad():
+        layer.in_proj_qkvz.weight.fill_(0.25)
+        layer.in_proj_ba.weight.fill_(0.5)
+    hidden = torch.ones(3, 8)
+    layer._project_prefill_inputs(hidden)
+    if update == "convert":
+        layer.double()
+        hidden = hidden.double()
+    elif update == "replace":
+        layer.in_proj_qkvz.weight = torch.nn.Parameter(torch.full_like(layer.in_proj_qkvz.weight, 0.75))
+        layer.in_proj_ba.weight = torch.nn.Parameter(torch.full_like(layer.in_proj_ba.weight, 1.0))
+    elif update == "replace_module":
+        layer.in_proj_qkvz = torch.nn.Linear(8, layer.in_proj_qkvz.weight.shape[0], bias=False)
+        layer.in_proj_ba = torch.nn.Linear(8, layer.in_proj_ba.weight.shape[0], bias=False)
+        with torch.no_grad():
+            layer.in_proj_qkvz.weight.fill_(0.75)
+            layer.in_proj_ba.weight.fill_(1.0)
+    elif update == "assign_state_dict":
+        state = {name: tensor.clone() for name, tensor in layer.state_dict().items()}
+        state["in_proj_qkvz.weight"].fill_(0.75)
+        state["in_proj_ba.weight"].fill_(1.0)
+        layer.load_state_dict(state, assign=True)
+    else:
+        with torch.no_grad():
+            layer.in_proj_qkvz.weight.fill_(0.75)
+            layer.in_proj_ba.weight.fill_(1.0)
+    expected = layer._project_verify_inputs(hidden)
+    actual = layer._project_prefill_inputs(hidden)
+    for value, reference in zip(actual, expected):
+        torch.testing.assert_close(value, reference)
+
+
+def test_npu_gdn_verify_preserves_separate_projections(monkeypatch: pytest.MonkeyPatch) -> None:
+    layer = NpuQwen3_5GatedDeltaNet(_linear_config(), 0, torch.float32, torch.device("cpu"))
+    with torch.no_grad():
+        layer.in_proj_qkvz.weight.fill_(0.25)
+        layer.in_proj_ba.weight.fill_(0.5)
+    hidden = torch.ones(3, 8)
+    linear = MagicMock(wraps=torch.nn.functional.linear)
+    monkeypatch.setattr(torch.nn.functional, "linear", linear)
+
+    mixed_qkv, a, b, z = layer._project_verify_inputs(hidden)
+
+    assert linear.call_count == 4
+    torch.testing.assert_close(mixed_qkv, torch.full((3, 24), 2.0))
+    torch.testing.assert_close(z, torch.full((3, 2, 4), 2.0))
+    torch.testing.assert_close(a, torch.full((3, 2), 4.0))
+    torch.testing.assert_close(b, torch.full((3, 2), 4.0))
 
 
 def test_npu_decode_uses_mega_fusion_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -620,9 +701,14 @@ def test_npu_moe_loads_native_weight_order() -> None:
     torch.testing.assert_close(layer.mlp.experts.w2, expected_w2.to(torch.bfloat16))
 
 
-def test_npu_gdn_uses_npu_prefill_fusion_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("num_tokens", [1, 17])
+def test_npu_gdn_uses_npu_prefill_fusion_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    grouped_linear_reference: MagicMock,
+    num_tokens: int,
+) -> None:
     calls = MagicMock()
-    mega = MagicMock(return_value=torch.zeros(1, 1, 128, dtype=torch.bfloat16))
+    mega = MagicMock(return_value=torch.zeros(num_tokens, 1, 128, dtype=torch.bfloat16))
     rms = MagicMock(side_effect=lambda output, *_args: output)
     for name, mock in (("mega", mega), ("rms", rms)):
         calls.attach_mock(mock, name)
@@ -656,8 +742,8 @@ def test_npu_gdn_uses_npu_prefill_fusion_boundary(monkeypatch: pytest.MonkeyPatc
         linear_state_read_indices=torch.tensor([1], dtype=torch.int32),
         linear_state_write_indices=torch.tensor([2], dtype=torch.int32),
         has_initial_state=torch.tensor([True], dtype=torch.bool),
-        q_cu_seq_lens=torch.tensor([0, 1], dtype=torch.int32),
-        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        q_cu_seq_lens=torch.tensor([0, num_tokens], dtype=torch.int32),
+        q_seq_lens_host=torch.tensor([num_tokens], dtype=torch.int32),
         is_prefill=True,
         is_chunked_prefill=False,
         is_dummy=False,
@@ -676,21 +762,22 @@ def test_npu_gdn_uses_npu_prefill_fusion_boundary(monkeypatch: pytest.MonkeyPatc
             )
         ],
     )
-    metadata.slot_mapping = torch.zeros(1, dtype=torch.int32)
+    metadata.slot_mapping = torch.zeros(num_tokens, dtype=torch.int32)
     builder = Qwen3_5GdnMetadataBuilder(cfg)
     layer.execution_metadata_builders = (builder,)
     runner = EagerRunner(layer, None, torch.device("cpu"))
     runner.bind_layer_caches(context.layer_caches)
     context.layer_shared_cache.update(runner._build_execution_contexts(metadata, metadata.slot_mapping))
     with forward_context(context):
-        output = layer(torch.zeros(1, 8, dtype=torch.bfloat16))
+        output = layer(torch.zeros(num_tokens, 8, dtype=torch.bfloat16))
 
-    assert output.shape == (1, 128)
+    assert output.shape == (num_tokens, 128)
     assert [call[0] for call in calls.mock_calls] == ["mega"]
     kernels.causal_conv1d_qkv_prefill.assert_not_called()
     kernels.fused_gdn_gating.assert_not_called()
     kernels.chunk_gated_delta_rule.assert_not_called()
     args = mega.call_args.args
+    assert all(tensor.is_contiguous() for tensor in args[:4])
     torch.testing.assert_close(args[8], torch.tensor([1], dtype=torch.int32))
     torch.testing.assert_close(args[9], torch.tensor([2], dtype=torch.int32))
     torch.testing.assert_close(args[10], torch.tensor([1], dtype=torch.int32))

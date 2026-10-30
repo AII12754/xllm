@@ -2078,8 +2078,9 @@ TEST(BatchTest, JsonObjectMetadataIsSkippedWhenDisabled) {
 
   EXPECT_TRUE(forward_input.json_object_states.empty());
   EXPECT_TRUE(forward_input.json_object_state_snapshots.empty());
-  EXPECT_TRUE(forward_input.sample_sequence_ids.empty());
-  EXPECT_TRUE(forward_input.sample_prior_output_rows.empty());
+  EXPECT_EQ(forward_input.sample_sequence_ids,
+            std::vector<std::string>{sequence.sample_sequence_id()});
+  EXPECT_EQ(forward_input.sample_prior_output_rows, std::vector<int32_t>{-1});
   EXPECT_FALSE(forward_input.sampling_params.filter_bitmask.defined());
   EXPECT_FALSE(forward_input.sampling_params.filter_mask.defined());
 }

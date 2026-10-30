@@ -850,7 +850,7 @@ TEST_F(VirtualIndexedKVCacheMemoryRegistryTest,
       .num_layers(3)
       .model_id("indexed")
       .model_type("glm_moe_dsa")
-      .enable_virtual_memory(true)
+      .enable_vmm_kvcache(true)
       .enable_lighting_indexer(true)
       .indexer_cache_enabled_layers(index_layer_owned)
       .tensor_allocator(allocator);

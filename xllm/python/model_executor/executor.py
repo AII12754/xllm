@@ -131,7 +131,6 @@ def _create_attention_backend(
     dtype: torch.dtype,
     config: dict | None = None,
     max_num_reqs: int = 1,
-    num_decoding_tokens: int = 1,
 ) -> AttentionBackend:
     config = config or {}
     model_type = config.get("model_type", "")
@@ -177,7 +176,6 @@ def _create_attention_backend(
                 dcp_group=dcp_group,
                 index_topk=index_topk,
                 max_num_reqs=max(max_num_reqs, 1),
-                num_decoding_tokens=max(num_decoding_tokens, 1),
             )
         from xllm.python.attention.npu_paged_attention import (
             NpuPagedAttentionBackend,
@@ -192,7 +190,6 @@ def _create_attention_backend(
             is_mla=bool(config.get("enable_mla", False)),
             device=device,
             dtype=dtype,
-            num_decoding_tokens=num_decoding_tokens,
             # Only the GLM5 DSpark draft carries the dense MLA block-draft
             # attention shape.
             mla_block_draft=model_type == "glm5_dspark",
@@ -362,7 +359,6 @@ class ModelExecutor:
         self._attention_backend_device = device
         self._attention_backend_dtype = first_parameter.dtype
         self._attention_backend_config = dict(config)
-        self._attention_backend_num_decoding_tokens = num_decoding_tokens
         self._attention_backend_max_num_reqs = max(max_seqs_per_batch, 1) * max_decode_rows_per_request
         self.attention_backend = _create_attention_backend(
             first_attention,
@@ -370,7 +366,6 @@ class ModelExecutor:
             first_parameter.dtype,
             config,
             self._attention_backend_max_num_reqs,
-            num_decoding_tokens=num_decoding_tokens,
         )
 
         execution_model = model.model
@@ -407,6 +402,9 @@ class ModelExecutor:
             and graph_backend == "aclgraph"
             and dp_size == 1
             and cp_size == 1
+        )
+        self._prepared_fixed_recurrent_target = self._prepared_recurrent_target and not config.get(
+            "enable_adaptive_target_verify", False
         )
         self._prepared_block_draft = is_block_draft_model(config)
         self._prepared_dspark = is_dspark_draft_model(config)
@@ -551,8 +549,13 @@ class ModelExecutor:
                     dp_rank,
                     enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
                     block_draft=self._prepared_block_draft,
-                    spec_verify_width=self.num_speculative_tokens + 1 if self._prepared_qwen_mtp_target else 1,
-                    device_kv_lengths=self._prepared_qwen_mtp_target or self._prepared_qwen_mtp_draft,
+                    spec_verify_width=self.num_speculative_tokens + 1
+                    if self._prepared_qwen_mtp_target or self._prepared_fixed_recurrent_target
+                    else 1,
+                    device_kv_lengths=self._prepared_qwen_mtp_target
+                    or self._prepared_qwen_mtp_draft
+                    or self._prepared_fixed_recurrent_target,
+                    block_draft_graph_warmup_max_kv_len=int(config.get("block_draft_graph_warmup_max_kv_len", 0)),
                 )
             else:
                 if self._independent_block_draft:
@@ -564,6 +567,7 @@ class ModelExecutor:
                         int(config["max_position_embeddings"]),
                         dp_size,
                         dp_rank,
+                        block_draft_graph_warmup_max_kv_len=int(config.get("block_draft_graph_warmup_max_kv_len", 0)),
                     )
                 else:
                     self.decode_graph_runner = DecodeAclGraphRunner(
@@ -652,7 +656,6 @@ class ModelExecutor:
                 self._attention_backend_dtype,
                 self._attention_backend_config,
                 self._attention_backend_max_num_reqs,
-                num_decoding_tokens=self._attention_backend_num_decoding_tokens,
             )
             backend.bind_kv_caches(self.eager_runner.layer_caches)
             backends.append(backend)
@@ -918,6 +921,13 @@ class ModelExecutor:
         else:
             metadata.prepared_attention_state = self.attention_backend.prepare_metadata(metadata)
 
+    def get_prepared_aux_hidden_states(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, metadata: AttentionMetadata
+    ) -> list[torch.Tensor]:
+        if self.prepared_graph_runner is None:
+            raise RuntimeError("prepared ACL graph runner is not enabled")
+        return self.prepared_graph_runner.get_prepared_aux_hidden_states(input_ids, positions, metadata)
+
     def warmup_prepared_graph(
         self,
         input_ids: torch.Tensor,
@@ -942,7 +952,14 @@ class ModelExecutor:
             else EplbRuntimeState(expert_load_data, eplb_decode_token_mask, is_graph_warmup)
         )
         self.prepared_graph_runner.warmup_prepared(
-            input_ids, positions, metadata, input_embedding, mtp_topk_indices, eplb=eplb, **graph_kwargs
+            input_ids,
+            positions,
+            metadata,
+            input_embedding,
+            mtp_topk_indices,
+            eplb=eplb,
+            pre_capture_kv_buckets=True,
+            **graph_kwargs,
         )
 
     def _validate_dspark_graph_metadata(self, metadata: AttentionMetadata) -> None:
@@ -1080,6 +1097,7 @@ class ModelExecutor:
                 input_ids, positions, metadata, input_embedding, layer_synchronizer, eplb=eplb
             )
         if graph_runner is not None or mtp_topk_indices is not None:
+            from xllm.python.model_executor.runners.block_draft_acl_graph import BlockDraftAclGraphRunner
             from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
 
         graph_kwargs = {}
@@ -1107,6 +1125,8 @@ class ModelExecutor:
                 warmup_kwargs = (
                     {"is_graph_warmup": is_graph_warmup} if type(graph_runner) is DecodeAclGraphRunner else {}
                 )
+                if isinstance(graph_runner, BlockDraftAclGraphRunner):
+                    warmup_kwargs["pre_capture_kv_buckets"] = is_graph_warmup
                 graph_key = graph_runner.warmup(
                     input_ids,
                     positions,
